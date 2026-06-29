@@ -1,0 +1,311 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum CredentialStatus {
+  VERIFIED
+  PENDING
+  EXPIRED
+  FAILED
+  UNAVAILABLE
+}
+
+enum ActivityType {
+  VERIFY
+  SHARE
+  ADD
+  SECURITY
+  SCAN
+  PAYMENT
+  CHAT
+}
+
+enum ActivityStatus {
+  SUCCESS
+  PENDING
+  FAILED
+}
+
+enum MessageType {
+  TEXT
+  MEDIA
+  CREDENTIAL
+  CONTRACT
+  PAYMENT
+  SYSTEM
+}
+
+enum MessageDirection {
+  INCOMING
+  OUTGOING
+}
+
+enum TransactionStatus {
+  PENDING
+  READY
+  COMPLETED
+  FAILED
+  CANCELLED
+  UNAVAILABLE
+  SOLD_OUT
+}
+
+enum DemoScenarioStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+model User {
+  id                       String                    @id @default(cuid())
+  did                      String?                   @unique
+  fullName                 String
+  dob                      String?
+  studentId                String?
+  school                   String?
+  nationalId               String?
+  email                    String?                   @unique
+  phone                    String?                   @unique
+  address                  String?
+  settings                 Json?
+  createdAt                DateTime                  @default(now())
+  updatedAt                DateTime                  @updatedAt
+  credentials              Credential[]
+  activityLogs             ActivityLog[]
+  deviceSessions           DeviceSession[]
+  notifications            Notification[]
+  paymentTransactions      PaymentTransaction[]
+  conversationParticipants ConversationParticipant[]
+
+  @@index([did])
+}
+
+model DeviceSession {
+  id               String    @id @default(cuid())
+  userId           String
+  deviceId         String
+  platform         String?
+  refreshTokenHash String?
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  user             User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, deviceId])
+  @@index([userId])
+}
+
+model Issuer {
+  id          String       @id @default(cuid())
+  did         String       @unique
+  name        String
+  type        String
+  trustLevel  String       @default("demo")
+  metadata    Json?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  credentials Credential[]
+}
+
+model Credential {
+  id                  String               @id @default(cuid())
+  holderId            String
+  issuerId            String?
+  type                String
+  title               String
+  status              CredentialStatus     @default(PENDING)
+  issuedAt            DateTime?
+  expiresAt           DateTime?
+  revokedAt           DateTime?
+  claims              Json
+  proof               Json?
+  isDemo              Boolean              @default(false)
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+  holder              User                 @relation(fields: [holderId], references: [id], onDelete: Cascade)
+  issuer              Issuer?              @relation(fields: [issuerId], references: [id], onDelete: SetNull)
+  attributes          CredentialAttribute[]
+  shareRequests       ShareRequest[]
+  verificationRecords VerificationRecord[]
+
+  @@index([holderId, status])
+  @@index([issuerId])
+}
+
+model CredentialAttribute {
+  id           String     @id @default(cuid())
+  credentialId String
+  label        String
+  value        String
+  isSensitive  Boolean    @default(false)
+  createdAt    DateTime   @default(now())
+  credential   Credential @relation(fields: [credentialId], references: [id], onDelete: Cascade)
+
+  @@index([credentialId])
+}
+
+model ShareRequest {
+  id              String      @id @default(cuid())
+  credentialId    String?
+  requesterDid    String?
+  verifierName    String
+  requestedClaims Json?
+  status          String      @default("pending")
+  expiresAt       DateTime?
+  approvedAt      DateTime?
+  createdAt       DateTime    @default(now())
+  updatedAt       DateTime    @updatedAt
+  credential      Credential? @relation(fields: [credentialId], references: [id], onDelete: SetNull)
+
+  @@index([credentialId])
+  @@index([status])
+}
+
+model VerificationRecord {
+  id           String      @id @default(cuid())
+  credentialId String?
+  verifierDid  String?
+  verifierName String
+  result       String
+  payload      Json?
+  createdAt    DateTime    @default(now())
+  credential   Credential? @relation(fields: [credentialId], references: [id], onDelete: SetNull)
+
+  @@index([credentialId])
+  @@index([createdAt])
+}
+
+model ActivityLog {
+  id          String          @id @default(cuid())
+  userId      String
+  type        ActivityType
+  status      ActivityStatus?
+  title       String
+  description String
+  partner     String
+  unread      Boolean         @default(false)
+  isDemo      Boolean         @default(false)
+  payload     Json?
+  createdAt   DateTime        @default(now())
+  expiresAt   DateTime?
+  user        User            @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+model Conversation {
+  id           String                    @id @default(cuid())
+  title        String?
+  type         String                    @default("direct")
+  isOfficial   Boolean                   @default(false)
+  createdAt    DateTime                  @default(now())
+  updatedAt    DateTime                  @updatedAt
+  participants ConversationParticipant[]
+  messages     Message[]
+}
+
+model ConversationParticipant {
+  id             String       @id @default(cuid())
+  conversationId String
+  userId         String?
+  displayName    String
+  role           String       @default("member")
+  createdAt      DateTime     @default(now())
+  conversation   Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  user           User?        @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([conversationId])
+  @@index([userId])
+}
+
+model Message {
+  id                String           @id @default(cuid())
+  conversationId    String
+  senderId          String?
+  senderDisplayName String?
+  type              MessageType      @default(TEXT)
+  direction         MessageDirection
+  body              String?
+  payload           Json?
+  deliveryStatus    String?
+  createdAt         DateTime         @default(now())
+  conversation      Conversation     @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  @@index([conversationId, createdAt])
+}
+
+model FeedPost {
+  id             String   @id @default(cuid())
+  authorUserId   String?
+  authorName     String
+  handle         String?
+  text           String
+  kind           String   @default("post")
+  payload        Json?
+  isDemo         Boolean  @default(false)
+  publishedAt    DateTime @default(now())
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  @@index([publishedAt])
+}
+
+model PaymentTransaction {
+  id          String            @id @default(cuid())
+  userId      String
+  amount      Decimal           @db.Decimal(18, 2)
+  currency    String            @default("VND")
+  status      TransactionStatus @default(PENDING)
+  description String?
+  metadata    Json?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+  user        User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+  @@index([status])
+}
+
+model Notification {
+  id        String    @id @default(cuid())
+  userId    String
+  title     String
+  body      String
+  channel   String    @default("in_app")
+  readAt    DateTime?
+  payload   Json?
+  createdAt DateTime  @default(now())
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, createdAt])
+}
+
+model MiniApp {
+  id          String   @id @default(cuid())
+  slug        String   @unique
+  name        String
+  description String?
+  scopes      String[]
+  launchUrl   String?
+  metadata    Json?
+  isEnabled   Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+}
+
+model DemoScenario {
+  id          String             @id @default(cuid())
+  slug        String             @unique
+  title       String
+  description String?
+  status      DemoScenarioStatus @default(ACTIVE)
+  payload     Json
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+}
