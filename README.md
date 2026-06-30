@@ -42,6 +42,18 @@ Health check:
 http://localhost:4000/v1/health
 ```
 
+Auth integration guide:
+
+```text
+docs/auth-flow.md
+```
+
+Auth production readiness checklist:
+
+```text
+docs/auth-production-readiness.md
+```
+
 ## Development Commands
 
 ```bash

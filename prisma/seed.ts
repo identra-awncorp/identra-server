@@ -1,11 +1,16 @@
 import { PrismaClient } from '@prisma/client';
+import * as argon2 from 'argon2';
 
 const prisma = new PrismaClient();
+const demoPassword = 'IdentraDemo123';
 
 async function main() {
   const user = await prisma.user.upsert({
     where: { email: 'demo@identra.local' },
-    update: {},
+    update: {
+      phone: '+84382948210',
+      phoneVerifiedAt: new Date('2024-01-01T00:00:00.000Z')
+    },
     create: {
       did: 'did:identra:demo-holder-001',
       fullName: 'Nguyen Van An',
@@ -14,7 +19,8 @@ async function main() {
       school: 'University of Technology',
       nationalId: '001202003847',
       email: 'demo@identra.local',
-      phone: '0382948210',
+      phone: '+84382948210',
+      phoneVerifiedAt: new Date('2024-01-01T00:00:00.000Z'),
       address: 'Cau Giay, Hanoi',
       settings: {
         language: 'vi',
@@ -22,6 +28,24 @@ async function main() {
         notificationsEnabled: true,
         hideSensitiveData: true
       }
+    }
+  });
+
+  await prisma.userPassword.upsert({
+    where: { userId: user.id },
+    update: {},
+    create: {
+      userId: user.id,
+      passwordHash: await argon2.hash(
+        `${demoPassword}${process.env.PASSWORD_PEPPER ?? 'dev_password_pepper_change_me'}`,
+        {
+          type: argon2.argon2id,
+          memoryCost: 19456,
+          timeCost: 2,
+          parallelism: 1
+        }
+      ),
+      passwordPepperVersion: process.env.PASSWORD_PEPPER_VERSION ?? 'v1'
     }
   });
 
