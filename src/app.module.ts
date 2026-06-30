@@ -4,6 +4,7 @@ import { ConfigModule } from '@nestjs/config';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { validateEnv } from './config/env.validation';
+import { IdentraGraphqlModule } from './graphql/graphql.module';
 import { PrismaModule } from './infrastructure/prisma/prisma.module';
 import { RedisModule } from './infrastructure/redis/redis.module';
 import { AuditModule } from './modules/audit/audit.module';
@@ -31,6 +32,7 @@ import { VerificationModule } from './modules/verification/verification.module';
     }),
     PrismaModule,
     RedisModule,
+    IdentraGraphqlModule,
     HealthModule,
     AuthModule,
     UsersModule,
