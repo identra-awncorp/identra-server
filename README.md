@@ -4,36 +4,127 @@ NestJS backend for Identra mobile app, website demos, and future super-app modul
 
 ## Stack
 
-- NestJS
-- Prisma
+- Node.js 22
+- NestJS 11
+- Prisma 6
 - PostgreSQL
 - Redis
 - Docker Compose
 
-## Local Docker Run
+## Requirements
+
+Before running the project, make sure your local environment has:
+
+- Node.js `22.x` recommended, `20.x` minimum
+- npm from the selected Node.js version
+- Docker Desktop with Docker Compose V2
+
+Check versions:
+
+```bash
+node -v
+npm -v
+docker --version
+docker compose version
+```
+
+The Docker image for this project uses Node.js 22, so local development should
+use the same major version whenever possible.
+
+On Windows, reopen Git Bash or PowerShell after installing Node.js or Docker so
+the terminal can reload the updated `PATH`.
+
+## Environment
+
+Create a local environment file:
+
+```bash
+cp .env.example .env
+```
+
+PowerShell:
+
+```powershell
+Copy-Item .env.example .env
+```
+
+The default `.env.example` values are configured for Docker Compose:
+
+```text
+DATABASE_URL=postgresql://identra:identra_password@db:5432/identra?schema=public
+REDIS_URL=redis://redis:6379
+```
+
+If you run the API directly with `npm run start:dev`, change those hostnames to
+`localhost`:
+
+```text
+DATABASE_URL=postgresql://identra:identra_password@localhost:5432/identra?schema=public
+REDIS_URL=redis://localhost:6379
+```
+
+## Run With Docker
+
+Recommended for local development:
 
 ```bash
 cp .env.example .env
 docker compose up --build
 ```
 
-On Windows PowerShell:
+PowerShell:
 
 ```powershell
 Copy-Item .env.example .env
 npm.cmd run docker:up
 ```
 
-The API listens on:
+Stop containers:
+
+```bash
+docker compose down
+```
+
+## Run Without Docker
+
+Use this only when PostgreSQL and Redis are already running locally.
+
+```bash
+npm ci
+npm run prisma:generate
+npm run prisma:push
+npm run seed
+npm run start:dev
+```
+
+PowerShell:
+
+```powershell
+npm.cmd ci
+npm.cmd run prisma:generate
+npm.cmd run prisma:push
+npm.cmd run seed
+npm.cmd run start:dev
+```
+
+## URLs
+
+API:
 
 ```text
 http://localhost:4000/v1
 ```
 
-Swagger docs:
+Swagger:
 
 ```text
 http://localhost:4000/docs
+```
+
+GraphQL:
+
+```text
+http://localhost:4000/graphql
 ```
 
 Health check:
@@ -42,67 +133,30 @@ Health check:
 http://localhost:4000/v1/health
 ```
 
-Auth integration guide:
-
-```text
-docs/auth-flow.md
-```
-
-Auth production readiness checklist:
-
-```text
-docs/auth-production-readiness.md
-```
-
 ## Development Commands
 
 ```bash
-npm install
 npm run start:dev
 npm run lint
+npm run build
 npm run prisma:generate
 npm run prisma:push
 npm run seed
+npm run docker:up
+npm run docker:down
 ```
-
-If PowerShell blocks `npm.ps1`, use `npm.cmd run <script>` instead.
-
-When running the API outside Docker, update `DATABASE_URL` and `REDIS_URL` to use
-`localhost` instead of the Docker service names `db` and `redis`.
 
 ## Architecture
 
 This project starts as a modular monolith. It deploys as one API service for now,
 but source code is split by business domain so modules can be extracted later if
-the product needs it.
+needed.
 
 ```text
 src/
   common/          shared DTOs and helpers
   config/          environment parsing
-  contracts/       API contract schemas shared with app/website later
+  contracts/       API contract schemas
   infrastructure/  database, redis, queues, storage, realtime
   modules/         product domains
 ```
-
-Initial product modules:
-
-- auth
-- users
-- identity
-- credentials
-- sharing
-- verification
-- chat
-- feed
-- payments
-- notifications
-- mini-apps
-- demo-scenarios
-- audit
-
-## Docker Notes
-
-The app, PostgreSQL, and Redis are separate containers in one compose project.
-That is the recommended local/demo setup. For production, keep the API image
-separate and use managed PostgreSQL/Redis or dedicated infrastructure services.
