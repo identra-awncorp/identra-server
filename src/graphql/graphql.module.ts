@@ -18,9 +18,28 @@ import {
 } from './resolvers/credential.resolver';
 import { UserFieldResolver, ViewerResolver } from './resolvers/viewer.resolver';
 
+const graphqlProviders = [
+  GraphqlSecurityConfig,
+  GraphqlContextFactory,
+  GraphqlLoadersService,
+  GraphqlPolicyService,
+  GraphqlCacheService,
+  GraphqlCostRateLimiterService,
+  GraphqlTrustedDocumentsService,
+  GraphqlSecurityPlugin
+];
+
+@Module({
+  providers: graphqlProviders,
+  exports: graphqlProviders
+})
+class GraphqlProvidersModule {}
+
 @Module({
   imports: [
+    GraphqlProvidersModule,
     NestGraphQLModule.forRootAsync<ApolloDriverConfig>({
+      imports: [GraphqlProvidersModule],
       driver: ApolloDriver,
       inject: [GraphqlContextFactory, GraphqlSecurityConfig, GraphqlSecurityPlugin],
       useFactory: (
@@ -44,14 +63,6 @@ import { UserFieldResolver, ViewerResolver } from './resolvers/viewer.resolver';
     })
   ],
   providers: [
-    GraphqlSecurityConfig,
-    GraphqlContextFactory,
-    GraphqlLoadersService,
-    GraphqlPolicyService,
-    GraphqlCacheService,
-    GraphqlCostRateLimiterService,
-    GraphqlTrustedDocumentsService,
-    GraphqlSecurityPlugin,
     ViewerResolver,
     UserFieldResolver,
     CredentialFieldResolver,

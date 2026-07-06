@@ -48,20 +48,16 @@ PowerShell:
 Copy-Item .env.example .env
 ```
 
-The default `.env.example` values are configured for Docker Compose:
-
-```text
-DATABASE_URL=postgresql://identra:identra_password@db:5432/identra?schema=public
-REDIS_URL=redis://redis:6379
-```
-
-If you run the API directly with `npm run start:dev`, change those hostnames to
-`localhost`:
+The default `.env.example` values are configured for running the API directly on
+the host machine:
 
 ```text
 DATABASE_URL=postgresql://identra:identra_password@localhost:5432/identra?schema=public
 REDIS_URL=redis://localhost:6379
 ```
+
+Docker Compose overrides these values for the API container so it can connect to
+the `db` and `redis` services inside the compose network.
 
 ## Run With Docker
 
@@ -132,6 +128,18 @@ Health check:
 ```text
 http://localhost:4000/v1/health
 ```
+
+LAN health check for a real phone on the same Wi-Fi:
+
+```text
+http://<your-computer-LAN-IP>:4000/v1/health
+http://<your-computer-LAN-IP>:4000/v1/auth/status
+```
+
+The server binds to `HOST=0.0.0.0` by default so Android phones running Expo Go
+can reach it through the computer's LAN IP. If the localhost URL works but the
+LAN URL does not, check Windows Firewall, Docker Desktop port publishing, and
+whether the phone is on the same Wi-Fi network without client isolation.
 
 ## Development Commands
 

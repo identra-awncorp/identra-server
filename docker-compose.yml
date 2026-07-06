@@ -8,11 +8,12 @@ services:
     environment:
       NODE_ENV: ${NODE_ENV:-development}
       PORT: 4000
+      HOST: ${HOST:-0.0.0.0}
       API_PREFIX: ${API_PREFIX:-v1}
       APP_NAME: ${APP_NAME:-Identra Server}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://localhost:8081,http://localhost:19006}
-      DATABASE_URL: ${DATABASE_URL:-postgresql://identra:identra_password@db:5432/identra?schema=public}
-      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      DATABASE_URL: postgresql://${POSTGRES_USER:-identra}:${POSTGRES_PASSWORD:-identra_password}@db:5432/${POSTGRES_DB:-identra}?schema=public
+      REDIS_URL: redis://redis:6379
       JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:-dev_access_secret_change_me}
       JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:-dev_refresh_secret_change_me}
     ports:

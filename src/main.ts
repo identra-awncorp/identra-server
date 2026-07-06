@@ -16,6 +16,7 @@ async function bootstrap() {
   const apiPrefix = config.get<string>('API_PREFIX', 'v1');
   const appName = config.get<string>('APP_NAME', 'Identra Server');
   const port = config.get<number>('PORT', 4000);
+  const host = config.get<string>('HOST', '0.0.0.0');
 
   app.enableShutdownHooks();
   app.setGlobalPrefix(apiPrefix);
@@ -41,7 +42,7 @@ async function bootstrap() {
   const document = SwaggerModule.createDocument(app, swaggerConfig);
   SwaggerModule.setup('docs', app, document);
 
-  await app.listen(port);
+  await app.listen(port, host);
 }
 
 void bootstrap();

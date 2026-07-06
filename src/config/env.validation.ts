@@ -25,6 +25,7 @@ const booleanFromEnv = z.preprocess((value) => {
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
   PORT: z.coerce.number().int().positive().default(4000),
+  HOST: z.string().min(1).default('0.0.0.0'),
   API_PREFIX: z.string().min(1).default('v1'),
   APP_NAME: z.string().min(1).default('Identra Server'),
   CORS_ORIGINS: z.string().default('http://localhost:3000,http://localhost:8081,http://localhost:19006'),
