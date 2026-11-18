@@ -3,6 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 
+import { bodyParserErrorHandler, RoutedErrorFilter } from './common/http-errors';
 import { parseCorsOrigins } from './config/cors';
 
 /**
@@ -46,6 +47,8 @@ export function configureApp(app: NestExpressApplication): void {
   app.useBodyParser('json', { limit: BODY_LIMIT });
   app.useBodyParser('urlencoded', { limit: BODY_LIMIT, extended: false });
   app.useBodyParser('text', { limit: BODY_LIMIT, type: 'application/jwt' });
+  // Parser failures (malformed JSON, too large) in the shape of the route they were sent to.
+  app.use(bodyParserErrorHandler);
 
   app.setGlobalPrefix(config.get<string>('API_PREFIX', 'v1'), {
     exclude: UNPREFIXED_ROUTES
@@ -62,6 +65,8 @@ export function configureApp(app: NestExpressApplication): void {
   // (`Record<string, unknown>`), which this pipe skips, and validates with its own pipe, e.g.
   // `@Body(new ValidationPipe({ expectedType: TokenRequestDto, whitelist: true }))`.
   // A controller-level @UsePipes alone cannot relax this pipe: global pipes run first.
+  // Fallback error shapes for anything no controller filter handles (unknown paths included).
+  app.useGlobalFilters(new RoutedErrorFilter(app.getHttpAdapter()));
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,

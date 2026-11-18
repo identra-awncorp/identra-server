@@ -1,12 +1,10 @@
-import { readdirSync, readFileSync, statSync } from 'node:fs';
+import { readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { Logger, Provider } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 
-import { createRedisStateStore } from '../common/state-store';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
-import { RedisService } from '../infrastructure/redis/redis.service';
 import {
   createCertificateChainValidator,
   createSignedTrustListRegistry,
@@ -19,7 +17,6 @@ import { webCryptoHasher, webCryptoRandom, webCryptoVerifier } from '@identra/sd
 import {
   createFileKeyStore,
   createStatusListService,
-  createTrustListService,
   type IssuerKeyStore,
   type StatusListService,
   type TrustListService
@@ -58,6 +55,24 @@ const logger = new Logger('Pki');
 const PURPOSE_FILES = { vc: ['vc', 'vc-product'], status: ['status'], request: ['request'] } as const;
 
 /**
+ * ADR-0015 §2, ADR-0016 §6: the Root and Issuing CA keys never live on the server. A `ca/`
+ * directory or a `ca.key.pem` anywhere under the key directory stops the startup (the
+ * message names the path, never content). Follows symlinks, a few levels deep.
+ */
+export function refuseCaKeys(dir: string, depth = 0): void {
+  for (const name of readdirSync(dir)) {
+    const path = join(dir, name);
+    const st = statSync(path);
+
+    if ((name === 'ca' && st.isDirectory()) || name === 'ca.key.pem') {
+      throw new Error(`${path} looks like CA key material; Root and Issuing CA keys must not be on the server (ADR-0015 §2)`);
+    }
+
+    if (st.isDirectory() && depth < 4) refuseCaKeys(path, depth + 1);
+  }
+}
+
+/**
  * Loads every key of the store (each organisation's keys found on disk and the trust-list
  * signer), so a missing, unreadable or invalid key stops the startup instead of the first
  * request. Messages name files and SDK error codes only, never key material.
@@ -67,6 +82,8 @@ async function loadPki(config: ConfigService, clock: Clock): Promise<Pki> {
   const baseUrl = config.getOrThrow<string>('IDENTRA_PUBLIC_BASE_URL');
 
   try {
+    refuseCaKeys(dir);
+
     const keyStore = createFileKeyStore(dir);
     const trustedRoots = keyStore.trustedRoots();
     const organisations = readdirSync(join(dir, 'orgs'), { withFileTypes: true }).filter((e) => e.isDirectory());
@@ -103,72 +120,59 @@ async function loadPki(config: ConfigService, clock: Clock): Promise<Pki> {
   }
 }
 
+/** How long a reader of a status list may wait (signing can queue behind a writer's lock). */
+export const STATUS_TOKEN_WAIT_MS = 1000;
+
+/** Thrown when a status list cannot be served within the bound and no earlier token is held. */
+export class StatusListBusyError extends Error {}
+
 /**
- * The trust-list content, re-read when the file's mtime changes. A file that cannot be read or
- * parsed throws (the service then keeps serving its last good token); the error says nothing
- * about the content.
+ * token() re-signs after a change and records the iat on the list row, which waits while a
+ * status change holds that row's lock. Readers (the public GET, the own verifier) therefore
+ * wait at most STATUS_TOKEN_WAIT_MS and then get the last token this process served for the
+ * list: valid, signed, merely without the change that is still being committed. The signing
+ * goes on in the background and refreshes the held token.
  */
-function trustListSource(path: string): () => unknown {
-  let cached: { mtimeMs: number; value: unknown } | undefined;
+function withBoundedTokens(service: StatusListService): StatusListService {
+  const held = new Map<string, string>();
 
-  return () => {
-    let mtimeMs: number;
+  return {
+    ...service,
+    async token(issuer, n) {
+      const key = `${issuer}/${n}`;
+      const fresh = service.token(issuer, n).then((token) => {
+        if (token !== null) held.set(key, token);
 
-    try {
-      mtimeMs = statSync(path).mtimeMs;
+        return token;
+      });
+      let timer: NodeJS.Timeout | undefined;
+      const late = new Promise<'late'>((resolve) => {
+        timer = setTimeout(() => resolve('late'), STATUS_TOKEN_WAIT_MS);
+      });
 
-      if (cached?.mtimeMs === mtimeMs) return cached.value;
+      try {
+        const first = await Promise.race([fresh, late]);
 
-      const value: unknown = JSON.parse(readFileSync(path, 'utf8'));
+        if (first !== 'late') return first;
+      } finally {
+        clearTimeout(timer);
+      }
 
-      cached = { mtimeMs, value };
+      fresh.catch(() => undefined);
 
-      return value;
-    } catch {
-      cached = undefined;
-      throw new Error('the trust-list source file is missing or not valid JSON');
+      const previous = held.get(key);
+
+      if (previous === undefined) throw new StatusListBusyError('status list is busy');
+
+      return previous;
     }
   };
 }
-
-const LAST_TRUST_LIST_TOKEN = 'last-token';
 
 export const vcProviders: Provider[] = [
   { provide: CLOCK, useValue: { now: () => new Date() } satisfies Clock },
   { provide: ISSUER_CLOCK, useExisting: CLOCK },
   { provide: PKI, inject: [ConfigService, CLOCK], useFactory: loadPki },
-  {
-    provide: TRUST_LIST_SERVICE,
-    inject: [PKI, ConfigService, RedisService],
-    useFactory: async (pki: Pki, config: ConfigService, redis: RedisService): Promise<TrustListService> => {
-      const trustListLogger = new Logger('TrustList');
-      // The last served token survives restarts, so the next iat is always greater (ADR-0019 §4).
-      const store = createRedisStateStore(redis.getClient(), 'trust-list');
-      const lastToken = await store.get(LAST_TRUST_LIST_TOKEN).catch(() => null);
-      const service = createTrustListService({
-        source: trustListSource(config.getOrThrow<string>('IDENTRA_TRUST_LIST_SOURCE')),
-        keyStore: pki.keyStore,
-        clock: pki.clock,
-        ...(lastToken ? { lastToken } : {}),
-        // The validator's detail can quote the content: log only that it happened.
-        onError: () => trustListLogger.warn('Trust-list source refused; still serving the last good token')
-      });
-      let saved = lastToken;
-
-      return {
-        async token() {
-          const token = await service.token();
-
-          if (token !== saved) {
-            saved = token;
-            await store.put(LAST_TRUST_LIST_TOKEN, token, 2 * 86_400).catch(() => undefined);
-          }
-
-          return token;
-        }
-      };
-    }
-  },
   {
     provide: STATUS_LIST_SERVICE,
     inject: [PKI, PrismaService],
@@ -176,13 +180,15 @@ export const vcProviders: Provider[] = [
     // still never serve a stale list (token() compares the stored version on every call), but
     // could sign two tokens with one iat in the same second.
     useFactory: (pki: Pki, prisma: PrismaService): StatusListService =>
-      createStatusListService({
-        issuerUri: pki.issuerUri,
-        keyStore: pki.keyStore,
-        storage: createPrismaStatusListStorage(prisma),
-        random: pki.random,
-        clock: pki.clock
-      })
+      withBoundedTokens(
+        createStatusListService({
+          issuerUri: pki.issuerUri,
+          keyStore: pki.keyStore,
+          storage: createPrismaStatusListStorage(prisma),
+          random: pki.random,
+          clock: pki.clock
+        })
+      )
   },
   {
     provide: OWN_FETCH,

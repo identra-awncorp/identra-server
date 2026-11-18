@@ -1,4 +1,5 @@
 import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from '@nestjs/common';
+import { BaseExceptionFilter } from '@nestjs/core';
 import { ThrottlerException } from '@nestjs/throttler';
 
 // The parts of Express's response used here (the server has no @types/express).
@@ -17,15 +18,19 @@ const V1_CODES: Record<number, string> = {
   403: 'FORBIDDEN',
   404: 'NOT_FOUND',
   409: 'CONFLICT',
-  413: 'VALIDATION_FAILED',
+  413: 'PAYLOAD_TOO_LARGE',
   429: 'RATE_LIMITED',
   503: 'UNAVAILABLE'
 };
 
 /** Throw from a /v1 route of docs/vc-api.md: rendered as `{ statusCode, code, message }`. */
-export function apiError(status: number, code: string, message: string): HttpException {
-  return new HttpException({ code, message }, status);
+export function apiError(status: number, code: string, message: string, options: { retryAfter?: number } = {}): HttpException {
+  return Object.assign(new HttpException({ code, message }, status), options);
 }
+
+/** 503 UNAVAILABLE with `Retry-After`: a dependency (Redis, a lock, the pool) is busy or down. */
+export const unavailable = (message = 'Temporarily unavailable; try again shortly.') =>
+  apiError(503, 'UNAVAILABLE', message, { retryAfter: 1 });
 
 function describe(exception: HttpException): { code?: string; message: string } {
   const body = exception.getResponse();
@@ -48,30 +53,39 @@ function logUnexpected(exception: unknown): void {
   logger.error(`Unhandled ${name}${typeof code === 'string' ? ` (${code})` : ''}`);
 }
 
-/**
- * Error envelope `{ statusCode, code, message }` for the /v1 routes of docs/vc-api.md (the older
- * auth routes keep their own shape). Use with @UseFilters on those controllers.
- */
+function renderV1(exception: unknown, res: HttpResponse): void {
+  if (!(exception instanceof HttpException)) {
+    logUnexpected(exception);
+    res.status(500).json({ statusCode: 500, code: 'INTERNAL_ERROR', message: 'Internal server error' });
+
+    return;
+  }
+
+  const statusCode = exception.getStatus();
+  const { code, message } = describe(exception);
+  const retryAfter = (exception as { retryAfter?: unknown }).retryAfter;
+
+  if (typeof retryAfter === 'number') res.setHeader('Retry-After', String(retryAfter));
+  else if (statusCode === 503) res.setHeader('Retry-After', '1');
+
+  res.status(statusCode).json({
+    statusCode,
+    // The contract has one code per 503 (e.g. the rate limiter's own RATE_LIMIT_UNAVAILABLE).
+    code:
+      exception instanceof ThrottlerException
+        ? 'RATE_LIMITED'
+        : statusCode === 503
+          ? 'UNAVAILABLE'
+          : (code ?? V1_CODES[statusCode] ?? 'ERROR'),
+    message: statusCode >= 500 ? 'Service unavailable' : message
+  });
+}
+
+/** Error envelope `{ statusCode, code, message }` for the /v1 routes of docs/vc-api.md. */
 @Catch()
 export class V1ErrorFilter implements ExceptionFilter {
   catch(exception: unknown, host: ArgumentsHost): void {
-    const res = host.switchToHttp().getResponse<HttpResponse>();
-
-    if (!(exception instanceof HttpException)) {
-      logUnexpected(exception);
-      res.status(500).json({ statusCode: 500, code: 'INTERNAL_ERROR', message: 'Internal server error' });
-
-      return;
-    }
-
-    const statusCode = exception.getStatus();
-    const { code, message } = describe(exception);
-
-    res.status(statusCode).json({
-      statusCode,
-      code: exception instanceof ThrottlerException ? 'RATE_LIMITED' : (code ?? V1_CODES[statusCode] ?? 'ERROR'),
-      message: statusCode >= 500 ? 'Service unavailable' : message
-    });
+    renderV1(exception, host.switchToHttp().getResponse<HttpResponse>());
   }
 }
 
@@ -88,37 +102,98 @@ export function oauthError(status: number, error: string, description: string): 
 @Catch()
 export class ProtocolErrorFilter implements ExceptionFilter {
   catch(exception: unknown, host: ArgumentsHost): void {
-    const res = host.switchToHttp().getResponse<HttpResponse>();
+    renderProtocol(exception, host.switchToHttp().getResponse<HttpResponse>());
+  }
+}
 
-    if (!(exception instanceof HttpException)) {
-      logUnexpected(exception);
-      res.status(500).json({ error: 'server_error' });
+function renderProtocol(exception: unknown, res: HttpResponse): void {
+  if (!(exception instanceof HttpException)) {
+    logUnexpected(exception);
+    res.status(500).json({ error: 'server_error' });
 
-      return;
-    }
+    return;
+  }
 
-    const status = exception.getStatus();
-    const body = exception.getResponse() as { error?: unknown; error_description?: unknown };
+  const status = exception.getStatus();
+  const body = exception.getResponse() as { error?: unknown; error_description?: unknown };
 
-    // Thrown with oauthError(): Nest's own exceptions also carry `error` ("Not Found"), not an OAuth code.
-    if (typeof body === 'object' && typeof body.error === 'string' && 'error_description' in body) {
-      res.status(status).json({ error: body.error, error_description: String(body.error_description ?? '') });
+  // Thrown with oauthError(): Nest's own exceptions also carry `error` ("Not Found"), not an OAuth code.
+  if (typeof body === 'object' && typeof body.error === 'string' && 'error_description' in body) {
+    res.status(status).json({ error: body.error, error_description: String(body.error_description ?? '') });
 
-      return;
-    }
+    return;
+  }
 
-    const error =
-      status === HttpStatus.TOO_MANY_REQUESTS || status === HttpStatus.SERVICE_UNAVAILABLE
-        ? 'temporarily_unavailable'
-        : status === HttpStatus.NOT_FOUND
-          ? 'not_found'
-          : status >= 500
-            ? 'server_error'
-            : 'invalid_request';
+  const error =
+    status === HttpStatus.TOO_MANY_REQUESTS || status === HttpStatus.SERVICE_UNAVAILABLE
+      ? 'temporarily_unavailable'
+      : status === HttpStatus.NOT_FOUND
+        ? 'not_found'
+        : status >= 500
+          ? 'server_error'
+          : 'invalid_request';
 
-    res.status(status >= 500 && status !== 503 ? 500 : status).json({
-      error,
-      error_description: status >= 500 ? 'Server error' : describe(exception).message
+  res.status(status >= 500 && status !== 503 ? 500 : status).json({
+    error,
+    error_description: status >= 500 ? 'Server error' : describe(exception).message
+  });
+}
+
+/** Paths of the unprefixed protocol routes (docs/vc-api.md §3, §4, §6). */
+const PROTOCOL_PATH = /^\/(\.well-known|issuers|oid4vp|trust-list)(\/|$)/;
+type Shape = 'protocol' | 'v1' | 'default';
+
+/** Which error shape a path gets; the auth routes keep Nest's own shape (docs/auth-flow.md). */
+export function errorShapeOf(path: string): Shape {
+  if (PROTOCOL_PATH.test(path)) return 'protocol';
+  if (path.startsWith('/v1/') && !path.startsWith('/v1/auth/')) return 'v1';
+
+  return 'default';
+}
+
+/**
+ * Global fallback, so even errors no controller filter sees (unknown paths, guards of routes
+ * without a filter) get the right shape: OAuth on protocol paths, the envelope under /v1.
+ * GraphQL errors pass through untouched.
+ */
+@Catch()
+export class RoutedErrorFilter extends BaseExceptionFilter {
+  catch(exception: unknown, host: ArgumentsHost): void {
+    if (host.getType() !== 'http') throw exception;
+
+    const http = host.switchToHttp();
+    const path = (http.getRequest<{ path?: string }>().path ?? '').split('?')[0]!;
+    const shape = errorShapeOf(path);
+
+    if (shape === 'protocol') return renderProtocol(exception, http.getResponse<HttpResponse>());
+    if (shape === 'v1') return renderV1(exception, http.getResponse<HttpResponse>());
+
+    super.catch(exception, host);
+  }
+}
+
+/**
+ * Express error handler right after the body parsers: malformed JSON, oversized or badly
+ * encoded bodies never reach Nest, so they are rendered here (never the parser's message).
+ */
+export function bodyParserErrorHandler(
+  error: { status?: number; type?: string },
+  req: { path?: string },
+  res: HttpResponse,
+  next: (error?: unknown) => void
+): void {
+  const status = error?.status === 413 ? 413 : error?.status === 400 || error?.status === 415 ? error.status : undefined;
+  const shape = errorShapeOf(req.path ?? '');
+
+  if (status === undefined || shape === 'default') return next(error);
+
+  if (shape === 'protocol') {
+    res.status(status).json({ error: 'invalid_request', error_description: status === 413 ? 'the request body is too large' : 'the request body is malformed' });
+  } else {
+    res.status(status).json({
+      statusCode: status,
+      code: status === 413 ? 'PAYLOAD_TOO_LARGE' : 'VALIDATION_FAILED',
+      message: status === 413 ? 'The request body is too large.' : 'The request body is malformed.'
     });
   }
 }

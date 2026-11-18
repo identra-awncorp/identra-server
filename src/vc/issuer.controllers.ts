@@ -14,26 +14,26 @@ import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import type { HttpRequest, HttpResponse as SdkResponse } from '@identra/sdk-server';
 
 import { allowAnyOrigin, apiError, HttpResponse, oauthError, ProtocolErrorFilter, V1ErrorFilter } from '../common/http-errors';
-import { RateLimit } from '../common/rate-limit';
+import { RateLimit, RateLimitFailClosed } from '../common/rate-limit';
 import { createRedisStateStore, StateStore } from '../common/state-store';
 import { DemoPortalGuard, PortalSession, PortalSessionData } from '../demo-portal/portal-sessions';
 import { RedisService } from '../infrastructure/redis/redis.service';
 import { ISSUER_STATE_NAMESPACE, ISSUERS, IssuerRegistry } from './issuers';
 
-interface RawRequest {
+export interface RawRequest {
   headers: Record<string, string | string[] | undefined>;
   /** Set by the body parsers when the app is created with `rawBody: true` (main.ts, tests). */
   rawBody?: Buffer;
   body?: unknown;
 }
 
-type RawResponse = HttpResponse & { statusCode: number; getHeader(name: string): unknown; end(body: string): void };
+export type RawResponse = HttpResponse & { statusCode: number; getHeader(name: string): unknown; end(body: string): void };
 
 /**
  * The exact request the SDK must see: lower-case header names and the body text byte for byte,
  * from the parser's raw buffer, never the parsed and re-serialised object.
  */
-function sdkRequest(req: RawRequest): HttpRequest {
+export function sdkRequest(req: RawRequest): HttpRequest {
   const headers: Record<string, string | undefined> = {};
 
   for (const [name, value] of Object.entries(req.headers)) {
@@ -48,7 +48,7 @@ function sdkRequest(req: RawRequest): HttpRequest {
 }
 
 /** Writes the SDK's response unchanged (res.end: Express would add a charset and an ETag). */
-function send(res: RawResponse, r: SdkResponse, options: { public?: boolean } = {}): void {
+export function send(res: RawResponse, r: SdkResponse, options: { public?: boolean } = {}): void {
   res.statusCode = r.status;
 
   for (const [name, value] of Object.entries(r.headers)) res.setHeader(name, value);
@@ -127,6 +127,7 @@ const CONFIGURATION = 'bang-tot-nghiep-v1';
 @Controller('demo/school/offers')
 @UseFilters(V1ErrorFilter)
 @UseGuards(DemoPortalGuard)
+@RateLimitFailClosed()
 @ApiBearerAuth()
 export class PortalOffersController {
   private readonly portalState: StateStore;

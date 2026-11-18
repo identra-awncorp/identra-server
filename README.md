@@ -52,16 +52,20 @@ server (`import … from '@identra/sdk-server'`); Node 24 loads them with `requi
 
 ### Credential features (optional locally)
 
-Trust list, status lists and the school portal's status changes need organisation keys
+Trust list, status lists, issuance and verification need organisation keys
 (`IDENTRA_KEYS_DIR`, layout of `identra-sdk/scripts/pki/make-demo-pki.sh`). A local demo set,
 kept outside the repository:
 
 ```bash
 ../identra-sdk/scripts/pki/make-demo-pki.sh ~/.identra/demo-pki
 node ../identra-sdk/scripts/pki/make-trust-list-source.mjs ~/.identra/demo-pki --out ~/.identra/demo-pki/trust-list.source.json
+# The demo set keeps its CA keys in ca/; the server refuses a key directory that holds CA keys
+# (ADR-0015 §2), so point it at a view without them:
+mkdir -m 700 ~/.identra/server-keys && for f in orgs trust-list-signer root.cert.pem trust-list.source.json; do
+  ln -s ~/.identra/demo-pki/$f ~/.identra/server-keys/$f; done
 ```
 
-Then set `IDENTRA_KEYS_DIR=$HOME/.identra/demo-pki` (absolute path) in `.env`. Without it the
+Then set `IDENTRA_KEYS_DIR=$HOME/.identra/server-keys` (absolute path) in `.env`. Without it the
 server runs without those routes. The school portal's sample accounts:
 `npm run build && DEMO_PORTAL_PASSWORD='Identra@2026' npm run demo:provision`.
 
@@ -205,9 +209,13 @@ The setup step applies the migrations (`prisma migrate deploy`), empties every t
 Redis database (it refuses unless `.env.test` points at a local `*test*` database), and stops
 with an error if either database is unreachable.
 
-The credential tests (`vc-*`, and the production-mode ones) start the app with the demo PKI
-above (`IDENTRA_TEST_KEYS_DIR` in `.env.test`, default `~/.identra/demo-pki`, read only); they
-fail with a message saying how to create it when it is missing. The other tests need no keys. Remove the containers and their volumes afterwards:
+Tests that start the app with the credential features need the demo PKI above
+(`IDENTRA_TEST_KEYS_DIR` in `.env.test`, default `~/.identra/demo-pki`, read only; the tests
+link its server part into a temporary directory without `ca/`): every `vc-*` file, and the
+production-mode files `demo-otp-production` and `dependencies-down` (production requires
+`IDENTRA_KEYS_DIR`). They fail with a message saying how to create it when it is missing. The
+other files (`access-control`, `app-setup`, `demo-otp-disabled`, `demo-portal`, `env-validation`,
+`rate-limit`) need no keys. Remove the containers and their volumes afterwards:
 
 ```bash
 docker rm -f -v identra-s0-pg identra-s0-redis

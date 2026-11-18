@@ -183,3 +183,40 @@ describe('own-origin fetch', () => {
     assert.equal(sockets, 0);
   });
 });
+
+describe('error shapes no controller filter sees (F11)', () => {
+  it('/v1: malformed JSON is 400 VALIDATION_FAILED, an oversized body 413 PAYLOAD_TOO_LARGE', async () => {
+    const malformed = await http().post('/v1/demo/school/login').set('Content-Type', 'application/json').send('{"username": ').expect(400);
+    const large = await http()
+      .post('/v1/demo/school/login')
+      .set('Content-Type', 'application/json')
+      .send(JSON.stringify({ username: 'x'.repeat(70 * 1024), password: 'y' }))
+      .expect(413);
+
+    assert.deepEqual(malformed.body, { statusCode: 400, code: 'VALIDATION_FAILED', message: 'The request body is malformed.' });
+    assert.deepEqual(large.body, { statusCode: 413, code: 'PAYLOAD_TOO_LARGE', message: 'The request body is too large.' });
+  });
+
+  it('/v1: an unknown path is 404 NOT_FOUND in the envelope', async () => {
+    const res = await http().get('/v1/no-such-route').expect(404);
+
+    assert.equal(res.body.code, 'NOT_FOUND');
+    assert.equal(res.body.statusCode, 404);
+  });
+
+  it('protocol paths: malformed or oversized bodies and unknown paths answer in the OAuth shape', async () => {
+    const malformed = await http().post('/oid4vp/response/x').set('Content-Type', 'application/json').send('{').expect(400);
+    const large = await http().post('/issuers/truong-mau/token').type('form').send(`a=${'x'.repeat(70 * 1024)}`).expect(413);
+    const unknown = await http().get('/.well-known/no-such-thing').expect(404);
+
+    assert.equal(malformed.body.error, 'invalid_request');
+    assert.equal(large.body.error, 'invalid_request');
+    assert.equal(unknown.body.error, 'not_found');
+  });
+
+  it('the auth routes keep their own shape', async () => {
+    const res = await http().post('/v1/auth/login/start').send({}).expect(400);
+
+    assert.ok(Array.isArray(res.body.message));
+  });
+});

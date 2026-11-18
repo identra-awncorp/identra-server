@@ -2,116 +2,21 @@
 // own (@identra/sdk-app), reaching the canonical origin through createMappedFetch.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 
-import {
-  base64Decode,
-  base64UrlEncode,
-  createMappedFetch,
-  utf8Encode,
-  type Clock,
-  type HttpFetch
-} from '@identra/sdk-core';
-import { createWebCryptoSigner, generateWebCryptoKeyPair, webCryptoRandom } from '@identra/sdk-core/webcrypto';
-import {
-  createCredentialVault,
-  createInMemoryCredentialRepository,
-  createInMemorySecretStorage,
-  createSoftwareKeyStore,
-  createWallet
-} from '@identra/sdk-app';
+import { base64UrlEncode, utf8Encode } from '@identra/sdk-core';
+import { createWebCryptoSigner, generateWebCryptoKeyPair } from '@identra/sdk-core/webcrypto';
 import { NestExpressApplication } from '@nestjs/platform-express';
 
 import { PrismaService } from '../src/infrastructure/prisma/prisma.service';
 import { RedisService } from '../src/infrastructure/redis/redis.service';
 import { ISSUER_CLOCK } from '../src/vc/vc.providers';
-import { createTestApp, TEST_PORTAL_PASSWORD, testKeysDir } from './helpers';
-
-const PORT = 47400;
-const LOCAL = `http://127.0.0.1:${PORT}`;
-const ORIGIN = 'https://api-identra.awncorp.vn';
-const ISS = `${ORIGIN}/issuers/truong-mau`;
-const keysDir = testKeysDir();
-
-/** A clock that tests can move forward; reset after use. */
-function adjustableClock() {
-  let offsetMs = 0;
-
-  return {
-    now: () => new Date(Date.now() + offsetMs),
-    advance: (seconds: number) => void (offsetMs += seconds * 1000),
-    reset: () => void (offsetMs = 0)
-  } satisfies Clock & Record<string, unknown>;
-}
+import { adjustableClock, call, ISS, keysDir, LOCAL, login, newOffer, newWallet, offerState, PORT, wrongPin } from './e2e-world';
+import { createTestApp, TEST_PORTAL_PASSWORD } from './helpers';
 
 const issuerClock = adjustableClock();
 let app: NestExpressApplication;
-
-// The wallet's network: never follows redirects, honours timeoutMs (as in the SDK's tests).
-const nodeFetch: HttpFetch = async (url, init) => {
-  const r = await fetch(url, {
-    method: init?.method ?? 'GET',
-    redirect: 'manual',
-    signal: AbortSignal.timeout(init?.timeoutMs ?? 10_000),
-    ...(init?.headers ? { headers: init.headers } : {}),
-    ...(init?.body !== undefined ? { body: init.body } : {})
-  });
-
-  return { status: r.status, headers: r.headers, text: () => r.text() };
-};
-const mappedFetch = createMappedFetch(nodeFetch, { [ORIGIN]: LOCAL });
-
-function newWallet() {
-  const clock = adjustableClock();
-  const rootPem = readFileSync(join(keysDir, 'root.cert.pem'), 'utf8');
-  const rootDer = base64Decode(/-----BEGIN CERTIFICATE-----([\s\S]+?)-----END/.exec(rootPem)![1]!.replace(/\s+/g, ''));
-  const wallet = createWallet({
-    keyStore: createSoftwareKeyStore({ secrets: createInMemorySecretStorage(), random: webCryptoRandom }),
-    vault: createCredentialVault({
-      repository: createInMemoryCredentialRepository(),
-      secrets: createInMemorySecretStorage(),
-      random: webCryptoRandom,
-      clock
-    }),
-    fetch: mappedFetch,
-    random: webCryptoRandom,
-    clock,
-    trustedRoots: [rootDer],
-    trustListUrl: `${ORIGIN}/trust-list`
-  });
-
-  return { wallet, clock };
-}
-
-/** JSON over the real listener, as the website would call it. */
-async function call(method: string, path: string, options: { token?: string; body?: unknown; ip?: string } = {}) {
-  const res = await fetch(`${LOCAL}${path}`, {
-    method,
-    headers: {
-      ...(options.token ? { authorization: `Bearer ${options.token}` } : {}),
-      ...(options.body !== undefined ? { 'content-type': 'application/json' } : {}),
-      ...(options.ip ? { 'x-forwarded-for': options.ip } : {})
-    },
-    ...(options.body !== undefined ? { body: JSON.stringify(options.body) } : {})
-  });
-  const text = await res.text();
-
-  return { status: res.status, headers: res.headers, body: text ? JSON.parse(text) : null };
-}
-
-const login = async (username: string) =>
-  (await call('POST', '/v1/demo/school/login', { body: { username, password: TEST_PORTAL_PASSWORD } })).body.token as string;
-const newOffer = async (token: string) => {
-  const res = await call('POST', '/v1/demo/school/offers', { token });
-
-  assert.equal(res.status, 201, JSON.stringify(res.body));
-
-  return res.body as { offerId: string; offerUri: string; txCode: string; expiresAt: string; serverTime: string };
-};
-const offerState = async (token: string, offerId: string) => call('GET', `/v1/demo/school/offers/${offerId}`, { token });
-const wrongPin = (pin: string) => String((Number(pin) + 1) % 1_000_000).padStart(6, '0');
 
 before(async () => {
   app = await createTestApp(

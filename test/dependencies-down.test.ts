@@ -45,7 +45,8 @@ describe('production errors do not leak infrastructure details (F6)', () => {
     assert.deepEqual(res.body.services, {
       database: { status: 'down' },
       redis: { status: 'down' },
-      trustList: { status: 'up' }
+      trustList: { status: 'up' },
+      verifier: { status: 'up' }
     });
     assert.equal(res.body.status, 'degraded');
   });
@@ -87,6 +88,22 @@ describe('rate limiting without Redis', () => {
 
     assert.equal(res.body.code, 'RATE_LIMIT_UNAVAILABLE');
     await http().get('/v1/auth/status').expect(503);
+  });
+
+  it('the school portal and the status-change route refuse with 503 UNAVAILABLE, never 500 or 401 (F4)', async () => {
+    for (const [method, path, body] of [
+      ['post', '/v1/demo/school/login', { username: 'sv001', password: 'Identra@2026' }],
+      ['post', '/v1/demo/school/login', { username: 'sv001', password: 'wrong-password' }],
+      ['get', '/v1/demo/school/credentials', undefined],
+      ['post', '/v1/demo/school/offers', undefined],
+      ['post', '/v1/issuers/truong-mau/credentials/AAAAAAAAAAAAAAAAAAAAAA/status', { status: 'revoked' }]
+    ] as const) {
+      const req = method === 'post' ? http().post(path).send(body ?? {}) : http().get(path);
+      const res = await req.set('Authorization', 'Bearer some-portal-token-value-123').expect(503);
+
+      assert.equal(res.body.code, 'UNAVAILABLE', path);
+      assert.equal(res.headers['retry-after'], '1', path);
+    }
   });
 
   it('fails open elsewhere', async () => {

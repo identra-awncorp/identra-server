@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomInt } from 'node:crypto';
-import { existsSync } from 'node:fs';
-import { homedir } from 'node:os';
+import { existsSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import { NestExpressApplication } from '@nestjs/platform-express';
@@ -56,7 +56,7 @@ export async function createTestApp(
  * The demo PKI (identra-sdk/scripts/pki/make-demo-pki.sh, outside git) for the credential tests.
  * Missing → the test file fails with this message; it is never skipped.
  */
-export function testKeysDir(): string {
+export function demoPkiDir(): string {
   const dir = process.env.IDENTRA_TEST_KEYS_DIR || join(homedir(), '.identra', 'demo-pki');
 
   if (!existsSync(join(dir, 'root.cert.pem')) || !existsSync(join(dir, 'trust-list.source.json'))) {
@@ -67,6 +67,29 @@ export function testKeysDir(): string {
   }
 
   return dir;
+}
+
+let keysView: string | undefined;
+
+/**
+ * IDENTRA_KEYS_DIR for tests: a temporary directory of symlinks to the demo PKI's server part
+ * (orgs/, trust-list-signer/, root.cert.pem, trust-list.source.json). The demo set also holds
+ * its CA keys in ca/, which the server refuses to start with (ADR-0015 §2); nothing is copied.
+ */
+export function testKeysDir(): string {
+  if (keysView) return keysView;
+
+  const pki = demoPkiDir();
+  const view = mkdtempSync(join(tmpdir(), 'identra-keys-'));
+
+  for (const name of ['orgs', 'trust-list-signer', 'root.cert.pem', 'trust-list.source.json']) {
+    symlinkSync(join(pki, name), join(view, name));
+  }
+
+  process.once('exit', () => rmSync(view, { recursive: true, force: true }));
+  keysView = view;
+
+  return view;
 }
 
 /** A production configuration that passes every startup check. */

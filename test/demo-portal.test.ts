@@ -75,7 +75,9 @@ describe('POST /v1/demo/school/login', () => {
     assert.equal(role, 'student');
     assert.equal(profile.hoTen, 'Nguyễn Thị Minh Anh');
     assert.equal(Date.parse(expiresAt) - Date.parse(serverTime), 30 * 60 * 1000);
-    assert.ok((await redis.ttl(key)) > 29 * 60);
+    const ttl = await redis.ttl(key);
+
+    assert.ok(ttl > 29 * 60 && ttl <= 30 * 60, `ttl ${ttl}`);
     assert.deepEqual(await redis.keys(`*${token}*`), []);
   });
 
@@ -137,6 +139,70 @@ describe('GET /v1/demo/school/credentials', () => {
       issuedAt: mine[1]!.issuedAt.toISOString(),
       status: 'revoked'
     });
+  });
+
+  it('pages newest first with limit and cursor, and scopes names to the issuer (F12)', async () => {
+    const before = new Date(Date.now() - 3_600_000);
+    const own = [];
+
+    for (let i = 0; i < 5; i += 1) {
+      own.push(
+        await prisma.vcIssuedCredential.create({
+          data: {
+            id: randomBytes(16).toString('base64url'),
+            issuerName: 'truong-mau',
+            vct: 'v',
+            subjectRef: 'sv003',
+            statusListNumber: 78,
+            statusIndex: i,
+            cnfThumbprint: 'x',
+            // Two share one instant: the id breaks the tie.
+            issuedAt: new Date(before.getTime() - (i < 2 ? 0 : i) * 1000)
+          }
+        })
+      );
+    }
+
+    const token = await portalLogin(app, 'sv003');
+    const seen: string[] = [];
+    let cursor: string | null = null;
+    let pages = 0;
+
+    do {
+      const res: request.Response = await http()
+        .get('/v1/demo/school/credentials')
+        .query({ limit: 2, ...(cursor ? { cursor } : {}) })
+        .auth(token, { type: 'bearer' })
+        .expect(200);
+
+      assert.ok(res.body.items.length <= 2);
+      seen.push(...res.body.items.map((i: { id: string }) => i.id));
+      cursor = res.body.nextCursor;
+      pages += 1;
+    } while (cursor && pages < 10);
+
+    assert.equal(pages, 3);
+    assert.deepEqual(new Set(seen), new Set(own.map((r) => r.id)));
+    assert.equal(seen.length, 5);
+    const order = own.sort((a, b) => b.issuedAt.getTime() - a.issuedAt.getTime() || (b.id < a.id ? -1 : 1)).map((r) => r.id);
+    assert.deepEqual(seen, order);
+
+    for (const query of [{ limit: 101 }, { limit: 0 }, { cursor: 'not a cursor!' }, { cursor: 'bm90LWpzb24' }]) {
+      const res = await http().get('/v1/demo/school/credentials').query(query).auth(token, { type: 'bearer' }).expect(400);
+
+      assert.equal(res.body.code, 'VALIDATION_FAILED');
+    }
+
+    // A row whose subject is an account of ANOTHER issuer gets no name from it.
+    const crossed = await row('phongqlcl-nsx');
+    const registrar = await http()
+      .get('/v1/demo/school/credentials')
+      .query({ limit: 100 })
+      .auth(await portalLogin(app, 'phongdaotao'), { type: 'bearer' })
+      .expect(200);
+    const item = registrar.body.items.find((i: { id: string }) => i.id === crossed.id);
+
+    assert.deepEqual([item.studentName, item.studentCode], [null, null]);
   });
 
   it('needs a live session: 401 SESSION_EXPIRED without one or after it expired', async () => {

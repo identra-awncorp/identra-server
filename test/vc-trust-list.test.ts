@@ -9,6 +9,7 @@ import request from 'supertest';
 
 import { verifyTrustListToken } from '@identra/sdk-core';
 import { PKI, Pki } from '../src/vc/vc.providers';
+import { VERIFIERS } from '../src/vc/verifiers';
 import { createTestApp, testKeysDir } from './helpers';
 
 // The source is a copy (public data, no keys): the demo PKI itself is read-only for tests.
@@ -30,7 +31,11 @@ let pki: Pki;
 
 before(async () => {
   // The source file does not exist yet: the first request has nothing good to serve.
-  app = await createTestApp({ IDENTRA_KEYS_DIR: keysDir, IDENTRA_TRUST_LIST_SOURCE: sourcePath });
+  // No hosted verifier here: constructing one needs a trust list, and this test starts without one.
+  app = await createTestApp(
+    { IDENTRA_KEYS_DIR: keysDir, IDENTRA_TRUST_LIST_SOURCE: sourcePath },
+    { override: (builder) => builder.overrideProvider(VERIFIERS).useValue(new Map()) }
+  );
   pki = app.get(PKI);
 });
 
@@ -62,6 +67,9 @@ describe('GET /trust-list', () => {
     assert.equal(res.headers['cache-control'], 'public, max-age=300');
     assert.equal(res.headers['access-control-allow-origin'], '*');
     assert.equal(res.headers['access-control-allow-credentials'], undefined);
+    // Public signed resources: Date readable by pages, 1200 requests per minute (contract §2, §8).
+    assert.match(res.headers['access-control-expose-headers'] ?? '', /\bDate\b/);
+    assert.equal(res.headers['x-ratelimit-limit'], '1200');
 
     const verified = await verify(res.text);
 
@@ -100,6 +108,20 @@ describe('GET /trust-list', () => {
     assert.ok(before.ok && now.ok);
     assert.equal(now.payload.issuers[0]!.ten, 'Trường Mẫu Đổi Tên (DEMO)');
     assert.ok(now.payload.iat > before.payload.iat);
+    firstToken = res.text;
+  });
+
+  it('notices an edit that keeps the mtime (cache keyed on mtime, ctime, size, inode)', async () => {
+    const source = JSON.parse(sourceText);
+
+    source.issuers[0].ten = 'Trường Mẫu Cùng Mtime (DEMO)';
+    writeFileSync(sourcePath, JSON.stringify(source));
+    utimesSync(sourcePath, mtime, mtime); // the same mtime as the previous write
+
+    const res = await http().get('/trust-list').expect(200);
+    const now = await verify(res.text);
+
+    assert.ok(now.ok && now.payload.issuers[0]!.ten === 'Trường Mẫu Cùng Mtime (DEMO)');
     firstToken = res.text;
   });
 

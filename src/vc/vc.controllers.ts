@@ -25,11 +25,11 @@ import { IsIn } from 'class-validator';
 
 import { OrgApiKeyHash } from '../config/env.validation';
 import { allowAnyOrigin, apiError, HttpResponse, ProtocolErrorFilter, V1ErrorFilter } from '../common/http-errors';
-import { RateLimit } from '../common/rate-limit';
+import { RateLimit, RateLimitFailClosed } from '../common/rate-limit';
 import { PortalSessions, readBearer } from '../demo-portal/portal-sessions';
 import type { StatusListService, TrustListService } from '@identra/sdk-server';
 import { VcCredentialsService } from './vc-credentials.service';
-import { STATUS_LIST_SERVICE, TRUST_LIST_SERVICE } from './vc.providers';
+import { STATUS_LIST_SERVICE, StatusListBusyError, TRUST_LIST_SERVICE } from './vc.providers';
 
 const ISSUER_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const LIST_NUMBER = /^[1-9][0-9]{0,8}$/;
@@ -73,8 +73,16 @@ export class StatusListController {
   @Get(':name/status/:n')
   @RateLimit('publicResource')
   async get(@Param('name') name: string, @Param('n') n: string, @Res({ passthrough: true }) res: HttpResponse) {
-    const token =
-      ISSUER_NAME.test(name) && LIST_NUMBER.test(n) ? await this.statusLists.token(name, Number(n)) : null;
+    let token: string | null = null;
+
+    try {
+      token = ISSUER_NAME.test(name) && LIST_NUMBER.test(n) ? await this.statusLists.token(name, Number(n)) : null;
+    } catch (error) {
+      if (!(error instanceof StatusListBusyError)) throw error;
+
+      res.setHeader('Retry-After', '1');
+      throw new ServiceUnavailableException('The status list is being updated.');
+    }
 
     if (token === null) throw new NotFoundException('No such status list.');
 
@@ -144,6 +152,7 @@ class ChangeStatusDto {
 @ApiTags('trust')
 @Controller('issuers')
 @UseFilters(V1ErrorFilter)
+@RateLimitFailClosed()
 export class CredentialStatusController {
   constructor(private readonly credentials: VcCredentialsService) {}
 

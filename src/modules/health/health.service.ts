@@ -3,8 +3,8 @@ import { ModuleRef } from '@nestjs/core';
 
 import { PrismaService } from '../../infrastructure/prisma/prisma.service';
 import { RedisService } from '../../infrastructure/redis/redis.service';
-import type { TrustListService } from '@identra/sdk-server';
-import { TRUST_LIST_SERVICE } from '../../vc/vc.providers';
+import { TRUST_LIST_MONITOR, TrustListMonitor } from '../../vc/trust-list';
+import { VERIFIER_MONITOR, VerifierMonitor } from '../../vc/verifiers';
 
 @Injectable()
 export class HealthService {
@@ -15,13 +15,14 @@ export class HealthService {
   ) {}
 
   async check() {
-    const [database, redis, trustList] = await Promise.all([
+    const [database, redis, credentials] = await Promise.all([
       this.checkDatabase(),
       this.checkRedis(),
-      this.checkTrustList()
+      this.checkCredentials()
     ]);
     // `status` (the container healthcheck) follows the stores only: a broken trust-list source
-    // must not make Docker restart the api. Monitoring watches `trustList` (ADR-0014 §7).
+    // must not make Docker restart the api. Monitoring watches `trustList` and `verifier`
+    // (ADR-0014 §7).
     const isHealthy = database.status === 'up' && redis.status === 'up';
 
     return {
@@ -30,25 +31,29 @@ export class HealthService {
       services: {
         database,
         redis,
-        ...(trustList ? { trustList } : {})
+        ...(credentials ?? {})
       }
     };
   }
 
-  /** Only when the credential features are on: can a valid trust list be served right now? */
-  private async checkTrustList() {
-    let service: TrustListService;
+  /**
+   * Only when the credential features are on: does the served trust list verify (and is it far
+   * from expiry), and are the hosted verifiers still in it? Both are cached by their monitors.
+   */
+  private async checkCredentials(): Promise<{ trustList: { status: 'up' | 'down' }; verifier: { status: 'up' | 'down' } } | null> {
+    let trustList: TrustListMonitor;
+    let verifiers: VerifierMonitor;
 
     try {
-      service = this.moduleRef.get<TrustListService>(TRUST_LIST_SERVICE, { strict: false });
+      trustList = this.moduleRef.get<TrustListMonitor>(TRUST_LIST_MONITOR, { strict: false });
+      verifiers = this.moduleRef.get<VerifierMonitor>(VERIFIER_MONITOR, { strict: false });
     } catch {
       return null;
     }
 
-    return service
-      .token()
-      .then(() => ({ status: 'up' as const }))
-      .catch(() => ({ status: 'down' as const }));
+    const [t, v] = await Promise.all([trustList.check(), verifiers.check().catch(() => 'down' as const)]);
+
+    return { trustList: { status: t }, verifier: { status: v } };
   }
 
   private async checkDatabase() {

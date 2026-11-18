@@ -53,6 +53,20 @@ docker compose --env-file /etc/identra/server.env -f docker-compose.prod.yml \
   table and never prints the password. Issued diplomas are recorded in `VcIssuedCredential`
   (status entry, cnf thumbprint, no claims); the credential itself is never stored.
 
+### Verifier (OpenID4VP, `nha-tuyen-dung-mau`)
+
+- Its `request` key is `orgs/nha-tuyen-dung-mau/request.{key,chain}.pem`; the certificate's
+  fingerprint must be in the trust list with purpose `request`, or the server refuses to
+  start (`Verifier nha-tuyen-dung-mau cannot start: …`). If a later edit of the trust list
+  drops it, `/v1/health` shows `verifier: down` (re-checked hourly) and wallets warn that the
+  verifier is not trusted. Verifiers are listed in `src/vc/verifiers.ts`.
+- Sessions and their results live only in Redis (5 minutes to answer, results 30 minutes).
+  Nothing about a presentation is written to Postgres or to the log, which carries only the
+  first 8 characters of the session id, the outcome and the failing check code.
+
+The key directory must not contain CA keys: the server refuses to start when it finds a `ca/`
+directory or a `ca.key.pem` anywhere under it (ADR-0015 §2, ADR-0016 §6).
+
 Single instance: one api container (ADR-0016). Status lists are read from Postgres on every
 request, so a second instance would never serve a stale list, but two instances could sign
 two tokens with the same `iat` in one second.

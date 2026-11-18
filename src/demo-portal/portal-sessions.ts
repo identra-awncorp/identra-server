@@ -4,7 +4,7 @@ import { CanActivate, ExecutionContext, Injectable, OnModuleInit, createParamDec
 import { DemoPortalRole } from '@prisma/client';
 import * as argon2 from 'argon2';
 
-import { apiError } from '../common/http-errors';
+import { apiError, unavailable } from '../common/http-errors';
 import { createRedisStateStore, StateStore } from '../common/state-store';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { RedisService } from '../infrastructure/redis/redis.service';
@@ -57,7 +57,9 @@ export class PortalSessions implements OnModuleInit {
     const session: PortalSessionData = { username: account.username, role: account.role, issuerName: account.issuerName };
     const now = new Date();
 
-    await this.store.put(hashToken(token), JSON.stringify(session), PORTAL_SESSION_SECONDS);
+    await this.store.put(hashToken(token), JSON.stringify(session), PORTAL_SESSION_SECONDS).catch(() => {
+      throw unavailable();
+    });
 
     return {
       token,
@@ -69,7 +71,10 @@ export class PortalSessions implements OnModuleInit {
   }
 
   async find(token: string): Promise<PortalSessionData | null> {
-    const stored = await this.store.get(hashToken(token));
+    // Redis down: 503, never a 500 (or a 401 that would send the user to sign in again).
+    const stored = await this.store.get(hashToken(token)).catch(() => {
+      throw unavailable();
+    });
 
     return stored ? (JSON.parse(stored) as PortalSessionData) : null;
   }
