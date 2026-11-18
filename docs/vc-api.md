@@ -196,12 +196,23 @@ a client cannot ask for arbitrary claims.
 
 | Method and path | Auth | Purpose |
 |---|---|---|
-| `GET /v1/products/:gtin/:serial/events` | none | `{ gtin, serial, events: ["<compact>", …] }` in chain order; `404` for an unknown product |
+| `GET /v1/products/:gtin/:serial/events` | none | `{ gtin, serial, serverTime, events: ["<compact>", …] }` in chain order; `404` for an unknown product |
 | `POST /v1/products/:gtin/:serial/events` `{ credential }` | organisation API key | Appends one signed event after verifying it and its position in the chain |
 
 The server is a store, not an authority: the page that shows a product verifies
 every event in the browser with `@identra/sdk-core` and the pinned root
-certificate. The `POST` verification only keeps garbage out of the store.
+certificate. The `POST` verification only keeps garbage out of the store: the
+existing chain must verify completely and the new event must extend it by
+exactly the next stage. `serverTime` is a hint for pages to warn about a wrong
+device clock; no verification decision uses it.
+
+`:gtin` is 14 digits with a valid check digit; `:serial` is 1–20 characters of
+the GS1 AI (21) character set, percent-encoded in the path. The QR code printed
+on a product is exactly `<website>/01/<GTIN-14>/21/<serial>`.
+
+All issuers of this deployment are hosted by this server. When it verifies a
+presentation or a product event it reads status lists only from its own
+canonical origin, in-process; it never fetches a status list from another host.
 
 ## 8. Rate limits
 
