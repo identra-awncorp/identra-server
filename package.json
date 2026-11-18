@@ -53,6 +53,7 @@
     "zod": "^3.24.1"
   },
   "devDependencies": {
+    "@identra/sdk-app": "file:../identra-sdk/packages/app",
     "@nestjs/cli": "^11.0.0",
     "@nestjs/schematics": "^11.0.0",
     "@nestjs/testing": "^11.0.0",

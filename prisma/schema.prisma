@@ -424,6 +424,8 @@ model VcIssuedCredential {
   statusIndex      Int
   // RFC 7638 thumbprint of the credential's cnf key.
   cnfThumbprint    String
+  // The OpenID4VCI offer it was issued for: makes recording an issuance idempotent.
+  offerId          String?            @unique
   status           VcCredentialStatus @default(valid)
   issuedAt         DateTime           @default(now())
   statusChangedAt  DateTime           @default(now())

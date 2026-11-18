@@ -37,10 +37,18 @@ the terminal can reload the updated `PATH`.
 ### The Identra SDK
 
 The server uses `@identra/sdk-core` and `@identra/sdk-server` from the sibling directory
-`../identra-sdk` (`file:` dependencies, ADR-0005). Build the SDK there first
-(`npm install --ignore-scripts && npm run build`), then run `npm install` here; after an SDK
-rebuild, just restart the server. The SDK packages are ES modules: the server imports them
-only through `src/sdk.mts`, which Node 24 loads from the CommonJS code with `require(esm)`.
+`../identra-sdk` (`file:` dependencies, ADR-0005); the tests also use `@identra/sdk-app` (the
+wallet) as a dev dependency. Build the SDK there first, installing its dependencies without
+install scripts (its README explains why):
+
+```bash
+(cd ../identra-sdk && npm ci --ignore-scripts && npm run build)
+npm ci && npm run lint && npm run build && npm test
+```
+
+After an SDK rebuild, restart the server; run `npm install` here again only when an SDK
+`package.json` changed. The SDK packages are ES modules imported by name from the CommonJS
+server (`import … from '@identra/sdk-server'`); Node 24 loads them with `require(esm)`.
 
 ### Credential features (optional locally)
 

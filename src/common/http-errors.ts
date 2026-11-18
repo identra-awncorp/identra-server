@@ -92,7 +92,7 @@ export class ProtocolErrorFilter implements ExceptionFilter {
 
     if (!(exception instanceof HttpException)) {
       logUnexpected(exception);
-      res.status(500).json({ error: 'server_error', error_description: 'Internal server error' });
+      res.status(500).json({ error: 'server_error' });
 
       return;
     }
@@ -129,6 +129,8 @@ export class ProtocolErrorFilter implements ExceptionFilter {
  */
 export function allowAnyOrigin(res: HttpResponse): void {
   res.setHeader('Access-Control-Allow-Origin', '*');
+  // Date lets a page warn about a wrong device clock (docs/vc-api.md §2).
+  res.setHeader('Access-Control-Expose-Headers', 'Date, Retry-After');
   res.removeHeader('Access-Control-Allow-Credentials');
   res.removeHeader('Vary');
 }

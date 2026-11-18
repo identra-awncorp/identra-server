@@ -34,7 +34,7 @@ export async function createTestApp(
 
   const { AppModule } = await import('../src/app.module.js');
   const moduleRef = await override(Test.createTestingModule({ imports: [AppModule], controllers })).compile();
-  const app = moduleRef.createNestApplication<NestExpressApplication>({ logger: false });
+  const app = moduleRef.createNestApplication<NestExpressApplication>({ logger: false, rawBody: true });
 
   configureApp(app);
   await app.init();

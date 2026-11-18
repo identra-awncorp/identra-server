@@ -27,7 +27,7 @@ import { OrgApiKeyHash } from '../config/env.validation';
 import { allowAnyOrigin, apiError, HttpResponse, ProtocolErrorFilter, V1ErrorFilter } from '../common/http-errors';
 import { RateLimit } from '../common/rate-limit';
 import { PortalSessions, readBearer } from '../demo-portal/portal-sessions';
-import type { StatusListService, TrustListService } from '../sdk.mjs';
+import type { StatusListService, TrustListService } from '@identra/sdk-server';
 import { VcCredentialsService } from './vc-credentials.service';
 import { STATUS_LIST_SERVICE, TRUST_LIST_SERVICE } from './vc.providers';
 
@@ -42,6 +42,7 @@ const signedResource = (token: string, type: string) => new StreamableFile(Buffe
 @ApiTags('trust')
 @Controller('trust-list')
 @UseFilters(ProtocolErrorFilter)
+@RateLimit('publicResource')
 export class TrustListController {
   constructor(@Inject(TRUST_LIST_SERVICE) private readonly trustList: TrustListService) {}
 
@@ -70,6 +71,7 @@ export class StatusListController {
   constructor(@Inject(STATUS_LIST_SERVICE) private readonly statusLists: StatusListService) {}
 
   @Get(':name/status/:n')
+  @RateLimit('publicResource')
   async get(@Param('name') name: string, @Param('n') n: string, @Res({ passthrough: true }) res: HttpResponse) {
     const token =
       ISSUER_NAME.test(name) && LIST_NUMBER.test(n) ? await this.statusLists.token(name, Number(n)) : null;

@@ -9,25 +9,32 @@ import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { RedisService } from '../infrastructure/redis/redis.service';
 import {
   createCertificateChainValidator,
-  createFileKeyStore,
   createSignedTrustListRegistry,
   createStatusListChecker,
-  createStatusListService,
-  createTrustListService,
-  webCryptoHasher,
-  webCryptoRandom,
-  webCryptoVerifier,
   type CertificateChainValidator,
   type Clock,
-  type HttpFetch,
+  type HttpFetch
+} from '@identra/sdk-core';
+import { webCryptoHasher, webCryptoRandom, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
+import {
+  createFileKeyStore,
+  createStatusListService,
+  createTrustListService,
   type IssuerKeyStore,
   type StatusListService,
   type TrustListService
-} from '../sdk.mjs';
+} from '@identra/sdk-server';
 import { createOwnFetch } from './own-fetch';
 import { createPrismaStatusListStorage } from './status-storage';
 
 export const PKI = Symbol('PKI');
+/** The clock of signing and verification (status lists, trust list, chain validation). */
+export const CLOCK = Symbol('CLOCK');
+/**
+ * The clock of the OpenID4VCI issuers (offer, token and proof lifetimes). The real clock; a
+ * separate token only so tests can move offers past their 10 minutes without touching the lists.
+ */
+export const ISSUER_CLOCK = Symbol('ISSUER_CLOCK');
 export const TRUST_LIST_SERVICE = Symbol('TRUST_LIST_SERVICE');
 export const STATUS_LIST_SERVICE = Symbol('STATUS_LIST_SERVICE');
 export const OWN_FETCH = Symbol('OWN_FETCH');
@@ -55,7 +62,7 @@ const PURPOSE_FILES = { vc: ['vc', 'vc-product'], status: ['status'], request: [
  * signer), so a missing, unreadable or invalid key stops the startup instead of the first
  * request. Messages name files and SDK error codes only, never key material.
  */
-async function loadPki(config: ConfigService): Promise<Pki> {
+async function loadPki(config: ConfigService, clock: Clock): Promise<Pki> {
   const dir = config.getOrThrow<string>('IDENTRA_KEYS_DIR');
   const baseUrl = config.getOrThrow<string>('IDENTRA_PUBLIC_BASE_URL');
 
@@ -87,7 +94,7 @@ async function loadPki(config: ConfigService): Promise<Pki> {
       verifier: webCryptoVerifier,
       hasher: webCryptoHasher,
       random: webCryptoRandom,
-      clock: { now: () => new Date() }
+      clock
     };
   } catch (error) {
     const reason = error instanceof Error ? error.message : 'unknown error';
@@ -127,7 +134,9 @@ function trustListSource(path: string): () => unknown {
 const LAST_TRUST_LIST_TOKEN = 'last-token';
 
 export const vcProviders: Provider[] = [
-  { provide: PKI, inject: [ConfigService], useFactory: loadPki },
+  { provide: CLOCK, useValue: { now: () => new Date() } satisfies Clock },
+  { provide: ISSUER_CLOCK, useExisting: CLOCK },
+  { provide: PKI, inject: [ConfigService, CLOCK], useFactory: loadPki },
   {
     provide: TRUST_LIST_SERVICE,
     inject: [PKI, ConfigService, RedisService],
@@ -182,7 +191,7 @@ export const vcProviders: Provider[] = [
       createOwnFetch({ baseUrl: pki.baseUrl, trustList, statusLists })
   },
   {
-    // For the verifier of the next phase. maxAgeSeconds 0: always re-read (in-process for our own lists).
+    // For the verifier of the next phase. maxAgeSeconds 0: always re-read (in-process, own origin only).
     provide: TRUST_REGISTRY,
     inject: [PKI, OWN_FETCH],
     useFactory: (pki: Pki, fetch: HttpFetch) =>

@@ -3,7 +3,7 @@ import { ModuleRef } from '@nestjs/core';
 
 import { PrismaService } from '../../infrastructure/prisma/prisma.service';
 import { RedisService } from '../../infrastructure/redis/redis.service';
-import type { TrustListService } from '../../sdk.mjs';
+import type { TrustListService } from '@identra/sdk-server';
 import { TRUST_LIST_SERVICE } from '../../vc/vc.providers';
 
 @Injectable()

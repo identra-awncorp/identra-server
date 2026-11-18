@@ -7,7 +7,7 @@ import { after, before, describe, it } from 'node:test';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 
-import { verifyTrustListToken } from '../src/sdk.mjs';
+import { verifyTrustListToken } from '@identra/sdk-core';
 import { PKI, Pki } from '../src/vc/vc.providers';
 import { createTestApp, testKeysDir } from './helpers';
 

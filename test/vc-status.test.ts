@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import net from 'node:net';
 import { createHash, randomBytes, randomInt } from 'node:crypto';
 import { after, before, describe, it } from 'node:test';
 
@@ -6,7 +7,8 @@ import { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 
 import { PrismaService } from '../src/infrastructure/prisma/prisma.service';
-import { statusListEntry, verifyStatusListToken, type StatusChecker, type StatusListService, type TrustRegistry } from '../src/sdk.mjs';
+import { statusListEntry, verifyStatusListToken, type StatusChecker, type TrustRegistry } from '@identra/sdk-core';
+import type { StatusListService } from '@identra/sdk-server';
 import { createPrismaStatusListStorage } from '../src/vc/status-storage';
 import { VcCredentialsService } from '../src/vc/vc-credentials.service';
 import { PKI, Pki, STATUS_CHECKER, STATUS_LIST_SERVICE, TRUST_REGISTRY } from '../src/vc/vc.providers';
@@ -212,7 +214,49 @@ describe('POST /v1/issuers/:name/credentials/:id/status', () => {
   });
 });
 
+describe('recording an issuance (the issuer onIssued callback)', () => {
+  it('is idempotent on offerId: a retried call returns the first row', async () => {
+    const status = await statusLists.allocate(ISSUER);
+    const event = {
+      issuerName: ISSUER,
+      vct: VCT,
+      offerId: randomBytes(16).toString('base64url'),
+      subjectRef: 'sv001',
+      statusUri: status.uri,
+      statusIdx: status.idx,
+      cnfThumbprint: randomBytes(32).toString('base64url'),
+      issuedAt: new Date()
+    };
+    const [first, second] = await Promise.all([credentials.recordIssued(event), credentials.recordIssued(event)]);
+
+    assert.equal(first.credentialId, second.credentialId);
+    assert.equal(await prisma.vcIssuedCredential.count({ where: { offerId: event.offerId } }), 1);
+    await assert.rejects(credentials.recordIssued({ ...event, offerId: 'x'.repeat(22), statusUri: 'https://api-identra.awncorp.vn/issuers/kiem-dinh/status/1' }));
+  });
+});
+
 describe('server-side status checker', () => {
+  it('answers unavailable (STATUS_UNAVAILABLE) for a list on another host, without a socket', async () => {
+    const connect = net.Socket.prototype.connect;
+    let sockets = 0;
+
+    net.Socket.prototype.connect = function (this: net.Socket, ...args: unknown[]) {
+      sockets += 1;
+
+      return (connect as (...a: unknown[]) => net.Socket).apply(this, args);
+    } as typeof connect;
+
+    try {
+      for (const uri of ['https://issuer.example/issuers/truong-mau/status/1', 'https://api-identra.awncorp.vn.example/issuers/truong-mau/status/1']) {
+        assert.equal(await checker.check({ uri, idx: 0 }, { maToChuc: ISSUER_ORG }), 'unavailable', uri);
+      }
+    } finally {
+      net.Socket.prototype.connect = connect;
+    }
+
+    assert.equal(sockets, 0);
+  });
+
   it('sees a revocation on the very next check, without any network', async () => {
     const { id, status } = await issue();
     const realFetch = globalThis.fetch;

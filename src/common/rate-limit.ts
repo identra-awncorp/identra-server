@@ -28,7 +28,9 @@ export const RATE_LIMITS = {
   login: { limit: 10, ttl: MINUTE },
   sessionCreation: { limit: 30, ttl: MINUTE },
   token: { limit: 20, ttl: MINUTE },
-  write: { limit: 60, ttl: MINUTE }
+  write: { limit: 60, ttl: MINUTE },
+  // Trust list and status lists: many verifiers can share one address, and they are cacheable.
+  publicResource: { limit: 1200, ttl: MINUTE }
 } as const;
 
 export const RateLimit = (name: keyof typeof RATE_LIMITS) => Throttle({ default: RATE_LIMITS[name] });

@@ -3,7 +3,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { Prisma } from '@prisma/client';
 
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
-import type { StatusListStorage } from '../sdk.mjs';
+import type { StatusListStorage } from '@identra/sdk-server';
 
 /**
  * While a callback runs inside `statusListTransaction.run(tx, …)`, the storage below uses that

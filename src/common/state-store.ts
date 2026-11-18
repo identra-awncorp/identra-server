@@ -1,17 +1,15 @@
+import type { ProtocolStateStore } from '@identra/sdk-server';
 import Redis from 'ioredis';
 
 /**
- * Short-lived state with a TTL (docs/vc-api.md §2): portal sessions now; offers, nonces and
- * verifier sessions in the next phases (handed to the SDK's issuer and verifier). Values are
- * strings; callers serialise. Every method is a single atomic Redis command or transaction.
+ * Short-lived state with a TTL (docs/vc-api.md §2): portal sessions, and the SDK's protocol
+ * state (its ProtocolStateStore: offers, codes, nonces, access tokens). Values are strings;
+ * callers serialise. Every method is a single atomic Redis command or transaction:
+ * `take` = GETDEL, `increment` = INCR + EXPIRE NX in one MULTI.
  */
-export interface StateStore {
-  put(key: string, value: string, ttlSeconds: number): Promise<void>;
-  get(key: string): Promise<string | null>;
-  /** Atomic get-and-delete: of concurrent callers exactly one receives the value. */
-  take(key: string): Promise<string | null>;
-  /** Increments a counter; the TTL is set when the counter is created and not extended later. */
-  increment(key: string, ttlSeconds: number): Promise<number>;
+export interface StateStore extends ProtocolStateStore {
+  /** Stores `value` and returns the previous value, atomically (SET … GET). */
+  swap(key: string, value: string, ttlSeconds: number): Promise<string | null>;
 }
 
 /** All keys live under `state:<namespace>:` so stores of different features cannot collide. */
@@ -33,6 +31,7 @@ export function createRedisStateStore(redis: Redis, namespace: string): StateSto
     },
     get: (key) => redis.get(k(key)),
     take: (key) => redis.getdel(k(key)),
+    swap: (key, value, ttlSeconds) => redis.set(k(key), value, 'EX', ttl(ttlSeconds), 'GET'),
     async increment(key, ttlSeconds) {
       const results = await redis.multi().incr(k(key)).expire(k(key), ttl(ttlSeconds), 'NX').exec();
       const [error, value] = results![0]!;

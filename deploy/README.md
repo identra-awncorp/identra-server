@@ -38,6 +38,21 @@ docker compose --env-file /etc/identra/server.env -f docker-compose.prod.yml \
   run --rm -e DEMO_PORTAL_PASSWORD='Identra@2026' api npm run demo:provision
 ```
 
+### Credential issuer (OpenID4VCI, `truong-mau`)
+
+- Its `vc` key and certificate are `orgs/truong-mau/vc.{key,chain}.pem` in the key directory;
+  the certificate's SAN must be `https://api-identra.awncorp.vn/issuers/truong-mau`. The
+  issuers are listed in `src/vc/issuers.ts` (a second one is one entry plus its keys).
+- The access-token signing key and the request-encryption key are generated in memory at
+  every start and never stored. **A restart invalidates outstanding access tokens (at most
+  5 minutes old) and the encryption key a wallet read just before**: a student in the middle of
+  collecting a diploma gets an error and scans a new offer. Offers and PINs live in Redis
+  (10 minutes; state readable 30 minutes) and survive a restart of the api, not of Redis.
+- `demo:provision` creates or updates only the four `DemoPortalAccount` rows (`sv001`–`sv003`,
+  `phongdaotao`), whose profiles are the claims of the diplomas issued; it touches no other
+  table and never prints the password. Issued diplomas are recorded in `VcIssuedCredential`
+  (status entry, cnf thumbprint, no claims); the credential itself is never stored.
+
 Single instance: one api container (ADR-0016). Status lists are read from Postgres on every
 request, so a second instance would never serve a stale list, but two instances could sign
 two tokens with the same `iat` in one second.

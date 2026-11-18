@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import net from 'node:net';
 import { after, before, describe, it } from 'node:test';
 
 import { Controller, Get, HttpException, NotFoundException, UseFilters } from '@nestjs/common';
@@ -71,7 +72,7 @@ describe('protocol error filter (OAuth 2.0 style)', () => {
   it('turns unexpected errors into server_error without details or stack', async () => {
     const res = await http().get('/oid4vp/request/crash').expect(500);
 
-    assert.deepEqual(res.body, { error: 'server_error', error_description: 'Internal server error' });
+    assert.deepEqual(res.body, { error: 'server_error' });
   });
 
   it('renders 503 as temporarily_unavailable', async () => {
@@ -157,7 +158,28 @@ describe('own-origin fetch', () => {
     }
   });
 
-  it('refuses plain http for other origins', async () => {
-    await assert.rejects(ownFetch('http://example.com/status/1'), TypeError);
+  it('refuses every other origin without opening a socket', async () => {
+    const connect = net.Socket.prototype.connect;
+    let sockets = 0;
+
+    net.Socket.prototype.connect = function (this: net.Socket, ...args: unknown[]) {
+      sockets += 1;
+
+      return (connect as (...a: unknown[]) => net.Socket).apply(this, args);
+    } as typeof connect;
+
+    try {
+      for (const url of [
+        'https://other.example/issuers/truong-mau/status/1',
+        'http://api-identra.awncorp.vn/trust-list',
+        'https://api-identra.awncorp.vn.evil.example/trust-list'
+      ]) {
+        await assert.rejects(ownFetch(url), /only from this server/, url);
+      }
+    } finally {
+      net.Socket.prototype.connect = connect;
+    }
+
+    assert.equal(sockets, 0);
   });
 });

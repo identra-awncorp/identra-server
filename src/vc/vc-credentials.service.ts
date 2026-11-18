@@ -1,11 +1,11 @@
 import { randomBytes } from 'node:crypto';
 
 import { Inject, Injectable } from '@nestjs/common';
-import { VcCredentialStatus, VcIssuedCredential } from '@prisma/client';
+import { Prisma, VcCredentialStatus, VcIssuedCredential } from '@prisma/client';
 
 import { apiError } from '../common/http-errors';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
-import { StatusRevokedError, type StatusListService } from '../sdk.mjs';
+import { StatusRevokedError, type StatusListService } from '@identra/sdk-server';
 import { statusListTransaction } from './status-storage';
 import { STATUS_LIST_SERVICE } from './vc.providers';
 
@@ -37,6 +37,49 @@ export class VcCredentialsService {
     });
 
     return { id: row.id, status };
+  }
+
+  /**
+   * Records a credential the OpenID4VCI issuer has just built (its onIssued callback), with the
+   * status entry the issuer allocated. Idempotent on `offerId`: a repeated call returns the row
+   * of the first one instead of creating a second.
+   */
+  async recordIssued(input: {
+    issuerName: string;
+    vct: string;
+    offerId: string;
+    subjectRef: string;
+    statusUri: string;
+    statusIdx: number;
+    cnfThumbprint: string;
+    issuedAt: Date;
+  }): Promise<{ credentialId: string }> {
+    const prefix = this.statusLists.uri(input.issuerName, 1).replace(/1$/, '');
+
+    if (!input.statusUri.startsWith(prefix)) throw new Error('the status entry belongs to another issuer');
+
+    const data = {
+      id: randomBytes(16).toString('base64url'),
+      issuerName: input.issuerName,
+      vct: input.vct,
+      offerId: input.offerId,
+      subjectRef: input.subjectRef,
+      statusListNumber: Number(input.statusUri.slice(prefix.length)),
+      statusIndex: input.statusIdx,
+      cnfThumbprint: input.cnfThumbprint,
+      issuedAt: input.issuedAt,
+      statusChangedAt: input.issuedAt
+    };
+
+    try {
+      return { credentialId: (await this.prisma.vcIssuedCredential.create({ data })).id };
+    } catch (error) {
+      if (!(error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002')) throw error;
+
+      const existing = await this.prisma.vcIssuedCredential.findUniqueOrThrow({ where: { offerId: input.offerId } });
+
+      return { credentialId: existing.id };
+    }
   }
 
   /**

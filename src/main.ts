@@ -9,7 +9,9 @@ import { configureApp } from './configure-app';
 
 async function bootstrap() {
   const app = await NestFactory.create<NestExpressApplication>(AppModule, {
-    bufferLogs: true
+    bufferLogs: true,
+    // The OpenID4VCI controllers hand the SDK the request body exactly as received.
+    rawBody: true
   });
   const config = app.get(ConfigService);
 
