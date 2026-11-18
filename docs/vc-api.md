@@ -32,8 +32,19 @@ Sample organisations (all operated by Identra, certificates carry "DEMO"):
 
 ## 2. Conventions
 
-- Routes under `/v1` are the application API: JSON, strict validation, errors
-  as `{ statusCode, error, message, code? }`.
+- Routes under `/v1` are the application API: JSON, strict validation. Errors
+  of the routes in this document are `{ statusCode, code, message }` where
+  `code` is a stable upper-case identifier clients branch on (`message` is for
+  logs). Codes used here: `INVALID_CREDENTIALS` (401), `SESSION_EXPIRED` (401),
+  `FORBIDDEN` (403), `NOT_FOUND` (404), `CONFLICT` (409), `VALIDATION_FAILED`
+  (400), `RATE_LIMITED` (429, with a `Retry-After` header in seconds, exposed to
+  browsers through `Access-Control-Expose-Headers`), `UNAVAILABLE` (503).
+- A `POST` that creates something answers `201`; a `POST` that changes state
+  answers `200`.
+- Every response that carries an `expiresAt` also carries `serverTime` (both
+  ISO 8601 UTC), so a client counts down against the server's clock, not its own.
+- `/v1` routes accept browser calls only from the origins in `CORS_ORIGINS`
+  (the website); no cookies are used anywhere, authentication is a bearer token.
 - Routes without `/v1` are protocol endpoints whose paths are fixed by a
   specification or signed into credentials. They follow the error format of
   their specification (OAuth 2.0 `{ error, error_description }` for OpenID4VCI
@@ -109,6 +120,14 @@ data; nothing here is a real person.
 The portal token is an opaque bearer token (Redis, 30 minutes). The `txCode`
 is shown once in the response and stored only as a keyed hash.
 
+An offer's state stays readable for 30 minutes after it was created: `pending`
+until the wallet collects it or 10 minutes pass, then `issued` or `expired`;
+after 30 minutes the route answers `404`. A student may ask for a new offer at
+any time, including when they already hold a diploma: each collected offer is a
+new credential with its own status entry (a lost phone is handled by issuing
+again and revoking the old one). In `GET /v1/demo/school/credentials`,
+`status` is `valid`, `suspended` or `revoked`.
+
 Seeded sample accounts (fictional people, public on purpose, shown on the
 portal's sign-in page): students `sv001`, `sv002`, `sv003` and registrar
 `phongdaotao`, all with the password `Identra@2026`. `profile` of a student:
@@ -156,8 +175,19 @@ a client cannot ask for arbitrary claims.
 }
 ```
 
-  `result` exists for `verified` and `failed`; `claims` only when `ok`. The
-  result is deleted 30 minutes after verification.
+  `result` is absent (not `null`) until the session is final. `verified` means
+  `result.ok` is `true`, `failed` means it is `false`; `claims` and `issuer`
+  exist only when `ok`. Every claim value is a string (`nam_tot_nghiep` is
+  `"2026"`, `ngay_sinh` is `YYYY-MM-DD`). `verifier.name` is the display name
+  from the trust list, in Vietnamese.
+- A session that nobody answered turns `expired` after 5 minutes and stays
+  readable as `expired`; every session is deleted 30 minutes after it was
+  created or verified, after which the route answers `404` (clients treat that
+  as expired).
+- The server verifies against its own status lists directly, so a revocation
+  made through this server is seen by the very next verification here. A third
+  party that fetches the status list over HTTP may see it up to 15 minutes later
+  (the list's `ttl`).
 
 ## 7. Product lifecycle
 
@@ -172,5 +202,7 @@ certificate. The `POST` verification only keeps garbage out of the store.
 
 ## 8. Rate limits
 
-Per client IP (the address nginx passes on): login 10/min, session creation
-30/min, token endpoint 20/min, other writes 60/min. Exceeding → `429`.
+Per client IP (the address nginx passes on) and per route: login 10/min,
+session creation 30/min, token endpoint 20/min, other writes 60/min, reads
+300/min (polling a session once per second and an offer every two seconds stays
+well inside). Exceeding → `429 RATE_LIMITED` with `Retry-After`.
