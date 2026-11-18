@@ -37,7 +37,7 @@ Sample organisations (all operated by Identra, certificates carry "DEMO"):
   `code` is a stable upper-case identifier clients branch on (`message` is for
   logs). Codes used here: `INVALID_CREDENTIALS` (401), `SESSION_EXPIRED` (401),
   `FORBIDDEN` (403), `NOT_FOUND` (404), `CONFLICT` (409), `VALIDATION_FAILED`
-  (400), `RATE_LIMITED` (429, with a `Retry-After` header in seconds, exposed to
+  (400, also for malformed JSON), `PAYLOAD_TOO_LARGE` (413), `RATE_LIMITED` (429, with a `Retry-After` header in seconds, exposed to
   browsers through `Access-Control-Expose-Headers`), `INTERNAL_ERROR` (500),
   `UNAVAILABLE` (503). A missing, unknown or expired bearer token is always
   `401 SESSION_EXPIRED`; a valid one without the right to do this is `403 FORBIDDEN`.
@@ -95,7 +95,7 @@ proof type `jwt` with ES256).
 
 Rules:
 
-- QR content: `openid-credential-offer://?credential_offer_uri=<api>/issuers/<name>/offers/<offerId>`.
+- QR content: `openid-credential-offer://?credential_offer_uri=<percent-encoded <api>/issuers/<name>/offers/<offerId>>`.
 - An offer lives 10 minutes. The pre-authorized code is single use. The
   `tx_code` is 6 digits; after 5 wrong attempts the offer is destroyed. Wrong
   code, wrong PIN, expired or reused → `400 { "error": "invalid_grant" }`.
@@ -116,9 +116,9 @@ data; nothing here is a real person.
 | Method and path | Auth | Response |
 |---|---|---|
 | `POST /v1/demo/school/login` `{ username, password }` | none, rate limited | `{ token, expiresAt, serverTime, role: "student" \| "registrar", profile }` |
-| `POST /v1/demo/school/offers` | student | `{ offerId, offerUri, txCode, expiresAt }` |
-| `GET /v1/demo/school/offers/:offerId` | student (owner) | `{ status: "pending" \| "issued" \| "expired" }` |
-| `GET /v1/demo/school/credentials` | student: own; registrar: all | `{ items: [{ id, studentCode, studentName, issuedAt, status }] }` |
+| `POST /v1/demo/school/offers` | student | `{ offerId, offerUri, txCode, expiresAt, serverTime }`; creating one cancels the student's previous pending offer |
+| `GET /v1/demo/school/offers/:offerId` | student (owner) | `{ status: "pending" \| "issued" \| "expired", serverTime }` |
+| `GET /v1/demo/school/credentials?limit&cursor` | student: own; registrar: all of the issuer | `{ items: [{ id, studentCode, studentName, issuedAt, status }], nextCursor }`, newest first, `limit` ≤ 100 |
 
 The portal token is an opaque bearer token (Redis, 30 minutes). The `txCode`
 is shown once in the response and stored only as a keyed hash.
