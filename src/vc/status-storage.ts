@@ -1,24 +1,16 @@
-import { AsyncLocalStorage } from 'node:async_hooks';
-
 import { Prisma } from '@prisma/client';
 
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import type { StatusListStorage } from '@identra/sdk-server';
 
 /**
- * While a callback runs inside `statusListTransaction.run(tx, …)`, the storage below uses that
- * Prisma transaction. This is how a status change and the credential row commit together or
- * not at all (VcCredentialsService.changeStatus), although the SDK service makes its own calls.
- */
-export const statusListTransaction = new AsyncLocalStorage<Prisma.TransactionClient>();
-
-/**
  * StatusListStorage of @identra/sdk-server on Postgres. Each method is one atomic statement:
  * optimistic `UPDATE … WHERE version = $expected`, and `INSERT … ON CONFLICT DO NOTHING` on the
  * (issuer, list, idx) primary key so two concurrent allocations never get one index.
  */
-export function createPrismaStatusListStorage(prisma: PrismaService): StatusListStorage {
-  const db = () => statusListTransaction.getStore() ?? prisma;
+export function createPrismaStatusListStorage(client: PrismaService | Prisma.TransactionClient): StatusListStorage {
+  // A transaction client binds every call to that transaction (setStatus(..., { storage })).
+  const db = () => client;
   const list = (issuerName: string, listNumber: number) => ({ issuerName, listNumber });
 
   return {

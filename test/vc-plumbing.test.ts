@@ -127,10 +127,11 @@ describe('Redis state store', () => {
 describe('own-origin fetch', () => {
   const ownFetch = createOwnFetch({
     baseUrl: 'https://api-identra.awncorp.vn',
-    trustList: { token: async () => 'trust.list.token' },
+    trustList: { token: async () => 'trust.list.token', current: () => null },
     statusLists: {
       token: async (issuer: string, n: number) => (issuer === 'truong-mau' && n === 1 ? 'status.list.token' : null),
-      allocate: async () => ({ uri: '', idx: 0 }),
+      allocate: async () => ({ uri: '', n: 1, idx: 0 }),
+      current: () => null,
       setStatus: async () => undefined,
       uri: () => ''
     }

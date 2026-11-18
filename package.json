@@ -22,7 +22,8 @@
     "docker:up": "docker compose up --build",
     "docker:down": "docker compose down",
     "test": "tsc -p tsconfig.test.json && node dist-test/test/global-setup.js && node --env-file=.env.test --test --test-concurrency=1 \"dist-test/test/**/*.test.js\"",
-    "demo:provision": "node dist/src/scripts/demo-provision.js"
+    "demo:provision": "node dist/src/scripts/demo-provision.js",
+    "demo:provision-product": "node dist/src/scripts/demo-provision-product.js"
   },
   "dependencies": {
     "@apollo/server": "^5.5.1",
@@ -54,6 +55,7 @@
   },
   "devDependencies": {
     "@identra/sdk-app": "file:../identra-sdk/packages/app",
+    "@identra/sdk-client": "file:../identra-sdk/packages/client",
     "@nestjs/cli": "^11.0.0",
     "@nestjs/schematics": "^11.0.0",
     "@nestjs/testing": "^11.0.0",

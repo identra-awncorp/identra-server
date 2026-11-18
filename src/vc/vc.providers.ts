@@ -123,6 +123,36 @@ async function loadPki(config: ConfigService, clock: Clock): Promise<Pki> {
 /** How long a reader of a status list may wait (signing can queue behind a writer's lock). */
 export const STATUS_TOKEN_WAIT_MS = 1000;
 
+export const STATUS_PROBLEMS = Symbol('STATUS_PROBLEMS');
+export const STATUS_MONITOR = Symbol('STATUS_MONITOR');
+
+export interface StatusMonitor {
+  /** `down` after a signing problem in the last hour, or a held token close to expiry. */
+  check(): Promise<'up' | 'down'>;
+}
+
+interface StatusProblems {
+  report(issuer: string, reason: string): void;
+  recent(nowMs: number): boolean;
+}
+
+function createStatusProblems(): StatusProblems {
+  const statusLogger = new Logger('StatusLists');
+  const last = new Map<string, number>();
+
+  return {
+    report(issuer, reason) {
+      const key = `${issuer}:${reason}`;
+
+      // Once a minute per issuer and reason.
+      if (Date.now() - (last.get(key) ?? 0) >= 60_000) statusLogger.warn(`Status list of ${issuer} not re-signed (${reason})`);
+
+      last.set(key, Date.now());
+    },
+    recent: (nowMs) => [...last.values()].some((at) => nowMs - at < 3_600_000)
+  };
+}
+
 /** Thrown when a status list cannot be served within the bound and no earlier token is held. */
 export class StatusListBusyError extends Error {}
 
@@ -175,20 +205,45 @@ export const vcProviders: Provider[] = [
   { provide: PKI, inject: [ConfigService, CLOCK], useFactory: loadPki },
   {
     provide: STATUS_LIST_SERVICE,
-    inject: [PKI, PrismaService],
+    inject: [PKI, PrismaService, STATUS_PROBLEMS],
     // Single-instance assumption (ADR-0016: one VPS, one api container): two processes would
     // still never serve a stale list (token() compares the stored version on every call), but
     // could sign two tokens with one iat in the same second.
-    useFactory: (pki: Pki, prisma: PrismaService): StatusListService =>
+    useFactory: (pki: Pki, prisma: PrismaService, problems: StatusProblems): StatusListService =>
       withBoundedTokens(
         createStatusListService({
           issuerUri: pki.issuerUri,
           keyStore: pki.keyStore,
           storage: createPrismaStatusListStorage(prisma),
           random: pki.random,
-          clock: pki.clock
+          clock: pki.clock,
+          // The held token is served meanwhile; the reason (never content) goes to the log and health.
+          onError: (reason, issuer) => problems.report(issuer, reason)
         })
       )
+  },
+  { provide: STATUS_PROBLEMS, useFactory: createStatusProblems },
+  {
+    provide: STATUS_MONITOR,
+    inject: [STATUS_LIST_SERVICE, STATUS_PROBLEMS, PrismaService, PKI],
+    useFactory: (statusLists: StatusListService, problems: StatusProblems, prisma: PrismaService, pki: Pki): StatusMonitor => ({
+      async check() {
+        const nowS = pki.clock.now().getTime() / 1000;
+
+        if (problems.recent(pki.clock.now().getTime())) return 'down';
+
+        const lists = await prisma.vcStatusList.findMany({ select: { issuerName: true, listNumber: true } });
+
+        for (const { issuerName, listNumber } of lists) {
+          const held = statusLists.current(issuerName, listNumber);
+
+          // Not signed yet by this process is fine; a held token must live 2 h more by a valid signer.
+          if (held && (held.exp <= nowS + 2 * 3600 || held.signerNotAfter <= nowS)) return 'down';
+        }
+
+        return 'up';
+      }
+    })
   },
   {
     provide: OWN_FETCH,

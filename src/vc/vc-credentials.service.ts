@@ -1,12 +1,13 @@
 import { randomBytes } from 'node:crypto';
 
 import { Inject, Injectable, Optional } from '@nestjs/common';
-import { Prisma, VcCredentialStatus, VcIssuedCredential } from '@prisma/client';
+import { Prisma, VcCredentialStatus } from '@prisma/client';
 
 import { apiError, unavailable } from '../common/http-errors';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { StatusRevokedError, type StatusListService } from '@identra/sdk-server';
-import { statusListTransaction } from './status-storage';
+import { issuerKind } from './hosted-issuers';
+import { createPrismaStatusListStorage } from './status-storage';
 import { STATUS_LIST_SERVICE } from './vc.providers';
 
 const STATUS_CHANGE_ATTEMPTS = 3;
@@ -29,7 +30,15 @@ function isContention(error: unknown): boolean {
   return error.code === 'P2010' && (error.meta as { code?: unknown } | undefined)?.code === '55P03';
 }
 
-const view = (row: VcIssuedCredential) => ({ id: row.id, status: row.status, updatedAt: row.statusChangedAt.toISOString() });
+interface StatusRecord {
+  id: string;
+  status: VcCredentialStatus;
+  statusListNumber: number;
+  statusIndex: number;
+  statusChangedAt: Date;
+}
+
+const view = (row: StatusRecord) => ({ id: row.id, status: row.status, updatedAt: row.statusChangedAt.toISOString() });
 
 /** What the issuer remembers about the credentials it issued (no claims, ADR-0014 §4). */
 @Injectable()
@@ -46,18 +55,12 @@ export class VcCredentialsService {
    * stays reserved and unused (value 0), which is harmless.
    */
   async register(input: { issuerName: string; vct: string; subjectRef: string; cnfThumbprint: string }) {
-    const status = await this.statusLists.allocate(input.issuerName);
-    const listNumber = Number(status.uri.slice(status.uri.lastIndexOf('/') + 1));
+    const { uri, n, idx } = await this.statusLists.allocate(input.issuerName);
     const row = await this.prisma.vcIssuedCredential.create({
-      data: {
-        id: randomBytes(16).toString('base64url'),
-        ...input,
-        statusListNumber: listNumber,
-        statusIndex: status.idx
-      }
+      data: { id: randomBytes(16).toString('base64url'), ...input, statusListNumber: n, statusIndex: idx }
     });
 
-    return { id: row.id, status };
+    return { id: row.id, status: { uri, idx } };
   }
 
   /**
@@ -125,14 +128,24 @@ export class VcCredentialsService {
   }
 
   private async changeStatusOnce(issuerName: string, id: string, status: VcCredentialStatus) {
+    // Diplomas are recorded in VcIssuedCredential, product events in ProductEvent: one code path.
+    const kind = issuerKind(issuerName);
+
+    if (kind === null) throw apiError(404, 'NOT_FOUND', 'No such credential for this issuer.');
+
+    const table = kind === 'product' ? '"ProductEvent"' : '"VcIssuedCredential"';
     let revokedInList = false;
 
     const updated = await this.prisma.$transaction(
       async (tx) => {
         await tx.$executeRawUnsafe(`SET LOCAL lock_timeout = '${LOCK_TIMEOUT_MS}ms'`);
 
-        const [row] = await tx.$queryRaw<VcIssuedCredential[]>`
-          SELECT * FROM "VcIssuedCredential" WHERE "id" = ${id} AND "issuerName" = ${issuerName} FOR UPDATE`;
+        const [row] = await tx.$queryRawUnsafe<StatusRecord[]>(
+          `SELECT "id", "status"::text AS "status", "statusListNumber", "statusIndex", "statusChangedAt"
+           FROM ${table} WHERE "id" = $1 AND "issuerName" = $2 FOR UPDATE`,
+          id,
+          issuerName
+        );
 
         if (!row) throw apiError(404, 'NOT_FOUND', 'No such credential for this issuer.');
 
@@ -146,24 +159,36 @@ export class VcCredentialsService {
 
         await this.hooks?.insideStatusChange?.(status);
 
-        try {
-          await statusListTransaction.run(tx, () =>
-            this.statusLists.setStatus(issuerName, row.statusListNumber, row.statusIndex, status)
+        const write = async (next: VcCredentialStatus): Promise<StatusRecord> => {
+          if (row.status === next) return row;
+
+          const changedAt = new Date();
+
+          await tx.$executeRawUnsafe(
+            `UPDATE ${table} SET "status" = $1::"VcCredentialStatus", "statusChangedAt" = $2 WHERE "id" = $3`,
+            next,
+            changedAt,
+            id
           );
+
+          return { ...row, status: next, statusChangedAt: changedAt };
+        };
+
+        try {
+          // The list update joins this transaction through a storage bound to it.
+          await this.statusLists.setStatus(issuerName, row.statusListNumber, row.statusIndex, status, {
+            storage: createPrismaStatusListStorage(tx)
+          });
         } catch (error) {
           if (!(error instanceof StatusRevokedError)) throw error;
 
           // The list already says revoked (final): the row follows the list, the request fails.
           revokedInList = true;
 
-          return row.status === 'revoked'
-            ? row
-            : tx.vcIssuedCredential.update({ where: { id }, data: { status: 'revoked', statusChangedAt: new Date() } });
+          return write('revoked');
         }
 
-        return row.status === status
-          ? row
-          : tx.vcIssuedCredential.update({ where: { id }, data: { status, statusChangedAt: new Date() } });
+        return write(status);
       },
       { maxWait: TX_MAX_WAIT_MS, timeout: TX_TIMEOUT_MS }
     );

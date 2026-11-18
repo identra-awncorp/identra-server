@@ -2,16 +2,38 @@ import { readFileSync, statSync } from 'node:fs';
 
 import { Logger, Provider } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
-import { base64Decode, base64UrlEncode, verifyTrustListToken } from '@identra/sdk-core';
-import { createTrustListService, type TrustListService } from '@identra/sdk-server';
+import { verifyTrustListToken } from '@identra/sdk-core';
+import { createTrustListService, type LastIatStore, type TrustListService } from '@identra/sdk-server';
 
-import { createRedisStateStore } from '../common/state-store';
 import { RedisService } from '../infrastructure/redis/redis.service';
 import { PKI, Pki, TRUST_LIST_SERVICE } from './vc.providers';
 
 const logger = new Logger('TrustList');
-const LAST_TRUST_LIST_TOKEN = 'last-token';
+const LAST_IAT_KEY = 'state:trust-list:last-iat';
 const SKEW_SECONDS = 60;
+
+/**
+ * The last signed iat across restarts (ADR-0019 §4), on Redis without a TTL. Best effort: the SDK
+ * fails the call when the store fails, which with Redis down would stop the trust list (and the
+ * startup). Here a failed read counts as none and a failed write is logged; the in-process iat
+ * stays strictly increasing, and only a restart in the same second during a Redis outage could
+ * repeat an iat (verifiers then keep their copy). The SDK ignores a stored iat > 60 s ahead.
+ */
+export function redisLastIatStore(redis: RedisService): LastIatStore {
+  return {
+    async get() {
+      const value = await redis.getClient().get(LAST_IAT_KEY).catch(() => null);
+
+      return value !== null && /^[0-9]{1,12}$/.test(value) ? Number(value) : null;
+    },
+    async set(iat) {
+      await redis
+        .getClient()
+        .set(LAST_IAT_KEY, String(iat))
+        .catch(() => logger.warn('Could not record the trust-list iat in Redis'));
+    }
+  };
+}
 const WARN_EVERY_MS = 60_000;
 
 /**
@@ -42,42 +64,12 @@ export function trustListSource(path: string): () => unknown {
   };
 }
 
-async function signerFingerprint(pki: Pki): Promise<string> {
-  const signer = await pki.keyStore.trustListSigner();
-
-  return base64UrlEncode(await pki.hasher.sha256(base64Decode(signer.x5c![0]!)));
-}
-
-/**
- * The last token kept in Redis only raises the next iat, so it must not be trusted blindly:
- * it is used only when it verifies against the pinned root, was signed by the current
- * trust-list signer, and its iat is not in the future. Anything else is ignored and logged.
- */
-export async function verifiedLastToken(token: string | null, pki: Pki): Promise<string | undefined> {
-  if (token === null) return undefined;
-
-  const now = pki.clock.now();
-  const verified = await verifyTrustListToken(token, { chainValidator: pki.chainValidator, verifier: pki.verifier, now });
-  const reason = !verified.ok
-    ? verified.reason
-    : verified.signerFingerprint !== (await signerFingerprint(pki))
-      ? 'other signer'
-      : verified.payload.iat > now.getTime() / 1000 + SKEW_SECONDS
-        ? 'iat in the future'
-        : null;
-
-  if (reason !== null) {
-    logger.warn(`Ignoring the stored last trust-list token (${reason})`);
-
-    return undefined;
-  }
-
-  return token;
-}
-
 export const TRUST_LIST_MONITOR = Symbol('TRUST_LIST_MONITOR');
 export interface TrustListMonitor {
-  /** `up` only when the token being served verifies, its iat is not ahead and it lives 2 h more. */
+  /**
+   * `up` only when the token being served verifies, and (from the service's current()) its iat is
+   * not ahead, it lives 2 h more and its signer certificate is still valid.
+   */
   check(): Promise<'up' | 'down'>;
 }
 
@@ -85,38 +77,22 @@ export const trustListProviders: Provider[] = [
   {
     provide: TRUST_LIST_SERVICE,
     inject: [PKI, ConfigService, RedisService],
-    useFactory: async (pki: Pki, config: ConfigService, redis: RedisService): Promise<TrustListService> => {
-      // The last served token survives restarts, so the next iat is always greater (ADR-0019 §4).
-      const store = createRedisStateStore(redis.getClient(), 'trust-list');
-      const lastToken = await verifiedLastToken(await store.get(LAST_TRUST_LIST_TOKEN).catch(() => null), pki);
+    useFactory: (pki: Pki, config: ConfigService, redis: RedisService): TrustListService => {
       let lastWarning = 0;
-      const service = createTrustListService({
+
+      return createTrustListService({
         source: trustListSource(config.getOrThrow<string>('IDENTRA_TRUST_LIST_SOURCE')),
         keyStore: pki.keyStore,
         clock: pki.clock,
-        ...(lastToken ? { lastToken } : {}),
-        // The validator's detail can quote the content: log only that it happened, once a minute.
-        onError: () => {
+        lastIatStore: redisLastIatStore(redis),
+        // The reason only, never content; at most once a minute.
+        onError: (reason) => {
           if (Date.now() - lastWarning < WARN_EVERY_MS) return;
 
           lastWarning = Date.now();
-          logger.warn('Trust-list source refused; still serving the last good token');
+          logger.warn(`Trust list not re-signed (${reason}); serving the held token`);
         }
       });
-      let saved = lastToken;
-
-      return {
-        async token() {
-          const token = await service.token();
-
-          if (token !== saved) {
-            saved = token;
-            await store.put(LAST_TRUST_LIST_TOKEN, token, 2 * 86_400).catch(() => undefined);
-          }
-
-          return token;
-        }
-      };
     }
   },
   {
@@ -140,7 +116,18 @@ export const trustListProviders: Provider[] = [
 
             const r = await verifyTrustListToken(token, { chainValidator: pki.chainValidator, verifier: pki.verifier, now: new Date(nowMs) });
 
-            if (r.ok && r.payload.iat <= nowMs / 1000 + SKEW_SECONDS && r.payload.exp > nowMs / 1000 + 2 * 3600) state = 'up';
+            const held = trustList.current();
+            const nowS = nowMs / 1000;
+
+            if (
+              r.ok &&
+              held !== null &&
+              held.iat <= nowS + SKEW_SECONDS &&
+              held.exp > nowS + 2 * 3600 &&
+              held.signerNotAfter > nowS
+            ) {
+              state = 'up';
+            }
           } catch {
             state = 'down';
           }

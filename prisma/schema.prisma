@@ -449,3 +449,27 @@ model DemoPortalAccount {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 }
+
+// A product lifecycle event (docs/vc-api.md §7, ADR-0012): the signed compact IS stored, it is
+// public by design. seq 0..2 = san_xuat, kiem_dinh, phan_phoi. The row is also the credential
+// record for the status route of product issuers.
+model ProductEvent {
+  // 128-bit random, base64url.
+  id               String             @id
+  gtin             String
+  serial           String
+  seq              Int
+  congDoan         String
+  issuerName       String
+  compact          String
+  // productEventHash(compact): the `prev` of the next event.
+  compactHash      String
+  statusListNumber Int
+  statusIndex      Int
+  status           VcCredentialStatus @default(valid)
+  statusChangedAt  DateTime           @default(now())
+  createdAt        DateTime           @default(now())
+
+  @@unique([gtin, serial, seq])
+  @@unique([issuerName, statusListNumber, statusIndex])
+}

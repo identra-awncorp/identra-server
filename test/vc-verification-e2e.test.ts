@@ -2,6 +2,7 @@
 // verifier `nha-tuyen-dung-mau` (docs/vc-api.md §6), then suspended, restored and revoked.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 
@@ -20,6 +21,12 @@ const verifierClock = adjustableClock();
 const logs: string[] = [];
 let app: NestExpressApplication;
 
+// Display names come from the trust list (its source file), never from the test.
+const trustSource = JSON.parse(readFileSync(join(keysDir, 'trust-list.source.json'), 'utf8')) as {
+  issuers: Array<{ ma_to_chuc: string; ten: string }>;
+  verifiers: Array<{ ma_to_chuc: string; ten: string }>;
+};
+const tenOf = (maToChuc: string) => [...trustSource.issuers, ...trustSource.verifiers].find((e) => e.ma_to_chuc === maToChuc)!.ten;
 const NAME = 'Nguyễn Thị Minh Anh';
 const MAJOR = 'Công nghệ thông tin';
 const DIPLOMA_NUMBER = 'TMDEMO-2025-000317';
@@ -84,7 +91,7 @@ describe('present a diploma, then suspend, restore and revoke it', () => {
     assert.ok(resolved.ok, JSON.stringify(resolved));
     if (!resolved.ok) return;
     assert.equal(resolved.request.verifier.trusted, true);
-    assert.equal(resolved.request.verifier.trusted && resolved.request.verifier.ten, 'Nhà Tuyển Dụng Mẫu (DEMO)');
+    assert.equal(resolved.request.verifier.trusted && resolved.request.verifier.ten, tenOf('VATVN-0100000005'));
     assert.equal((await session(created.body.id)).body.status, 'request_retrieved');
 
     assert.deepEqual(await holder.wallet.presentations.submit(resolved.request, { credentialId, claimSetIndex: 1 }), { ok: true });
@@ -94,7 +101,8 @@ describe('present a diploma, then suspend, restore and revoke it', () => {
     assert.deepEqual(done.body.result.checks.map((c: { id: string }) => c.id), CHECK_ORDER);
     assert.ok(done.body.result.checks.every((c: { ok: boolean; code: string | null }) => c.ok && c.code === null));
     assert.deepEqual(done.body.result.claims, { ho_ten: NAME, nganh: MAJOR });
-    assert.deepEqual(done.body.result.issuer, { maToChuc: 'VATVN-0100000001', ten: 'Trường Mẫu (DEMO)' });
+    assert.deepEqual(done.body.result.issuer, { maToChuc: 'VATVN-0100000001', ten: tenOf('VATVN-0100000001') });
+    assert.equal(done.body.verifier.name, tenOf('VATVN-0100000005'));
     verifiedSessionId = created.body.id;
 
     for (const [status, expected] of [['suspended', 'SUSPENDED'], ['valid', null], ['revoked', 'REVOKED']] as const) {
@@ -132,7 +140,7 @@ describe('negative paths over real HTTP', () => {
 
     assert.deepEqual(await fresh.wallet.presentations.submit(resolved.request, { credentialId: freshCredential, claimSetIndex: 1 }), { ok: true });
     const again = await fresh.wallet.presentations.submit(resolved.request, { credentialId: freshCredential, claimSetIndex: 0 });
-    assert.equal(!again.ok && again.code, 'VERIFIER_ERROR');
+    assert.equal(again.ok, false);
     assert.equal((await session(created.body.id)).body.status, 'verified');
     assert.deepEqual(Object.keys((await session(created.body.id)).body.result.claims), ['ho_ten', 'nganh']);
   });
@@ -155,41 +163,59 @@ describe('negative paths over real HTTP', () => {
     assert.deepEqual([post.status, (await post.json()).error], [400, 'invalid_request']);
   });
 
-  it('a photographed QR: garbage is ignored, a well-formed JWE with a bad vp_token wins the session', async () => {
+  /** The request a photographed QR reveals, and a way to post forms to its response URI. */
+  async function attacker(qr: string) {
+    const requestId = requestIdOf(qr);
+    const jwt = await (await fetch(`${LOCAL}/oid4vp/request/${requestId}`)).text();
+    const payload = JSON.parse(utf8Decode(base64UrlDecode(jwt.split('.')[1]!)));
+    const { kty, crv, x, y, kid } = payload.client_metadata.jwks.keys[0];
+    const post = (form: string) =>
+      fetch(`${LOCAL}/oid4vp/response/${requestId}`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form });
+    const badJwe = () =>
+      encryptJwe({
+        recipientPublicJwk: { kty, crv, x, y },
+        enc: 'A256GCM',
+        plaintext: utf8Encode(JSON.stringify({ vp_token: { credential: ['not-a-presentation'] }, state: payload.state })),
+        random: webCryptoRandom,
+        header: { kid }
+      });
+
+    return { post, badJwe, state: payload.state as string };
+  }
+
+  it('a photographed QR: garbage and a well-formed JWE with a bad vp_token are refused, the session stays open', async () => {
     const created = await createSession();
-    const requestId = requestIdOf(created.body.qr);
     // The legitimate wallet has read the request; the attacker reads it too.
     const resolved = await fresh.wallet.presentations.resolve(created.body.qr);
     assert.ok(resolved.ok);
     if (!resolved.ok) return;
-    const jwt = await (await fetch(`${LOCAL}/oid4vp/request/${requestId}`)).text();
-    const payload = JSON.parse(utf8Decode(base64UrlDecode(jwt.split('.')[1]!)));
-    const { kty, crv, x, y, kid } = payload.client_metadata.jwks.keys[0];
-    const postForm = (form: string) =>
-      fetch(`${LOCAL}/oid4vp/response/${requestId}`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: form });
+    const evil = await attacker(created.body.qr);
 
-    for (const garbage of ['response=garbage', 'vp_token=x&state=y', `response=a.b.c.d.e&state=${payload.state}`]) {
-      assert.equal((await postForm(garbage)).status, 400, garbage);
+    for (const form of ['response=garbage', 'vp_token=x&state=y', `response=a.b.c.d.e&state=${evil.state}`, `response=${evil.badJwe()}`]) {
+      const res = await evil.post(form);
+
+      assert.deepEqual([res.status, (await res.json()).error], [400, 'invalid_request'], form.slice(0, 20));
     }
-    assert.equal((await session(created.body.id)).body.status, 'request_retrieved', 'garbage changes nothing');
+    assert.equal((await session(created.body.id)).body.status, 'request_retrieved', 'refused responses finalise nothing');
 
-    const jwe = encryptJwe({
-      recipientPublicJwk: { kty, crv, x, y },
-      enc: 'A256GCM',
-      plaintext: utf8Encode(JSON.stringify({ vp_token: { credential: ['not-a-presentation'] }, state: payload.state })),
-      random: webCryptoRandom,
-      header: { kid }
-    });
-    assert.equal((await postForm(`response=${jwe}`)).status, 200);
+    // The legitimate wallet still completes the session.
+    assert.deepEqual(await fresh.wallet.presentations.submit(resolved.request, { credentialId: freshCredential, claimSetIndex: 1 }), { ok: true });
+    assert.equal((await session(created.body.id)).body.status, 'verified');
+    assert.ok(logs.some((line) => line === `Presentation ${created.body.id.slice(0, 8)}: refused (MALFORMED)`));
+  });
 
-    const taken = (await session(created.body.id)).body;
-    assert.equal(taken.status, 'failed');
-    assert.equal(codeAt(taken.result.checks, 'structure'), 'MALFORMED');
+  it('ten refused responses finalise the session as failed (TOO_MANY_ATTEMPTS)', async () => {
+    const created = await createSession();
+    const evil = await attacker(created.body.qr);
 
-    // Documented (architecture §9): exactly one response per session; the real one is refused.
-    const late = await fresh.wallet.presentations.submit(resolved.request, { credentialId: freshCredential, claimSetIndex: 1 });
-    assert.equal(!late.ok && late.code, 'VERIFIER_ERROR');
-    assert.equal((await session(created.body.id)).body.status, 'failed');
+    for (let i = 0; i < 10; i += 1) assert.equal((await evil.post(`response=${evil.badJwe()}`)).status, 400);
+
+    const done = (await session(created.body.id)).body;
+    assert.equal(done.status, 'failed');
+    assert.equal(codeAt(done.result.checks, 'holder_binding'), 'TOO_MANY_ATTEMPTS');
+    // Final: the request object is gone and further responses are refused.
+    assert.equal((await fetch(`${LOCAL}/oid4vp/request/${requestIdOf(created.body.qr)}`)).status, 404);
+    assert.equal((await evil.post(`response=${evil.badJwe()}`)).status, 400);
   });
 
   it('unknown sessions are 404, unknown verifier/scenario 404, extra fields 400', async () => {

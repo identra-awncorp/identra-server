@@ -12,21 +12,9 @@ import { createRedisStateStore } from '../common/state-store';
 import { StudentProfile } from '../demo-portal/demo-accounts';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { RedisService } from '../infrastructure/redis/redis.service';
+import { OPENID4VCI_ISSUERS } from './hosted-issuers';
 import { VcCredentialsService } from './vc-credentials.service';
 import { ISSUER_CLOCK, PKI, Pki, STATUS_LIST_SERVICE } from './vc.providers';
-
-/**
- * The OpenID4VCI issuers this server hosts. A second issuer is one more entry here (and its
- * `vc` key in IDENTRA_KEYS_DIR); `credentials` names configurations of the SDK's
- * CREDENTIAL_CONFIGURATIONS whose handlers are built below.
- */
-export const HOSTED_ISSUERS = [
-  {
-    name: 'truong-mau',
-    display: { vi: 'Trường Mẫu (DEMO)', en: 'Sample University (DEMO)' },
-    credentials: ['bang-tot-nghiep-v1']
-  }
-] as const satisfies ReadonlyArray<{ name: string; display: { vi: string; en: string }; credentials: readonly string[] }>;
 
 export const ISSUERS = Symbol('ISSUERS');
 /** The protocol state of every hosted issuer (the SDK prefixes its keys with the issuer URI). */
@@ -84,7 +72,7 @@ export const issuerProviders: Provider[] = [
       const store = createRedisStateStore(redis.getClient(), ISSUER_STATE_NAMESPACE);
       const registry = new Map<string, HostedIssuer>();
 
-      for (const hosted of HOSTED_ISSUERS) {
+      for (const hosted of OPENID4VCI_ISSUERS) {
         const issuerUri = pki.issuerUri(hosted.name);
         const issuer = createCredentialIssuer({
           issuerUri,

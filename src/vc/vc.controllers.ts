@@ -93,6 +93,21 @@ export class StatusListController {
   }
 }
 
+/**
+ * The organisation whose back-office API key `token` is, or null. Keys are compared as SHA-256
+ * digests in constant time, and every configured key is compared, matched or not.
+ */
+export function orgOfApiKey(keys: OrgApiKeyHash[], token: string): string | null {
+  const digest = createHash('sha256').update(token).digest();
+  let found: string | null = null;
+
+  for (const { org, hash } of keys) {
+    if (timingSafeEqual(Buffer.from(hash, 'hex'), digest) && found === null) found = org;
+  }
+
+  return found;
+}
+
 interface AdminRequest {
   headers: Record<string, string | string[] | undefined>;
   params: { name?: string };
@@ -104,15 +119,13 @@ interface AdminRequest {
  */
 @Injectable()
 export class IssuerAdminGuard implements CanActivate {
-  private readonly keys: Array<{ org: string; digest: Buffer }>;
+  private readonly keys: OrgApiKeyHash[];
 
   constructor(
     config: ConfigService,
     private readonly sessions: PortalSessions
   ) {
-    this.keys = config
-      .getOrThrow<OrgApiKeyHash[]>('IDENTRA_ORG_API_KEY_HASHES')
-      .map(({ org, hash }) => ({ org, digest: Buffer.from(hash, 'hex') }));
+    this.keys = config.getOrThrow<OrgApiKeyHash[]>('IDENTRA_ORG_API_KEY_HASHES');
   }
 
   async canActivate(context: ExecutionContext): Promise<boolean> {
@@ -122,12 +135,10 @@ export class IssuerAdminGuard implements CanActivate {
 
     if (!token) throw apiError(401, 'SESSION_EXPIRED', 'A bearer token is required.');
 
-    const digest = createHash('sha256').update(token).digest();
-    // Every configured key is compared, matched or not.
-    const keyOrgs = this.keys.filter((key) => timingSafeEqual(key.digest, digest)).map((key) => key.org);
+    const keyOrg = orgOfApiKey(this.keys, token);
 
-    if (keyOrgs.length > 0) {
-      if (keyOrgs.includes(issuer)) return true;
+    if (keyOrg !== null) {
+      if (keyOrg === issuer) return true;
 
       throw apiError(403, 'FORBIDDEN', 'This API key belongs to another organisation.');
     }

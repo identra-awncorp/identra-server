@@ -3,10 +3,11 @@ import { Module } from '@nestjs/common';
 import { DemoPortalModule } from '../demo-portal/demo-portal.controller';
 import { IssuerProtocolController, PortalOffersController } from './issuer.controllers';
 import { issuerProviders, ISSUERS } from './issuers';
+import { productControllers, ProductEventsService, productProviders } from './products';
 import { TRUST_LIST_MONITOR, trustListProviders } from './trust-list';
 import { STATUS_CHANGE_HOOKS, VcCredentialsService } from './vc-credentials.service';
 import { CredentialStatusController, IssuerAdminGuard, StatusListController, TrustListController } from './vc.controllers';
-import { CLOCK, PKI, STATUS_CHECKER, STATUS_LIST_SERVICE, TRUST_LIST_SERVICE, TRUST_REGISTRY, vcProviders } from './vc.providers';
+import { CLOCK, PKI, STATUS_CHECKER, STATUS_LIST_SERVICE, STATUS_MONITOR, TRUST_LIST_SERVICE, TRUST_REGISTRY, vcProviders } from './vc.providers';
 import { Oid4vpController, VerificationSessionsController } from './verification.controllers';
 import { VERIFIER_CLOCK, VERIFIER_MONITOR, verifierProviders, VERIFIERS } from './verifiers';
 
@@ -23,13 +24,15 @@ import { VERIFIER_CLOCK, VERIFIER_MONITOR, verifierProviders, VERIFIERS } from '
     IssuerProtocolController,
     PortalOffersController,
     VerificationSessionsController,
-    Oid4vpController
+    Oid4vpController,
+    ...productControllers
   ],
   providers: [
     ...vcProviders,
     ...trustListProviders,
     ...issuerProviders,
     ...verifierProviders,
+    ...productProviders,
     { provide: VERIFIER_CLOCK, useExisting: CLOCK },
     // Test seam only (delays inside a status change); nothing in production.
     { provide: STATUS_CHANGE_HOOKS, useValue: {} },
@@ -41,12 +44,14 @@ import { VERIFIER_CLOCK, VERIFIER_MONITOR, verifierProviders, VERIFIERS } from '
     TRUST_LIST_SERVICE,
     TRUST_LIST_MONITOR,
     STATUS_LIST_SERVICE,
+    STATUS_MONITOR,
     TRUST_REGISTRY,
     STATUS_CHECKER,
     ISSUERS,
     VERIFIERS,
     VERIFIER_MONITOR,
-    VcCredentialsService
+    VcCredentialsService,
+    ProductEventsService
   ]
 })
 export class VcModule {}

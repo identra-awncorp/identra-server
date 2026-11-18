@@ -66,8 +66,10 @@ mkdir -m 700 ~/.identra/server-keys && for f in orgs trust-list-signer root.cert
 ```
 
 Then set `IDENTRA_KEYS_DIR=$HOME/.identra/server-keys` (absolute path) in `.env`. Without it the
-server runs without those routes. The school portal's sample accounts:
-`npm run build && DEMO_PORTAL_PASSWORD='Identra@2026' npm run demo:provision`.
+server runs without those routes. Sample data, after `npm run build`:
+`DEMO_PORTAL_PASSWORD='Identra@2026' npm run demo:provision` (school portal accounts) and
+`DEMO_PRODUCT_PROVISION=yes npm run demo:provision-product` (the sample product chain; add
+`DEMO_PRODUCT_SERIAL=SN-2026-000002 DEMO_PRODUCT_STAGES=2` for a product still in progress).
 
 ## Environment
 

@@ -43,15 +43,39 @@ docker compose --env-file /etc/identra/server.env -f docker-compose.prod.yml \
 - Its `vc` key and certificate are `orgs/truong-mau/vc.{key,chain}.pem` in the key directory;
   the certificate's SAN must be `https://api-identra.awncorp.vn/issuers/truong-mau`. The
   issuers are listed in `src/vc/issuers.ts` (a second one is one entry plus its keys).
-- The access-token signing key and the request-encryption key are generated in memory at
-  every start and never stored. **A restart invalidates outstanding access tokens (at most
-  5 minutes old) and the encryption key a wallet read just before**: a student in the middle of
-  collecting a diploma gets an error and scans a new offer. Offers and PINs live in Redis
-  (10 minutes; state readable 30 minutes) and survive a restart of the api, not of Redis.
+- The access-token signing key, the request-encryption key and the HMAC key of the PIN hashes
+  are generated in memory at every start and never stored. **A restart invalidates outstanding
+  access tokens (at most 5 minutes old), the encryption key a wallet read just before, and the
+  PINs of every pending offer** (offers live 10 minutes): a student in the middle of collecting a
+  diploma gets an error and asks the portal for a new offer. Offer state lives in Redis (readable
+  30 minutes) and keeps only a keyed hash of the PIN, so Redis alone never reveals a PIN.
 - `demo:provision` creates or updates only the four `DemoPortalAccount` rows (`sv001`–`sv003`,
   `phongdaotao`), whose profiles are the claims of the diplomas issued; it touches no other
   table and never prints the password. Issued diplomas are recorded in `VcIssuedCredential`
   (status entry, cnf thumbprint, no claims); the credential itself is never stored.
+
+### Product issuers (`nha-san-xuat`, `kiem-dinh`, `phan-phoi`)
+
+- Each signs its lifecycle events with `orgs/<name>/vc-product.{key,chain}.pem` (the key store
+  serves it as purpose `vc`) and has its own status lists (`orgs/<name>/status.*`). They have no
+  OpenID4VCI endpoints. Organisations post events with their API key
+  (`IDENTRA_ORG_API_KEY_HASHES`) and revoke one through
+  `POST /v1/issuers/<name>/credentials/<event id>/status`.
+- The compact events are stored in `ProductEvent` (public by design, ADR-0012 §2); the page
+  verifies them itself. An event's status entry must have been allocated by this server.
+- The sample product (GTIN 09520123456788, GS1 demo prefix 952; not a real product):
+
+```bash
+docker compose --env-file /etc/identra/server.env -f docker-compose.prod.yml \
+  run --rm -e DEMO_PRODUCT_PROVISION=yes api npm run demo:provision-product
+# a second product with two stages, for the "not yet distributed" state of the page
+docker compose ... run --rm -e DEMO_PRODUCT_PROVISION=yes -e DEMO_PRODUCT_SERIAL=SN-2026-000002 \
+  -e DEMO_PRODUCT_STAGES=2 api npm run demo:provision-product
+```
+
+  It signs in-process with the three organisations' keys, stores each event through the same
+  check as the API, skips stages already stored (a second run changes nothing) and touches only
+  `ProductEvent` and the status-list tables.
 
 ### Verifier (OpenID4VP, `nha-tuyen-dung-mau`)
 

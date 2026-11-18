@@ -6,15 +6,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it } from 'node:test';
 
-import { createTrustListToken, statusListEntry, STATUS_LIST_BYTES } from '@identra/sdk-core';
-import type { StatusListService } from '@identra/sdk-server';
+import { statusListEntry, STATUS_LIST_BYTES } from '@identra/sdk-core';
+import { createTrustListService, type StatusListService } from '@identra/sdk-server';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 
 import { PrismaService } from '../src/infrastructure/prisma/prisma.service';
 import { RedisService } from '../src/infrastructure/redis/redis.service';
 import { createPrismaStatusListStorage } from '../src/vc/status-storage';
-import { verifiedLastToken } from '../src/vc/trust-list';
+import { redisLastIatStore } from '../src/vc/trust-list';
 import { STATUS_CHANGE_HOOKS, VcCredentialsService } from '../src/vc/vc-credentials.service';
 import { PKI, Pki, refuseCaKeys, STATUS_LIST_SERVICE } from '../src/vc/vc.providers';
 import { createTestApp, demoPkiDir, randomIp, testKeysDir } from './helpers';
@@ -183,29 +183,34 @@ describe('status-list storage keeps its optimistic version (mutation survivor)',
   });
 });
 
-describe('the stored last trust-list token is verified before use (F7)', () => {
+describe('the trust-list iat survives restarts (lastIatStore on Redis)', () => {
   const content = () => JSON.parse(readFileSync(join(testKeysDir(), 'trust-list.source.json'), 'utf8'));
 
-  it('accepts a token of the current signer and refuses garbage, a future iat and another signer', async () => {
-    const signer = await pki.keyStore.trustListSigner();
-    const now = new Date();
-    const good = await createTrustListToken({ ...content(), signer, now });
-    const future = await createTrustListToken({ ...content(), signer, now: new Date(now.getTime() + 120_000) });
-    const statusSigner = await pki.keyStore.signer(ISSUER, 'status');
-    const leafOnly = { ...statusSigner, x5c: [statusSigner.x5c![0]!] };
-    const other = await createTrustListToken({ ...content(), signer: leafOnly, now }).catch(() => 'not-a-token');
+  it('records the iat of every signed token in Redis', async () => {
+    const served = (await http().get('/trust-list').expect(200)).text;
+    const iat = JSON.parse(Buffer.from(served.split('.')[1]!, 'base64url').toString('utf8')).iat;
 
-    assert.equal(await verifiedLastToken(good, pki), good);
-    assert.equal(await verifiedLastToken(null, pki), undefined);
-    assert.equal(await verifiedLastToken('garbage', pki), undefined);
-    assert.equal(await verifiedLastToken(future, pki), undefined);
-    assert.equal(await verifiedLastToken(other, pki), undefined);
+    assert.equal(await app.get(RedisService).getClient().get('state:trust-list:last-iat'), String(iat));
   });
 
-  it('keeps the served token in Redis (mutation survivor: persistence)', async () => {
-    const served = (await http().get('/trust-list').expect(200)).text;
+  it('a stored iat is respected, garbage is ignored, one far in the future is ignored and reported', async () => {
+    const redis = app.get(RedisService);
+    const store = redisLastIatStore(redis);
+    const nowS = Math.floor(Date.now() / 1000);
+    const sign = async (stored: string) => {
+      await redis.getClient().set('state:trust-list:last-iat', stored);
+      const reasons: string[] = [];
+      const service = createTrustListService({ source: content, keyStore: pki.keyStore, clock: pki.clock, lastIatStore: store, onError: (r) => void reasons.push(r) });
+      const token = await service.token();
 
-    assert.equal(await app.get(RedisService).getClient().get('state:trust-list:last-token'), served);
+      return { iat: JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString('utf8')).iat as number, reasons };
+    };
+
+    assert.equal((await sign(String(nowS + 30))).iat, nowS + 31, 'a recent stored iat raises the next one');
+    assert.ok((await sign('not-a-number')).iat <= nowS + 2);
+    const future = await sign(String(nowS + 3600));
+    assert.ok(future.iat <= nowS + 2);
+    assert.deepEqual(future.reasons, ['last_iat_in_future']);
   });
 });
 

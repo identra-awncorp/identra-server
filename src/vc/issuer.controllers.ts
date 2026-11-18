@@ -18,7 +18,7 @@ import { RateLimit, RateLimitFailClosed } from '../common/rate-limit';
 import { createRedisStateStore, StateStore } from '../common/state-store';
 import { DemoPortalGuard, PortalSession, PortalSessionData } from '../demo-portal/portal-sessions';
 import { RedisService } from '../infrastructure/redis/redis.service';
-import { ISSUER_STATE_NAMESPACE, ISSUERS, IssuerRegistry } from './issuers';
+import { ISSUERS, IssuerRegistry } from './issuers';
 
 export interface RawRequest {
   headers: Record<string, string | string[] | undefined>;
@@ -131,14 +131,12 @@ const CONFIGURATION = 'bang-tot-nghiep-v1';
 @ApiBearerAuth()
 export class PortalOffersController {
   private readonly portalState: StateStore;
-  private readonly issuerState: StateStore;
 
   constructor(
     @Inject(ISSUERS) private readonly issuers: IssuerRegistry,
     redis: RedisService
   ) {
     this.portalState = createRedisStateStore(redis.getClient(), 'portal-offer');
-    this.issuerState = createRedisStateStore(redis.getClient(), ISSUER_STATE_NAMESPACE);
   }
 
   private hosted(session: PortalSessionData) {
@@ -155,7 +153,7 @@ export class PortalOffersController {
   async create(@PortalSession() session: PortalSessionData) {
     if (session.role !== 'student') throw apiError(403, 'FORBIDDEN', 'Only students can collect a diploma.');
 
-    const { issuer, issuerUri } = this.hosted(session);
+    const { issuer } = this.hosted(session);
     // The PIN (txCode) exists only in this response: the SDK keeps a keyed hash of it.
     const offer = await issuer.createOffer({ subjectRef: session.username, configurationId: CONFIGURATION });
     const previous = await this.portalState.swap(
@@ -164,12 +162,8 @@ export class PortalOffersController {
       PORTAL_OFFER_SECONDS
     );
 
-    if (previous && previous !== offer.offerId && (await issuer.offerStatus(previous))?.status === 'pending') {
-      await this.portalState.put(`superseded:${previous}`, '1', PORTAL_OFFER_SECONDS);
-      // The SDK has no cancel operation: removing its documented `offer:<id>` record makes the
-      // offer 404 and its pre-authorized code `invalid_grant` (docs/architecture.md §8).
-      await this.issuerState.take(`vci:${issuerUri}:offer:${previous}`);
-    }
+    // Safe on a used, expired or unknown offer: an issued one stays issued.
+    if (previous && previous !== offer.offerId) await issuer.cancelOffer(previous);
 
     return { ...offer, serverTime: new Date().toISOString() };
   }
@@ -181,8 +175,6 @@ export class PortalOffersController {
     // Unknown, too old, or someone else's: the same answer.
     if (!state || state.subjectRef !== session.username) throw apiError(404, 'NOT_FOUND', 'No such offer.');
 
-    const superseded = state.status === 'pending' && (await this.portalState.get(`superseded:${offerId}`)) !== null;
-
-    return { status: superseded ? 'expired' : state.status, serverTime: new Date().toISOString() };
+    return { status: state.status, serverTime: new Date().toISOString() };
   }
 }

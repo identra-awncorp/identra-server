@@ -46,6 +46,8 @@ describe('production errors do not leak infrastructure details (F6)', () => {
       database: { status: 'down' },
       redis: { status: 'down' },
       trustList: { status: 'up' },
+      // Without the database no status list can be served or checked.
+      statusLists: { status: 'down' },
       verifier: { status: 'up' }
     });
     assert.equal(res.body.status, 'degraded');

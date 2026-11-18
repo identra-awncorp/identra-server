@@ -1,14 +1,11 @@
 import { Body, Controller, Get, Header, HttpCode, Inject, Logger, Param, Post, Req, Res, UseFilters } from '@nestjs/common';
 import { ApiTags } from '@nestjs/swagger';
 import { IsString, Matches } from 'class-validator';
-import type { PresentationVerifier } from '@identra/sdk-server';
 
-import { apiError, oauthError, ProtocolErrorFilter, V1ErrorFilter } from '../common/http-errors';
+import { apiError, oauthError, ProtocolErrorFilter, unavailable, V1ErrorFilter } from '../common/http-errors';
 import { RateLimit, RateLimitFailClosed } from '../common/rate-limit';
-import { createRedisStateStore, StateStore } from '../common/state-store';
-import { RedisService } from '../infrastructure/redis/redis.service';
 import { RawRequest, RawResponse, sdkRequest, send } from './issuer.controllers';
-import { VERIFIER_STATE_NAMESPACE, VERIFIERS, VerifierRegistry } from './verifiers';
+import { VERIFIER_MONITOR, VerifierMonitor, VERIFIERS, VerifierRegistry } from './verifiers';
 
 const NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const logger = new Logger('Verification');
@@ -30,15 +27,27 @@ class CreateSessionDto {
 // Sessions live in Redis: without it there is nothing to create or read (503).
 @RateLimitFailClosed()
 export class VerificationSessionsController {
-  constructor(@Inject(VERIFIERS) private readonly verifiers: VerifierRegistry) {}
+  constructor(
+    @Inject(VERIFIERS) private readonly verifiers: VerifierRegistry,
+    @Inject(VERIFIER_MONITOR) private readonly monitor: VerifierMonitor
+  ) {}
 
   @Post()
   @HttpCode(201)
   @RateLimit('sessionCreation')
   async create(@Body() body: CreateSessionDto) {
-    const session = await this.verifiers.get(body.verifier)?.createSession({ scenario: body.scenario });
+    const verifier = this.verifiers.get(body.verifier);
+    const created = verifier ? await verifier.createSession({ scenario: body.scenario }) : null;
 
-    if (!session) throw apiError(404, 'NOT_FOUND', 'No such verifier or scenario.');
+    if (!created || (!created.ok && created.reason === 'unknown_scenario')) {
+      throw apiError(404, 'NOT_FOUND', 'No such verifier or scenario.');
+    }
+
+    this.monitor.listing(body.verifier, created.ok);
+
+    if (!created.ok) throw unavailable('This verifier is not in the trust list at the moment.');
+
+    const { session } = created;
 
     // requestId is never handed out on its own: it is inside the QR, which only a wallet reads.
     return { id: session.id, qr: session.qr, expiresAt: session.expiresAt, serverTime: session.serverTime };
@@ -66,51 +75,39 @@ export class VerificationSessionsController {
 @Controller('oid4vp')
 @UseFilters(ProtocolErrorFilter)
 export class Oid4vpController {
-  private readonly store: StateStore;
-
-  constructor(
-    @Inject(VERIFIERS) private readonly verifiers: VerifierRegistry,
-    redis: RedisService
-  ) {
-    this.store = createRedisStateStore(redis.getClient(), VERIFIER_STATE_NAMESPACE);
-  }
-
-  /** The verifier whose session owns `requestId` (the SDK's documented `request:` record). */
-  private async owner(requestId: string): Promise<{ verifier: PresentationVerifier; sessionId: string | null }> {
-    for (const verifier of this.verifiers.values()) {
-      const record = /^[A-Za-z0-9_-]{22}$/.test(requestId)
-        ? await this.store.get(`vp:${verifier.clientId}:request:${requestId}`)
-        : null;
-
-      if (record !== null) return { verifier, sessionId: (JSON.parse(record) as { id?: string }).id ?? null };
-    }
-
-    const [only] = this.verifiers.values();
-
-    if (!only) throw oauthError(404, 'not_found', 'unknown request');
-
-    // Unknown everywhere: let the SDK answer (404 / invalid_request) in its own words.
-    return { verifier: only, sessionId: null };
-  }
+  constructor(@Inject(VERIFIERS) private readonly verifiers: VerifierRegistry) {}
 
   @Get('request/:requestId')
   async request(@Param('requestId') requestId: string, @Res() res: RawResponse) {
-    send(res, await (await this.owner(requestId)).verifier.requestObject(requestId));
+    // Each verifier answers null for request ids it does not hold.
+    for (const verifier of this.verifiers.values()) {
+      const answer = await verifier.requestObject(requestId);
+
+      if (answer) return send(res, answer);
+    }
+
+    throw oauthError(404, 'not_found', 'unknown or finished request');
   }
 
   @Post('response/:requestId')
   @RateLimit('write')
   async response(@Param('requestId') requestId: string, @Req() req: RawRequest, @Res() res: RawResponse) {
-    const { verifier, sessionId } = await this.owner(requestId);
-    const answer = await verifier.handleResponse(requestId, sdkRequest(req));
+    const request = sdkRequest(req);
 
-    if (answer.status === 200 && sessionId) {
-      const result = (await verifier.session(sessionId))?.result;
-      const failing = result?.checks.find((check) => !check.ok && check.code !== 'SKIPPED')?.code;
+    for (const verifier of this.verifiers.values()) {
+      const handled = await verifier.handleResponse(requestId, request);
 
-      logger.log(`Presentation ${sessionId.slice(0, 8)}: ${result?.ok ? 'verified' : `failed${failing ? ` (${failing})` : ''}`}`);
+      if (!handled) continue;
+
+      const { outcome } = handled;
+      // Ids and codes only, the session id as an 8-character prefix (it reads the result).
+      const what = outcome.final ? (outcome.ok ? 'verified' : 'failed') : 'refused';
+
+      logger.log(`Presentation ${outcome.sessionId.slice(0, 8)}: ${what}${outcome.code ? ` (${outcome.code})` : ''}`);
+
+      return send(res, handled.response);
     }
 
-    send(res, answer);
+    throw oauthError(400, 'invalid_request', 'the response is not acceptable');
   }
 }

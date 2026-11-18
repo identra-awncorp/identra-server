@@ -24,8 +24,13 @@ const V1_CODES: Record<number, string> = {
 };
 
 /** Throw from a /v1 route of docs/vc-api.md: rendered as `{ statusCode, code, message }`. */
-export function apiError(status: number, code: string, message: string, options: { retryAfter?: number } = {}): HttpException {
-  return Object.assign(new HttpException({ code, message }, status), options);
+export function apiError(
+  status: number,
+  code: string,
+  message: string,
+  options: { retryAfter?: number; details?: { reason?: string; index?: number | null } } = {}
+): HttpException {
+  return Object.assign(new HttpException({ code, message, ...options.details }, status), { retryAfter: options.retryAfter });
 }
 
 /** 503 UNAVAILABLE with `Retry-After`: a dependency (Redis, a lock, the pool) is busy or down. */
@@ -63,6 +68,8 @@ function renderV1(exception: unknown, res: HttpResponse): void {
 
   const statusCode = exception.getStatus();
   const { code, message } = describe(exception);
+  // Optional machine-readable detail of a refusal (e.g. the SDK code of a product event).
+  const { reason, index } = (typeof exception.getResponse() === 'object' ? exception.getResponse() : {}) as { reason?: unknown; index?: unknown };
   const retryAfter = (exception as { retryAfter?: unknown }).retryAfter;
 
   if (typeof retryAfter === 'number') res.setHeader('Retry-After', String(retryAfter));
@@ -77,7 +84,9 @@ function renderV1(exception: unknown, res: HttpResponse): void {
         : statusCode === 503
           ? 'UNAVAILABLE'
           : (code ?? V1_CODES[statusCode] ?? 'ERROR'),
-    message: statusCode >= 500 ? 'Service unavailable' : message
+    message: statusCode >= 500 ? 'Service unavailable' : message,
+    ...(typeof reason === 'string' ? { reason } : {}),
+    ...(typeof index === 'number' || index === null ? { index } : {})
   });
 }
 

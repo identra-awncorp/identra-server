@@ -4,6 +4,7 @@ import { ModuleRef } from '@nestjs/core';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service';
 import { RedisService } from '../../infrastructure/redis/redis.service';
 import { TRUST_LIST_MONITOR, TrustListMonitor } from '../../vc/trust-list';
+import { STATUS_MONITOR, StatusMonitor } from '../../vc/vc.providers';
 import { VERIFIER_MONITOR, VerifierMonitor } from '../../vc/verifiers';
 
 @Injectable()
@@ -40,20 +41,23 @@ export class HealthService {
    * Only when the credential features are on: does the served trust list verify (and is it far
    * from expiry), and are the hosted verifiers still in it? Both are cached by their monitors.
    */
-  private async checkCredentials(): Promise<{ trustList: { status: 'up' | 'down' }; verifier: { status: 'up' | 'down' } } | null> {
+  private async checkCredentials() {
     let trustList: TrustListMonitor;
     let verifiers: VerifierMonitor;
+    let statusLists: StatusMonitor;
 
     try {
       trustList = this.moduleRef.get<TrustListMonitor>(TRUST_LIST_MONITOR, { strict: false });
       verifiers = this.moduleRef.get<VerifierMonitor>(VERIFIER_MONITOR, { strict: false });
+      statusLists = this.moduleRef.get<StatusMonitor>(STATUS_MONITOR, { strict: false });
     } catch {
       return null;
     }
 
-    const [t, v] = await Promise.all([trustList.check(), verifiers.check().catch(() => 'down' as const)]);
+    const down = () => 'down' as const;
+    const [t, s, v] = await Promise.all([trustList.check(), statusLists.check().catch(down), verifiers.check().catch(down)]);
 
-    return { trustList: { status: t }, verifier: { status: v } };
+    return { trustList: { status: t }, statusLists: { status: s }, verifier: { status: v } };
   }
 
   private async checkDatabase() {

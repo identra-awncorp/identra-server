@@ -42,8 +42,14 @@ export const VERIFIER_MONITOR = Symbol('VERIFIER_MONITOR');
 export type VerifierRegistry = ReadonlyMap<string, PresentationVerifier>;
 
 export interface VerifierMonitor {
-  /** `down` when a hosted verifier's certificate is no longer in the trust list (re-checked hourly). */
+  /**
+   * `down` when a hosted verifier is no longer in the trust list: as the SDK verifier itself found
+   * at its hourly re-check (a createSession answered `verifier_not_listed`), or by this monitor's
+   * own hourly lookup when no session was created meanwhile.
+   */
   check(): Promise<'up' | 'down'>;
+  /** Told by the session route what the verifier's own re-check answered. */
+  listing(name: string, listed: boolean): void;
 }
 
 const logger = new Logger('Verifiers');
@@ -92,11 +98,18 @@ export const verifierProviders: Provider[] = [
     inject: [VERIFIERS, TRUST_REGISTRY, PKI],
     useFactory: (verifiers: VerifierRegistry, trustRegistry: Registry, pki: Pki): VerifierMonitor => {
       let verdict: { state: 'up' | 'down'; at: number } | undefined;
+      const reported = new Map<string, boolean>();
 
       return {
+        listing(name, listed) {
+          if (reported.get(name) !== listed && !listed) logger.warn(`Verifier ${name} is no longer in the trust list`);
+          reported.set(name, listed);
+          verdict = undefined;
+        },
         async check() {
           const now = pki.clock.now().getTime();
 
+          if ([...reported.values()].includes(false)) return 'down';
           if (verdict && now - verdict.at < 3_600_000 && now >= verdict.at) return verdict.state;
 
           let state: 'up' | 'down' = 'up';
