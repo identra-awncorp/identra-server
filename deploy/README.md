@@ -16,6 +16,32 @@ takes the client IP (used for rate limits and stored on sessions) from the last
 `CF-Connecting-IP`, overwriting whatever the client sent. Without it every request seems
 to come from 127.0.0.1 and all visitors share one rate-limit budget.
 
+## Keys (`/etc/identra/keys`, mounted read-only at `/run/identra/keys`)
+
+Layout of `identra-sdk/scripts/pki/README.md`: `root.cert.pem`, `orgs/<name>/<purpose>.key.pem`
++ `.chain.pem`, `trust-list-signer/trust-list.{key,cert}.pem`, and the trust-list content
+`trust-list.source.json`. Never the `ca/` directory: the Root and Issuing CA keys do not
+touch the VPS (ADR-0015 §2). The container runs as uid 1000, and the SDK refuses a key file
+that is not a regular file of mode 600, so: `sudo chown -R 1000:1000 /etc/identra/keys`,
+`chmod 600` every `*.key.pem`, `chmod 700` the directories. The server loads every key at
+startup and refuses to start, naming the file, when one is missing or does not validate.
+
+Editing `trust-list.source.json` takes effect on the next request (re-read when its mtime
+changes). An invalid edit keeps the last good list in service, logs a warning, and
+`/v1/health` keeps `trustList: up` until that list expires (24 h): check the log after
+every edit.
+
+The school portal's sample accounts (idempotent; run again to reset their password):
+
+```bash
+docker compose --env-file /etc/identra/server.env -f docker-compose.prod.yml \
+  run --rm -e DEMO_PORTAL_PASSWORD='Identra@2026' api npm run demo:provision
+```
+
+Single instance: one api container (ADR-0016). Status lists are read from Postgres on every
+request, so a second instance would never serve a stale list, but two instances could sign
+two tokens with the same `iat` in one second.
+
 ## Deploy
 
 ```bash

@@ -21,11 +21,14 @@
     "seed": "prisma db seed",
     "docker:up": "docker compose up --build",
     "docker:down": "docker compose down",
-    "test": "tsc -p tsconfig.test.json && node dist-test/test/global-setup.js && node --env-file=.env.test --test --test-concurrency=1 \"dist-test/test/**/*.test.js\""
+    "test": "tsc -p tsconfig.test.json && node dist-test/test/global-setup.js && node --env-file=.env.test --test --test-concurrency=1 \"dist-test/test/**/*.test.js\"",
+    "demo:provision": "node dist/src/scripts/demo-provision.js"
   },
   "dependencies": {
     "@apollo/server": "^5.5.1",
     "@as-integrations/express5": "^1.1.2",
+    "@identra/sdk-core": "file:../identra-sdk/packages/core",
+    "@identra/sdk-server": "file:../identra-sdk/packages/server",
     "@nestjs/apollo": "^13.4.2",
     "@nestjs/common": "^11.0.0",
     "@nestjs/config": "^4.0.0",

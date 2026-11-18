@@ -52,7 +52,9 @@ export function configureApp(app: NestExpressApplication): void {
   });
   app.enableCors({
     origin: parseCorsOrigins(config.get<string>('CORS_ORIGINS')),
-    credentials: true
+    credentials: true,
+    // Lets the website read how long to wait after a 429 (docs/vc-api.md §2).
+    exposedHeaders: ['Retry-After']
   });
 
   // Strict DTO validation for /v1. It only applies to parameters typed as a class: a protocol

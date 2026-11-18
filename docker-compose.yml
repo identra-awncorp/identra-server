@@ -27,6 +27,9 @@ services:
     volumes:
       - .:/app
       - identra_node_modules:/app/node_modules
+      # The built SDK packages from the host, so an SDK rebuild needs no image rebuild
+      # (their dependencies stay in the image's /identra-sdk/node_modules).
+      - ../identra-sdk/packages:/identra-sdk/packages:ro
     depends_on:
       db:
         condition: service_healthy

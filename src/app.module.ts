@@ -1,9 +1,10 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
+import { ConditionalModule, ConfigModule } from '@nestjs/config';
 
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
 import { RateLimitModule } from './common/rate-limit';
+import { DemoPortalModule } from './demo-portal/demo-portal.controller';
 import { validateEnv } from './config/env.validation';
 import { IdentraGraphqlModule } from './graphql/graphql.module';
 import { PrismaModule } from './infrastructure/prisma/prisma.module';
@@ -22,6 +23,7 @@ import { PaymentsModule } from './modules/payments/payments.module';
 import { SharingModule } from './modules/sharing/sharing.module';
 import { UsersModule } from './modules/users/users.module';
 import { VerificationModule } from './modules/verification/verification.module';
+import { VcModule } from './vc/vc.module';
 
 @Module({
   imports: [
@@ -48,7 +50,10 @@ import { VerificationModule } from './modules/verification/verification.module';
     NotificationsModule,
     MiniAppsModule,
     DemoScenariosModule,
-    AuditModule
+    AuditModule,
+    DemoPortalModule,
+    // Credential features need the organisation keys; without IDENTRA_KEYS_DIR they are off.
+    ConditionalModule.registerWhen(VcModule, (env) => Boolean(env.IDENTRA_KEYS_DIR))
   ],
   controllers: [AppController],
   providers: [AppService]

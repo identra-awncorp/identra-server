@@ -34,6 +34,29 @@ use the same major version whenever possible.
 On Windows, reopen Git Bash or PowerShell after installing Node.js or Docker so
 the terminal can reload the updated `PATH`.
 
+### The Identra SDK
+
+The server uses `@identra/sdk-core` and `@identra/sdk-server` from the sibling directory
+`../identra-sdk` (`file:` dependencies, ADR-0005). Build the SDK there first
+(`npm install --ignore-scripts && npm run build`), then run `npm install` here; after an SDK
+rebuild, just restart the server. The SDK packages are ES modules: the server imports them
+only through `src/sdk.mts`, which Node 24 loads from the CommonJS code with `require(esm)`.
+
+### Credential features (optional locally)
+
+Trust list, status lists and the school portal's status changes need organisation keys
+(`IDENTRA_KEYS_DIR`, layout of `identra-sdk/scripts/pki/make-demo-pki.sh`). A local demo set,
+kept outside the repository:
+
+```bash
+../identra-sdk/scripts/pki/make-demo-pki.sh ~/.identra/demo-pki
+node ../identra-sdk/scripts/pki/make-trust-list-source.mjs ~/.identra/demo-pki --out ~/.identra/demo-pki/trust-list.source.json
+```
+
+Then set `IDENTRA_KEYS_DIR=$HOME/.identra/demo-pki` (absolute path) in `.env`. Without it the
+server runs without those routes. The school portal's sample accounts:
+`npm run build && DEMO_PORTAL_PASSWORD='Identra@2026' npm run demo:provision`.
+
 ## Environment
 
 Create a local environment file:
@@ -172,7 +195,11 @@ npm test
 
 The setup step applies the migrations (`prisma migrate deploy`), empties every table and the
 Redis database (it refuses unless `.env.test` points at a local `*test*` database), and stops
-with an error if either database is unreachable. Remove the containers and their volumes afterwards:
+with an error if either database is unreachable.
+
+The credential tests (`vc-*`, and the production-mode ones) start the app with the demo PKI
+above (`IDENTRA_TEST_KEYS_DIR` in `.env.test`, default `~/.identra/demo-pki`, read only); they
+fail with a message saying how to create it when it is missing. The other tests need no keys. Remove the containers and their volumes afterwards:
 
 ```bash
 docker rm -f -v identra-s0-pg identra-s0-redis

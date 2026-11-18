@@ -1,11 +1,18 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomInt } from 'node:crypto';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { Test, TestingModuleBuilder } from '@nestjs/testing';
 import request from 'supertest';
 
+import * as argon2 from 'argon2';
+
 import { configureApp } from '../src/configure-app';
+import { DEMO_ACCOUNTS, DEMO_ISSUER, PORTAL_PASSWORD_HASH } from '../src/demo-portal/demo-accounts';
+import { PrismaService } from '../src/infrastructure/prisma/prisma.service';
 import { RedisService } from '../src/infrastructure/redis/redis.service';
 
 export const TEST_PASSWORD = 'Correct-Horse-9';
@@ -45,12 +52,30 @@ export async function createTestApp(
   return app;
 }
 
+/**
+ * The demo PKI (identra-sdk/scripts/pki/make-demo-pki.sh, outside git) for the credential tests.
+ * Missing → the test file fails with this message; it is never skipped.
+ */
+export function testKeysDir(): string {
+  const dir = process.env.IDENTRA_TEST_KEYS_DIR || join(homedir(), '.identra', 'demo-pki');
+
+  if (!existsSync(join(dir, 'root.cert.pem')) || !existsSync(join(dir, 'trust-list.source.json'))) {
+    throw new Error(
+      `No demo PKI at ${dir}. Create it with identra-sdk/scripts/pki/make-demo-pki.sh <dir> and ` +
+        'make-trust-list-source.mjs, or set IDENTRA_TEST_KEYS_DIR in .env.test (README, "Tests").'
+    );
+  }
+
+  return dir;
+}
+
 /** A production configuration that passes every startup check. */
-export function productionEnv() {
+export function productionEnv(keysDir = testKeysDir()) {
   const secret = () => randomBytes(48).toString('base64');
 
   return {
     NODE_ENV: 'production',
+    IDENTRA_KEYS_DIR: keysDir,
     CORS_ORIGINS: 'https://identra.awncorp.vn',
     JWT_ACCESS_SECRET: secret(),
     JWT_REFRESH_SECRET: secret(),
@@ -112,4 +137,33 @@ export async function registerUser(app: NestExpressApplication): Promise<Registe
     device,
     accessToken: password.body.data.tokens.accessToken
   };
+}
+
+export const TEST_PORTAL_PASSWORD = 'Identra@2026';
+
+/** The sample portal accounts, plus a registrar of another issuer for authorisation tests. */
+export async function seedPortalAccounts(prisma: PrismaService): Promise<void> {
+  const passwordHash = await argon2.hash(TEST_PORTAL_PASSWORD, PORTAL_PASSWORD_HASH);
+  const accounts = [
+    ...DEMO_ACCOUNTS.map((a) => ({ username: a.username, role: a.role, issuerName: DEMO_ISSUER, profile: { ...a.profile } })),
+    { username: 'phongqlcl-nsx', role: 'registrar' as const, issuerName: 'nha-san-xuat', profile: { hoTen: 'Mẫu', donVi: 'DEMO' } }
+  ];
+
+  for (const { username, ...data } of accounts) {
+    await prisma.demoPortalAccount.upsert({
+      where: { username },
+      create: { username, passwordHash, ...data },
+      update: { passwordHash, ...data }
+    });
+  }
+}
+
+export async function portalLogin(app: NestExpressApplication, username: string): Promise<string> {
+  const res = await request(app.getHttpServer())
+    .post('/v1/demo/school/login')
+    .set('X-Forwarded-For', randomIp())
+    .send({ username, password: TEST_PORTAL_PASSWORD })
+    .expect(201);
+
+  return res.body.token;
 }

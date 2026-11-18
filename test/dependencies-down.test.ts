@@ -41,7 +41,12 @@ describe('production errors do not leak infrastructure details (F6)', () => {
   it('GET /v1/health reports components down without reasons', async () => {
     const res = await http().get('/v1/health').expect(200);
 
-    assert.deepEqual(res.body.services, { database: { status: 'down' }, redis: { status: 'down' } });
+    // The trust list needs neither store: it is signed from the key files and the source file.
+    assert.deepEqual(res.body.services, {
+      database: { status: 'down' },
+      redis: { status: 'down' },
+      trustList: { status: 'up' }
+    });
     assert.equal(res.body.status, 'degraded');
   });
 

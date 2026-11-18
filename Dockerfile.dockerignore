@@ -11,4 +11,10 @@
 !identra-server/prisma/schema.prisma
 !identra-server/prisma/migrations/**
 !identra-server/src/**
-# TODO(identra-sdk): add the SDK sources here (not its node_modules or build output).
+# The SDK: manifests and the built output of the two packages the server uses. No sources,
+# no tests, no .pki/ test keys, no node_modules (installed inside the image).
+!identra-sdk/package.json
+!identra-sdk/package-lock.json
+!identra-sdk/packages/*/package.json
+!identra-sdk/packages/core/dist/**
+!identra-sdk/packages/server/dist/**

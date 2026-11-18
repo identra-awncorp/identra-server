@@ -376,3 +376,74 @@ model DemoScenario {
   createdAt   DateTime           @default(now())
   updatedAt   DateTime           @updatedAt
 }
+
+// ---- Verifiable credentials (docs/vc-api.md §3, §5) ----
+
+enum VcCredentialStatus {
+  valid
+  suspended
+  revoked
+}
+
+// One Token Status List per issuer and list number: the raw 32 768-byte list (2 bits per
+// credential), an optimistic version and the iat of the last token signed for it
+// (StatusListStorage of @identra/sdk-server).
+model VcStatusList {
+  issuerName String
+  listNumber Int
+  bytes      Bytes
+  version    Int      @default(1)
+  lastIat    BigInt?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@id([issuerName, listNumber])
+}
+
+// An index handed out by allocate(); the primary key makes two concurrent allocations of one
+// index impossible (INSERT … ON CONFLICT DO NOTHING).
+model VcStatusIndex {
+  issuerName String
+  listNumber Int
+  idx        Int
+  createdAt  DateTime @default(now())
+
+  @@id([issuerName, listNumber, idx])
+}
+
+// What the issuer must remember about a credential it issued. No claims, no credential, no
+// disclosures (ADR-0014 §4).
+model VcIssuedCredential {
+  // 128-bit random, base64url (not a cuid: it is handed to clients).
+  id               String             @id
+  issuerName       String
+  vct              String
+  // Who it was issued to in the issuer's own records (portal username for the school demo).
+  subjectRef       String
+  statusListNumber Int
+  statusIndex      Int
+  // RFC 7638 thumbprint of the credential's cnf key.
+  cnfThumbprint    String
+  status           VcCredentialStatus @default(valid)
+  issuedAt         DateTime           @default(now())
+  statusChangedAt  DateTime           @default(now())
+
+  @@unique([issuerName, statusListNumber, statusIndex])
+  @@index([issuerName, subjectRef])
+}
+
+enum DemoPortalRole {
+  student
+  registrar
+}
+
+// Sample accounts of the school portal demo (docs/vc-api.md §5), created by `npm run demo:provision`.
+model DemoPortalAccount {
+  username     String   @id
+  passwordHash String
+  role         DemoPortalRole
+  issuerName   String
+  profile      Json
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+}

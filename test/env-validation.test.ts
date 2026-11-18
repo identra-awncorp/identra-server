@@ -6,7 +6,7 @@ import { validateEnv } from '../src/config/env.validation';
 import { productionEnv as strongProductionEnv } from './helpers';
 
 const productionEnv = {
-  ...strongProductionEnv(),
+  ...strongProductionEnv('/run/identra/keys'),
   DATABASE_URL: 'postgresql://u:p@db:5432/identra',
   REDIS_URL: 'redis://redis:6379'
 };
@@ -157,5 +157,60 @@ describe('parseCorsOrigins', () => {
       'https://a.example',
       'https://b.example'
     ]);
+  });
+});
+
+describe('credential feature configuration', () => {
+  const dev = { DATABASE_URL: 'postgresql://x', REDIS_URL: 'redis://x' };
+
+  it('defaults to the canonical base URL and derives the trust-list source from the keys dir', () => {
+    const env = validateEnv({ ...dev, IDENTRA_KEYS_DIR: '/keys' });
+
+    assert.equal(env.IDENTRA_PUBLIC_BASE_URL, 'https://api-identra.awncorp.vn');
+    assert.equal(env.IDENTRA_TRUST_LIST_SOURCE, '/keys/trust-list.source.json');
+    assert.deepEqual(env.IDENTRA_ORG_API_KEY_HASHES, []);
+  });
+
+  for (const url of ['http://api-identra.awncorp.vn', 'https://api-identra.awncorp.vn/', 'https://x.example/api']) {
+    it(`refuses IDENTRA_PUBLIC_BASE_URL=${url}`, () => {
+      assert.throws(() => validateEnv({ ...dev, IDENTRA_PUBLIC_BASE_URL: url }), /IDENTRA_PUBLIC_BASE_URL must be an https origin/);
+    });
+  }
+
+  it('refuses a non-canonical base URL in production unless explicitly overridden', () => {
+    const env = { ...productionEnv, IDENTRA_PUBLIC_BASE_URL: 'https://staging.example' };
+
+    assert.throws(() => validateEnv(env), /IDENTRA_PUBLIC_BASE_URL must be https:\/\/api-identra\.awncorp\.vn/);
+    assert.equal(
+      validateEnv({ ...env, IDENTRA_ALLOW_NONCANONICAL_BASE_URL: 'true' }).IDENTRA_PUBLIC_BASE_URL,
+      'https://staging.example'
+    );
+  });
+
+  it('requires IDENTRA_KEYS_DIR in production', () => {
+    const { IDENTRA_KEYS_DIR: _unset, ...env } = productionEnv;
+
+    assert.throws(() => validateEnv(env), /IDENTRA_KEYS_DIR is required/);
+  });
+
+  it('refuses relative key and source paths', () => {
+    assert.throws(() => validateEnv({ ...dev, IDENTRA_KEYS_DIR: 'keys' }), /IDENTRA_KEYS_DIR must be an absolute path/);
+    assert.throws(() => validateEnv({ ...dev, IDENTRA_TRUST_LIST_SOURCE: './x.json' }), /IDENTRA_TRUST_LIST_SOURCE must be an absolute path/);
+  });
+
+  it('parses IDENTRA_ORG_API_KEY_HASHES and refuses malformed entries without echoing them', () => {
+    const hash = 'a'.repeat(64);
+
+    assert.deepEqual(validateEnv({ ...dev, IDENTRA_ORG_API_KEY_HASHES: `truong-mau:${hash}, kiem-dinh:${'b'.repeat(64)}` }).IDENTRA_ORG_API_KEY_HASHES, [
+      { org: 'truong-mau', hash },
+      { org: 'kiem-dinh', hash: 'b'.repeat(64) }
+    ]);
+
+    for (const bad of [`Truong:${hash}`, 'truong-mau:abc', `truong-mau:${hash}:x`, 'plainsecretvalue']) {
+      assert.throws(
+        () => validateEnv({ ...dev, IDENTRA_ORG_API_KEY_HASHES: bad }),
+        (error: Error) => /org:sha256hex/.test(error.message) && !error.message.includes(bad)
+      );
+    }
   });
 });

@@ -1,3 +1,5 @@
+import { isAbsolute, join } from 'node:path';
+
 import { z } from 'zod';
 
 const booleanFromEnv = z.preprocess((value) => {
@@ -38,6 +40,17 @@ const SECRET_PLACEHOLDER = /change_?me|dev_|secret/i;
 // Demo codes anyone would try first.
 const GUESSABLE_OTP_CODE = /^(\d)\1{5}$|^123456$/;
 const E164 = /^\+[1-9]\d{7,14}$/;
+// The canonical API origin, signed into every credential (docs/vc-api.md §1).
+export const CANONICAL_PUBLIC_BASE_URL = 'https://api-identra.awncorp.vn';
+// Organisation names as in the key store: lower-case words joined by hyphens.
+const ORG_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
+
+export interface OrgApiKeyHash {
+  org: string;
+  /** sha256 of the API key, hex. */
+  hash: string;
+}
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -70,6 +83,19 @@ const envSchema = z.object({
   // Set to `production` by docker-compose.prod.yml so an unset NODE_ENV cannot silently
   // start the VPS in development mode.
   IDENTRA_DEPLOYMENT: z.string().optional(),
+  // Credential features (docs/vc-api.md). Identifiers stay canonical in every environment;
+  // development and tests redirect network access instead of changing them.
+  IDENTRA_PUBLIC_BASE_URL: z.string().default(CANONICAL_PUBLIC_BASE_URL),
+  // Production refuses any other base URL unless this is set (e.g. a staging host).
+  IDENTRA_ALLOW_NONCANONICAL_BASE_URL: booleanFromEnv.default(false),
+  // Directory of the organisation keys (layout of the SDK's make-demo-pki.sh). Unset = the
+  // credential features are off (auth-only deployments and tests). Required in production.
+  IDENTRA_KEYS_DIR: z.string().min(1).optional(),
+  // Trust-list content (JSON); defaults to <IDENTRA_KEYS_DIR>/trust-list.source.json.
+  IDENTRA_TRUST_LIST_SOURCE: z.string().min(1).optional(),
+  // Comma list of `org:sha256hex`: the SHA-256 of each organisation's back-office API key.
+  // Empty = no API-key access.
+  IDENTRA_ORG_API_KEY_HASHES: z.string().default(''),
   OTP_TTL_SECONDS: z.coerce.number().int().positive().default(300),
   OTP_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
   OTP_RESEND_COOLDOWN_SECONDS: z.coerce.number().int().positive().default(60),
@@ -90,11 +116,12 @@ const envSchema = z.object({
 
 export type Env = Omit<
   z.infer<typeof envSchema>,
-  'CORS_ORIGINS' | 'OTP_DEMO_ENABLED' | 'OTP_DEMO_PHONE_ALLOWLIST'
+  'CORS_ORIGINS' | 'OTP_DEMO_ENABLED' | 'OTP_DEMO_PHONE_ALLOWLIST' | 'IDENTRA_ORG_API_KEY_HASHES'
 > & {
   CORS_ORIGINS: string;
   OTP_DEMO_ENABLED: boolean;
   OTP_DEMO_PHONE_ALLOWLIST: string[];
+  IDENTRA_ORG_API_KEY_HASHES: OrgApiKeyHash[];
 };
 
 export function validateEnv(config: Record<string, unknown>): Env {
@@ -117,11 +144,36 @@ export function validateEnv(config: Record<string, unknown>): Env {
     throw new Error('Invalid environment variables: OTP_DEMO_PHONE_ALLOWLIST must list E.164 numbers');
   }
 
+  if (!isHttpsOrigin(env.IDENTRA_PUBLIC_BASE_URL)) {
+    throw new Error('Invalid environment variables: IDENTRA_PUBLIC_BASE_URL must be an https origin without a trailing slash');
+  }
+
+  for (const [name, path] of [['IDENTRA_KEYS_DIR', env.IDENTRA_KEYS_DIR], ['IDENTRA_TRUST_LIST_SOURCE', env.IDENTRA_TRUST_LIST_SOURCE]]) {
+    if (path !== undefined && !isAbsolute(path)) {
+      throw new Error(`Invalid environment variables: ${name} must be an absolute path`);
+    }
+  }
+
+  const apiKeyHashes = splitList(env.IDENTRA_ORG_API_KEY_HASHES).map((item) => {
+    const [org, hash, extra] = item.split(':');
+
+    if (extra !== undefined || !ORG_NAME.test(org ?? '') || !SHA256_HEX.test(hash ?? '')) {
+      // Never echo the entry: it is close to a secret.
+      throw new Error('Invalid environment variables: IDENTRA_ORG_API_KEY_HASHES must be a comma list of org:sha256hex');
+    }
+
+    return { org: org!, hash: hash! };
+  });
+
   const resolved: Env = {
     ...env,
     CORS_ORIGINS: env.CORS_ORIGINS ?? (isProduction ? '' : DEV_CORS_ORIGINS),
     OTP_DEMO_ENABLED: env.OTP_DEMO_ENABLED ?? !isProduction,
-    OTP_DEMO_PHONE_ALLOWLIST: allowlist
+    OTP_DEMO_PHONE_ALLOWLIST: allowlist,
+    IDENTRA_TRUST_LIST_SOURCE:
+      env.IDENTRA_TRUST_LIST_SOURCE ??
+      (env.IDENTRA_KEYS_DIR === undefined ? undefined : join(env.IDENTRA_KEYS_DIR, 'trust-list.source.json')),
+    IDENTRA_ORG_API_KEY_HASHES: apiKeyHashes
   };
 
   if (isProduction) {
@@ -160,6 +212,16 @@ function productionProblems(env: Env, raw: Record<string, unknown>): string[] {
     }
 
     seen.set(value, name);
+  }
+
+  if (env.IDENTRA_PUBLIC_BASE_URL !== CANONICAL_PUBLIC_BASE_URL && !env.IDENTRA_ALLOW_NONCANONICAL_BASE_URL) {
+    problems.push(
+      `IDENTRA_PUBLIC_BASE_URL must be ${CANONICAL_PUBLIC_BASE_URL} (set IDENTRA_ALLOW_NONCANONICAL_BASE_URL=true to override)`
+    );
+  }
+
+  if (env.IDENTRA_KEYS_DIR === undefined) {
+    problems.push('IDENTRA_KEYS_DIR is required (the organisation keys, /run/identra/keys in the container)');
   }
 
   const origins = splitList(env.CORS_ORIGINS);
