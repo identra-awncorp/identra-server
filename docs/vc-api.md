@@ -38,7 +38,9 @@ Sample organisations (all operated by Identra, certificates carry "DEMO"):
   logs). Codes used here: `INVALID_CREDENTIALS` (401), `SESSION_EXPIRED` (401),
   `FORBIDDEN` (403), `NOT_FOUND` (404), `CONFLICT` (409), `VALIDATION_FAILED`
   (400), `RATE_LIMITED` (429, with a `Retry-After` header in seconds, exposed to
-  browsers through `Access-Control-Expose-Headers`), `UNAVAILABLE` (503).
+  browsers through `Access-Control-Expose-Headers`), `INTERNAL_ERROR` (500),
+  `UNAVAILABLE` (503). A missing, unknown or expired bearer token is always
+  `401 SESSION_EXPIRED`; a valid one without the right to do this is `403 FORBIDDEN`.
 - A `POST` that creates something answers `201`; a `POST` that changes state
   answers `200`.
 - Every response that carries an `expiresAt` also carries `serverTime` (both
@@ -50,7 +52,8 @@ Sample organisations (all operated by Identra, certificates carry "DEMO"):
   their specification (OAuth 2.0 `{ error, error_description }` for OpenID4VCI
   and OpenID4VP).
 - Public signed resources (trust list, status lists, product events, issuer
-  metadata) send `Access-Control-Allow-Origin: *` and never use cookies.
+  metadata) send `Access-Control-Allow-Origin: *` and
+  `Access-Control-Expose-Headers: Date`, and never use cookies.
 - Nothing logs claims, credentials, disclosures, KB-JWTs, PINs, pre-authorized
   codes or tokens. Logs carry identifiers, error codes and timings only.
 - Every identifier handed to a client is at least 128 bits from a CSPRNG.
@@ -112,7 +115,7 @@ data; nothing here is a real person.
 
 | Method and path | Auth | Response |
 |---|---|---|
-| `POST /v1/demo/school/login` `{ username, password }` | none, rate limited | `{ token, expiresAt, role: "student" \| "registrar", profile }` |
+| `POST /v1/demo/school/login` `{ username, password }` | none, rate limited | `{ token, expiresAt, serverTime, role: "student" \| "registrar", profile }` |
 | `POST /v1/demo/school/offers` | student | `{ offerId, offerUri, txCode, expiresAt }` |
 | `GET /v1/demo/school/offers/:offerId` | student (owner) | `{ status: "pending" \| "issued" \| "expired" }` |
 | `GET /v1/demo/school/credentials` | student: own; registrar: all | `{ items: [{ id, studentCode, studentName, issuedAt, status }] }` |
@@ -205,4 +208,5 @@ certificate. The `POST` verification only keeps garbage out of the store.
 Per client IP (the address nginx passes on) and per route: login 10/min,
 session creation 30/min, token endpoint 20/min, other writes 60/min, reads
 300/min (polling a session once per second and an offer every two seconds stays
-well inside). Exceeding → `429 RATE_LIMITED` with `Retry-After`.
+well inside). The public signed resources of section 3 and the product events
+allow 1200/min: verifiers behind one address fetch them, and they are cacheable. Exceeding → `429 RATE_LIMITED` with `Retry-After`.
