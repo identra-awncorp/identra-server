@@ -1,14 +1,19 @@
-import { Injectable } from '@nestjs/common';
+import { HttpException, Injectable } from '@nestjs/common';
+import { GraphQLError } from 'graphql';
 
-import { GraphqlContext, GraphqlHttpRequest, GraphqlIdentity, GraphqlRole } from './graphql.context';
+import { AuthService } from '../modules/auth/auth.service';
+import { GraphqlContext, GraphqlHttpRequest, GraphqlIdentity } from './graphql.context';
 import { GraphqlLoadersService } from './graphql-loaders.service';
 
 @Injectable()
 export class GraphqlContextFactory {
-  constructor(private readonly loaders: GraphqlLoadersService) {}
+  constructor(
+    private readonly loaders: GraphqlLoadersService,
+    private readonly authService: AuthService
+  ) {}
 
-  create(req?: GraphqlHttpRequest): GraphqlContext {
-    const identity = this.createIdentity(req);
+  async create(req?: GraphqlHttpRequest): Promise<GraphqlContext> {
+    const identity = await this.createIdentity(req);
 
     return {
       req,
@@ -17,63 +22,52 @@ export class GraphqlContextFactory {
     };
   }
 
-  private createIdentity(req?: GraphqlHttpRequest): GraphqlIdentity {
-    const userId = readHeader(req, 'x-identra-user-id') ?? null;
-    const role = toRole(readHeader(req, 'x-identra-role'));
-    const scopes = toScopes(readHeader(req, 'x-identra-scopes'));
-    const ip = readClientIp(req);
-    const highAssurance =
-      readHeader(req, 'x-identra-session-assurance')?.toLowerCase() === 'high' ||
-      scopes.has('session:high_assurance');
-
-    return {
-      userId,
-      role,
-      scopes,
+  // Identity comes only from a verified bearer JWT (same check as JwtAuthGuard). No request
+  // header can set the user, role, scopes or session assurance; nothing grants admin/service yet.
+  private async createIdentity(req?: GraphqlHttpRequest): Promise<GraphqlIdentity> {
+    const ip = req?.ip ?? req?.socket?.remoteAddress ?? 'unknown';
+    const authorization = readHeader(req, 'authorization');
+    const anonymous: GraphqlIdentity = {
+      userId: null,
+      role: 'anonymous',
+      scopes: new Set(),
       ip,
-      highAssurance,
-      rateLimitKey: userId ? `user:${userId}` : `ip:${ip}`
+      highAssurance: false,
+      rateLimitKey: `ip:${ip}`
     };
+
+    if (!authorization) {
+      return anonymous;
+    }
+
+    try {
+      const auth = await this.authService.authenticateAccessToken(authorization);
+
+      return {
+        userId: auth.user.id,
+        role: 'user',
+        scopes: new Set(auth.claims.scopes),
+        ip,
+        highAssurance: false,
+        rateLimitKey: `user:${auth.user.id}`
+      };
+    } catch (error) {
+      if (error instanceof HttpException) {
+        // A credential was sent but is invalid: say so instead of silently downgrading.
+        const body = error.getResponse() as { code?: string; message?: string };
+
+        throw new GraphQLError(body.message ?? 'Unauthorized', {
+          extensions: { code: 'UNAUTHENTICATED', reason: body.code, http: { status: 401 } }
+        });
+      }
+
+      throw error;
+    }
   }
 }
 
 function readHeader(req: GraphqlHttpRequest | undefined, name: string): string | undefined {
-  const value = req?.headers?.[name.toLowerCase()] ?? req?.headers?.[name];
+  const value = req?.headers?.[name];
 
-  if (Array.isArray(value)) {
-    return value[0];
-  }
-
-  return value;
-}
-
-function toRole(value: string | undefined): GraphqlRole {
-  if (value === 'admin' || value === 'service' || value === 'user') {
-    return value;
-  }
-
-  return 'anonymous';
-}
-
-function toScopes(value: string | undefined): Set<string> {
-  if (!value) {
-    return new Set();
-  }
-
-  return new Set(
-    value
-      .split(/[,\s]+/)
-      .map((scope) => scope.trim())
-      .filter(Boolean)
-  );
-}
-
-function readClientIp(req: GraphqlHttpRequest | undefined): string {
-  const forwardedFor = readHeader(req, 'x-forwarded-for');
-
-  if (forwardedFor) {
-    return forwardedFor.split(',')[0].trim();
-  }
-
-  return req?.ip ?? req?.socket?.remoteAddress ?? 'unknown';
+  return Array.isArray(value) ? value[0] : value;
 }

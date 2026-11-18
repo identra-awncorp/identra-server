@@ -9,6 +9,7 @@ import {
   HttpStatus,
   Injectable,
   NotFoundException,
+  ServiceUnavailableException,
   UnauthorizedException
 } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
@@ -368,12 +369,11 @@ export class AuthService {
     };
   }
 
-  async logoutAll(authorization: string | undefined) {
-    const auth = await this.authenticateAccessToken(authorization);
+  async logoutAll(userId: string) {
     const now = new Date();
     const result = await this.prisma.deviceSession.updateMany({
       where: {
-        userId: auth.user.id,
+        userId,
         revokedAt: null
       },
       data: {
@@ -389,27 +389,25 @@ export class AuthService {
     };
   }
 
-  async listDevices(authorization: string | undefined) {
-    const auth = await this.authenticateAccessToken(authorization);
+  async listDevices(userId: string, currentSessionId: string) {
     const sessions = await this.prisma.deviceSession.findMany({
-      where: { userId: auth.user.id },
+      where: { userId },
       orderBy: { updatedAt: 'desc' }
     });
 
     return {
       data: sessions.map((session) => ({
         ...this.mapSession(session),
-        current: session.id === auth.session.id
+        current: session.id === currentSessionId
       }))
     };
   }
 
-  async revokeDevice(authorization: string | undefined, id: string) {
-    const auth = await this.authenticateAccessToken(authorization);
+  async revokeDevice(userId: string, currentSessionId: string, id: string) {
     const session = await this.prisma.deviceSession.findFirst({
       where: {
         id,
-        userId: auth.user.id
+        userId
       }
     });
 
@@ -420,7 +418,7 @@ export class AuthService {
       });
     }
 
-    if (session.id === auth.session.id) {
+    if (session.id === currentSessionId) {
       throw new ForbiddenException({
         code: 'CANNOT_REVOKE_CURRENT_DEVICE_HERE',
         message: 'Use /auth/logout to revoke the current device.'
@@ -450,6 +448,8 @@ export class AuthService {
     device: StartAuthDto['device'];
     meta: AuthRequestMeta;
   }) {
+    this.assertDemoOtpEnabled();
+
     const now = new Date();
     const windowStart = addSeconds(now, -60 * 60);
     const startsInWindow = await this.prisma.otpChallenge.count({
@@ -520,6 +520,8 @@ export class AuthService {
     purpose: OtpPurpose;
     otpCode: string;
   }): Promise<OtpChallenge> {
+    this.assertDemoOtpEnabled();
+
     const challenge = await this.prisma.otpChallenge.findUnique({
       where: { id: input.challengeId }
     });
@@ -640,7 +642,8 @@ export class AuthService {
     };
   }
 
-  private async authenticateAccessToken(
+  /** Bearer JWT verification plus active device-session lookup. Used by JwtAuthGuard and GraphQL. */
+  async authenticateAccessToken(
     authorization: string | undefined
   ): Promise<AuthenticatedSession> {
     const token = readBearerToken(authorization);
@@ -858,9 +861,23 @@ export class AuthService {
         channel: 'sms',
         provider: 'demo',
         to: challenge.phone,
-        demoOtp: this.config.getOrThrow<string>('OTP_DEMO_CODE')
+        // Development convenience only; never sent in production, even with the demo OTP opted in.
+        ...(this.config.get<string>('NODE_ENV') === 'production'
+          ? {}
+          : { demoOtp: this.config.getOrThrow<string>('OTP_DEMO_CODE') })
       }
     };
+  }
+
+  // There is no real OTP provider yet. With the fixed demo code switched off, refuse to
+  // create or accept challenges instead of silently using OTP_DEMO_CODE.
+  private assertDemoOtpEnabled(): void {
+    if (!this.config.getOrThrow<boolean>('OTP_DEMO_ENABLED')) {
+      throw new ServiceUnavailableException({
+        code: 'OTP_PROVIDER_UNAVAILABLE',
+        message: 'OTP delivery is not available on this server.'
+      });
+    }
   }
 
   private mapAuthUser(user: User) {

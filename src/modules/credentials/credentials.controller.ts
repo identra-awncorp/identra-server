@@ -1,7 +1,9 @@
-import { Controller, Get, Query } from '@nestjs/common';
-import { ApiTags } from '@nestjs/swagger';
+import { Controller, Get, Query, UseGuards } from '@nestjs/common';
+import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { User } from '@prisma/client';
 
 import { PaginationQueryDto } from '../../common/dto/pagination-query.dto';
+import { CurrentUser, JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { CredentialsService } from './credentials.service';
 
 @ApiTags('credentials')
@@ -10,7 +12,9 @@ export class CredentialsController {
   constructor(private readonly credentialsService: CredentialsService) {}
 
   @Get()
-  listCredentials(@Query() query: PaginationQueryDto) {
-    return this.credentialsService.listCredentials(query);
+  @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
+  listCredentials(@CurrentUser() user: User, @Query() query: PaginationQueryDto) {
+    return this.credentialsService.listCredentials(user.id, query);
   }
 }

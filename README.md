@@ -4,7 +4,7 @@ NestJS backend for Identra mobile app, website demos, and future super-app modul
 
 ## Stack
 
-- Node.js 22
+- Node.js 24 (minimum 22.12)
 - NestJS 11
 - Prisma 6
 - PostgreSQL
@@ -15,7 +15,7 @@ NestJS backend for Identra mobile app, website demos, and future super-app modul
 
 Before running the project, make sure your local environment has:
 
-- Node.js `22.x` recommended, `20.x` minimum
+- Node.js `24.x` recommended, `22.12` minimum (needed to `require()` ESM-only packages)
 - npm from the selected Node.js version
 - Docker Desktop with Docker Compose V2
 
@@ -28,7 +28,7 @@ docker --version
 docker compose version
 ```
 
-The Docker image for this project uses Node.js 22, so local development should
+The Docker image for this project uses Node.js 24, so local development should
 use the same major version whenever possible.
 
 On Windows, reopen Git Bash or PowerShell after installing Node.js or Docker so
@@ -88,7 +88,7 @@ Use this only when PostgreSQL and Redis are already running locally.
 ```bash
 npm ci
 npm run prisma:generate
-npm run prisma:push
+npm run prisma:deploy
 npm run seed
 npm run start:dev
 ```
@@ -98,7 +98,7 @@ PowerShell:
 ```powershell
 npm.cmd ci
 npm.cmd run prisma:generate
-npm.cmd run prisma:push
+npm.cmd run prisma:deploy
 npm.cmd run seed
 npm.cmd run start:dev
 ```
@@ -147,12 +147,49 @@ whether the phone is on the same Wi-Fi network without client isolation.
 npm run start:dev
 npm run lint
 npm run build
+npm test
 npm run prisma:generate
-npm run prisma:push
+npm run prisma:deploy     # apply committed migrations
+npm run prisma:migrate    # create a new migration after editing schema.prisma
 npm run seed
 npm run docker:up
 npm run docker:down
 ```
+
+## Tests
+
+`npm test` compiles the tests in `test/` and runs them with Node's built-in test runner
+against a real Postgres and Redis. Start two throwaway containers (project-specific names and
+ports, so they do not clash with the dev stack on 5432/6379):
+
+```bash
+docker run -d --name identra-s0-pg -e POSTGRES_USER=identra -e POSTGRES_PASSWORD=identra_test \
+  -e POSTGRES_DB=identra_test -p 127.0.0.1:47432:5432 postgres:16-alpine
+docker run -d --name identra-s0-redis -p 127.0.0.1:47379:6379 redis:7-alpine
+cp .env.test.example .env.test
+npm test
+```
+
+The setup step applies the migrations (`prisma migrate deploy`) and stops with an error if
+either database is unreachable. Remove the containers and their volumes afterwards:
+
+```bash
+docker rm -f -v identra-s0-pg identra-s0-redis
+```
+
+## Production
+
+The VPS runs `docker-compose.prod.yml` (ADR-0016); `docker-compose.yml` is for developer
+machines only. Both build from the parent directory (`context: ..`). Secrets come from
+`/etc/identra/server.env` (template: `.env.production.example`), signing keys from
+`/etc/identra/keys`:
+
+```bash
+docker compose --env-file /etc/identra/server.env -f docker-compose.prod.yml up -d --build
+```
+
+The api container runs `prisma migrate deploy` and then the server; schema changes ship as
+migrations in `prisma/migrations`, never `db push`.
 
 ## Architecture
 

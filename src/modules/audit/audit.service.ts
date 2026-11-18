@@ -7,8 +7,9 @@ import { PrismaService } from '../../infrastructure/prisma/prisma.service';
 export class AuditService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async listActivity(query: PaginationQueryDto) {
+  async listActivity(userId: string, query: PaginationQueryDto) {
     const logs = await this.prisma.activityLog.findMany({
+      where: { userId },
       orderBy: { createdAt: 'desc' },
       take: query.limit,
       skip: query.offset

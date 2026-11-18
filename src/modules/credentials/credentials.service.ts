@@ -16,8 +16,9 @@ const credentialStatusMap: Record<CredentialStatus, string> = {
 export class CredentialsService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async listCredentials(query: PaginationQueryDto) {
+  async listCredentials(holderId: string, query: PaginationQueryDto) {
     const credentials = await this.prisma.credential.findMany({
+      where: { holderId },
       include: {
         issuer: {
           select: {

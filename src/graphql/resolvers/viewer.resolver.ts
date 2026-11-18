@@ -40,9 +40,11 @@ export class ViewerResolver {
   @Query(() => GqlUser, { nullable: true })
   @Extensions({ complexity: 5 })
   async viewer(@Context() context: GraphqlContext): Promise<GqlUser | null> {
-    const user = context.identity.userId
-      ? await this.prisma.user.findUnique({ where: { id: context.identity.userId } })
-      : await this.prisma.user.findFirst({ orderBy: { createdAt: 'asc' } });
+    if (!context.identity.userId) {
+      return null;
+    }
+
+    const user = await this.prisma.user.findUnique({ where: { id: context.identity.userId } });
 
     return user ? mapUser(user) : null;
   }

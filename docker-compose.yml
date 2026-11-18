@@ -1,7 +1,13 @@
+# DEVELOPER MACHINES ONLY. Never use this file on the VPS (ADR-0016 §3): it runs the `dev`
+# stage, bind-mounts the source, runs `prisma db push` and the seed on every start, ships
+# default passwords and JWT secrets, and publishes 4000/5432/6379 on all interfaces.
+# Production uses docker-compose.prod.yml.
 services:
   api:
     build:
-      context: .
+      # Same parent-directory context as production (the image will later need ../identra-sdk).
+      context: ..
+      dockerfile: identra-server/Dockerfile
       target: dev
     container_name: identra-server-api
     command: sh -c "npx prisma db push && npx prisma db seed && npm run start:dev"

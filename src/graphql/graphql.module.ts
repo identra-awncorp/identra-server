@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ApolloDriver, ApolloDriverConfig } from '@nestjs/apollo';
 import { GraphQLModule as NestGraphQLModule } from '@nestjs/graphql';
 
+import { AuthModule } from '../modules/auth/auth.module';
 import { createDepthLimitRule } from './graphql-depth-limit.rule';
 import { GraphqlCacheService } from './graphql-cache.service';
 import { GraphqlHttpRequest } from './graphql.context';
@@ -30,6 +31,7 @@ const graphqlProviders = [
 ];
 
 @Module({
+  imports: [AuthModule],
   providers: graphqlProviders,
   exports: graphqlProviders
 })

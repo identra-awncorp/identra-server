@@ -1,0 +1,13 @@
+# Used by BuildKit for Dockerfile (same directory, same base name). Paths are relative to the
+# build context, which is the parent directory. Allow-list: the parent also holds unrelated
+# projects and secrets that must never enter an image or the build context.
+*
+!identra-server/package.json
+!identra-server/package-lock.json
+!identra-server/nest-cli.json
+!identra-server/tsconfig.json
+!identra-server/tsconfig.build.json
+!identra-server/prisma.config.ts
+!identra-server/prisma/
+!identra-server/src/
+# TODO(identra-sdk): add the SDK sources here (not its node_modules or build output).

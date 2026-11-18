@@ -1,11 +1,13 @@
-import { Body, Controller, Delete, Get, Headers, Param, Post, Req } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Headers, Param, Post, Req, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { DeviceSession, User } from '@prisma/client';
 
 import { AuthService } from './auth.service';
 import { PasswordLoginDto, SetRegistrationPasswordDto } from './dto/password.dto';
 import { LogoutDto, RefreshTokenDto } from './dto/refresh-token.dto';
 import { StartAuthDto } from './dto/start-auth.dto';
 import { VerifyAuthDto, VerifyRegisterDto } from './dto/verify-auth.dto';
+import { CurrentUser, JwtAuthGuard } from './jwt-auth.guard';
 
 interface RequestLike {
   headers?: Record<string, string | string[] | undefined>;
@@ -55,6 +57,7 @@ export class AuthController {
     return this.authService.refreshToken(body, getRequestMeta(req));
   }
 
+  // Not guarded: logout also works with only a refreshToken in the body.
   @Post('logout')
   logout(@Headers('authorization') authorization: string | undefined, @Body() body: LogoutDto) {
     return this.authService.logout(authorization, body.refreshToken);
@@ -62,23 +65,27 @@ export class AuthController {
 
   @Post('logout-all')
   @ApiBearerAuth()
-  logoutAll(@Headers('authorization') authorization: string | undefined) {
-    return this.authService.logoutAll(authorization);
+  @UseGuards(JwtAuthGuard)
+  logoutAll(@CurrentUser() user: User) {
+    return this.authService.logoutAll(user.id);
   }
 
   @Get('devices')
   @ApiBearerAuth()
-  listDevices(@Headers('authorization') authorization: string | undefined) {
-    return this.authService.listDevices(authorization);
+  @UseGuards(JwtAuthGuard)
+  listDevices(@CurrentUser() user: User, @CurrentUser('session') session: DeviceSession) {
+    return this.authService.listDevices(user.id, session.id);
   }
 
   @Delete('devices/:id')
   @ApiBearerAuth()
+  @UseGuards(JwtAuthGuard)
   revokeDevice(
-    @Headers('authorization') authorization: string | undefined,
+    @CurrentUser() user: User,
+    @CurrentUser('session') session: DeviceSession,
     @Param('id') id: string
   ) {
-    return this.authService.revokeDevice(authorization, id);
+    return this.authService.revokeDevice(user.id, session.id, id);
   }
 }
 
@@ -89,13 +96,9 @@ function getRequestMeta(req: RequestLike) {
   };
 }
 
+// req.ip honours `trust proxy` (one hop, see configureApp); reading X-Forwarded-For
+// directly would let any client choose the IP stored on its session.
 function readClientIp(req: RequestLike): string | null {
-  const forwardedFor = readHeader(req, 'x-forwarded-for');
-
-  if (forwardedFor) {
-    return forwardedFor.split(',')[0].trim();
-  }
-
   return req.ip ?? req.socket?.remoteAddress ?? null;
 }
 

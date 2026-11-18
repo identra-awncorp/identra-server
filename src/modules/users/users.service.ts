@@ -6,9 +6,9 @@ import { PrismaService } from '../../infrastructure/prisma/prisma.service';
 export class UsersService {
   constructor(private readonly prisma: PrismaService) {}
 
-  async findCurrentDemoUser() {
-    const user = await this.prisma.user.findFirst({
-      orderBy: { createdAt: 'asc' },
+  async findUser(id: string) {
+    const user = await this.prisma.user.findUnique({
+      where: { id },
       select: {
         id: true,
         did: true,
