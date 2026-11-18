@@ -472,7 +472,7 @@ OTP_ALREADY_CONSUMED
 OTP_EXPIRED
 OTP_ATTEMPTS_EXCEEDED
 OTP_INVALID
-OTP_PROVIDER_UNAVAILABLE   (503, only when the server runs with OTP_DEMO_ENABLED=false)
+OTP_PROVIDER_UNAVAILABLE   (503, demo OTP disabled, or the number is not on OTP_DEMO_PHONE_ALLOWLIST)
 ```
 
 Token and session:
@@ -487,6 +487,16 @@ LOGOUT_TOKEN_REQUIRED
 DEVICE_SESSION_NOT_FOUND
 CANNOT_REVOKE_CURRENT_DEVICE_HERE
 ```
+
+Rate limits (all auth routes):
+
+```text
+429 Too Many Requests     per client IP (start/verify/login: 10/min) or per phone number
+                          (10/min); wait for the Retry-After header
+RATE_LIMIT_UNAVAILABLE    503, the limiter cannot reach Redis; auth routes then refuse
+```
+
+A new login on a device invalidates every access token issued to that device before it.
 
 ## Related Server Configuration
 

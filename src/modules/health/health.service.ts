@@ -29,11 +29,9 @@ export class HealthService {
       await this.prisma.$queryRaw`SELECT 1`;
 
       return { status: 'up' as const };
-    } catch (error) {
-      return {
-        status: 'down' as const,
-        reason: error instanceof Error ? error.message : 'unknown'
-      };
+    } catch {
+      // Public endpoint: never echo driver errors (they name hosts and ports).
+      return { status: 'down' as const };
     }
   }
 
@@ -42,11 +40,9 @@ export class HealthService {
       const response = await this.redis.ping();
 
       return { status: response === 'PONG' ? ('up' as const) : ('degraded' as const) };
-    } catch (error) {
-      return {
-        status: 'down' as const,
-        reason: error instanceof Error ? error.message : 'unknown'
-      };
+    } catch {
+      // Public endpoint: never echo driver errors (they name hosts and ports).
+      return { status: 'down' as const };
     }
   }
 }

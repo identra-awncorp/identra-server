@@ -216,9 +216,9 @@ export class AuthService {
       });
     }
 
-    await this.verifyPasswordOrThrow(userPassword, body.password);
-
     const deviceKnown = await this.hasTrustedDevice(user.id, body.device.deviceId);
+
+    await this.verifyPasswordOrThrow(userPassword, body.password, deviceKnown);
 
     if (deviceKnown) {
       return this.prisma.$transaction((tx) =>
@@ -282,7 +282,8 @@ export class AuthService {
       include: { user: true }
     });
 
-    if (!session || session.revokedAt || session.expiresAt <= now) {
+    // Sessions from before loginId existed cannot mint valid access tokens: log in again.
+    if (!session || session.revokedAt || session.expiresAt <= now || !session.loginId) {
       throw new UnauthorizedException({
         code: 'INVALID_REFRESH_TOKEN',
         message: 'Refresh token is invalid or expired.'
@@ -448,7 +449,7 @@ export class AuthService {
     device: StartAuthDto['device'];
     meta: AuthRequestMeta;
   }) {
-    this.assertDemoOtpEnabled();
+    this.assertDemoOtpEnabled(input.phone);
 
     const now = new Date();
     const windowStart = addSeconds(now, -60 * 60);
@@ -520,7 +521,7 @@ export class AuthService {
     purpose: OtpPurpose;
     otpCode: string;
   }): Promise<OtpChallenge> {
-    this.assertDemoOtpEnabled();
+    this.assertDemoOtpEnabled(input.phone);
 
     const challenge = await this.prisma.otpChallenge.findUnique({
       where: { id: input.challengeId }
@@ -594,6 +595,9 @@ export class AuthService {
   ) {
     const refreshToken = this.createOpaqueToken();
     const refreshTokenExpiresAt = addDays(now, this.config.getOrThrow<number>('JWT_REFRESH_TTL_DAYS'));
+    // One row per (user, device) is reused across logins; a fresh loginId makes every access
+    // token from an earlier login (e.g. before a logout) invalid.
+    const loginId = this.createOpaqueToken();
     const session = await tx.deviceSession.upsert({
       where: {
         userId_deviceId: {
@@ -608,6 +612,7 @@ export class AuthService {
         deviceName: device.deviceName,
         appVersion: device.appVersion,
         refreshTokenHash: this.hashRefreshToken(refreshToken),
+        loginId,
         trustedAt: now,
         trustRevokedAt: null,
         lastSeenAt: now,
@@ -621,6 +626,7 @@ export class AuthService {
         deviceName: device.deviceName,
         appVersion: device.appVersion,
         refreshTokenHash: this.hashRefreshToken(refreshToken),
+        loginId,
         trustedAt: now,
         trustRevokedAt: null,
         lastSeenAt: now,
@@ -655,13 +661,14 @@ export class AuthService {
       });
     }
 
-    let claims: AccessTokenClaims;
+    const claims = await this.jwt
+      .verifyAsync<AccessTokenClaims>(token, {
+        secret: this.config.getOrThrow<string>('JWT_ACCESS_SECRET'),
+        algorithms: [ACCESS_TOKEN_ALGORITHM]
+      })
+      .catch(() => undefined);
 
-    try {
-      claims = await this.jwt.verifyAsync<AccessTokenClaims>(token, {
-        secret: this.config.getOrThrow<string>('JWT_ACCESS_SECRET')
-      });
-    } catch {
+    if (!isAccessTokenClaims(claims)) {
       throw new UnauthorizedException({
         code: 'ACCESS_TOKEN_INVALID',
         message: 'Bearer access token is invalid or expired.'
@@ -672,6 +679,7 @@ export class AuthService {
       where: {
         id: claims.sid,
         userId: claims.sub,
+        loginId: claims.lid,
         revokedAt: null,
         expiresAt: {
           gt: new Date()
@@ -704,12 +712,14 @@ export class AuthService {
       {
         sub: user.id,
         sid: session.id,
-        phone: user.phone,
+        lid: session.loginId!,
+        token_use: 'access',
         role: 'user',
         scopes: ['user']
       } satisfies AccessTokenClaims,
       {
         secret: this.config.getOrThrow<string>('JWT_ACCESS_SECRET'),
+        algorithm: ACCESS_TOKEN_ALGORITHM,
         expiresIn: expiresInSeconds
       }
     );
@@ -740,10 +750,17 @@ export class AuthService {
     });
   }
 
-  private async verifyPasswordOrThrow(userPassword: UserPassword, password: string): Promise<void> {
+  // The lockout stops guessing from new devices. It does not apply to a device that already
+  // holds a trusted session: otherwise anyone who knows a phone number could lock its owner
+  // out remotely with a few wrong passwords. A trusted device still needs the right password.
+  private async verifyPasswordOrThrow(
+    userPassword: UserPassword,
+    password: string,
+    trustedDevice: boolean
+  ): Promise<void> {
     const now = new Date();
 
-    if (userPassword.lockedUntil && userPassword.lockedUntil > now) {
+    if (!trustedDevice && userPassword.lockedUntil && userPassword.lockedUntil > now) {
       throw new HttpException(
         {
           code: 'PASSWORD_LOCKED',
@@ -871,8 +888,13 @@ export class AuthService {
 
   // There is no real OTP provider yet. With the fixed demo code switched off, refuse to
   // create or accept challenges instead of silently using OTP_DEMO_CODE.
-  private assertDemoOtpEnabled(): void {
-    if (!this.config.getOrThrow<boolean>('OTP_DEMO_ENABLED')) {
+  private assertDemoOtpEnabled(phone: string): void {
+    const allowlist = this.config.getOrThrow<string[]>('OTP_DEMO_PHONE_ALLOWLIST');
+
+    if (
+      !this.config.getOrThrow<boolean>('OTP_DEMO_ENABLED') ||
+      (allowlist.length > 0 && !allowlist.includes(phone))
+    ) {
       throw new ServiceUnavailableException({
         code: 'OTP_PROVIDER_UNAVAILABLE',
         message: 'OTP delivery is not available on this server.'
@@ -928,6 +950,19 @@ export class AuthService {
   private createOpaqueToken(): string {
     return randomBytes(48).toString('base64url');
   }
+}
+
+const ACCESS_TOKEN_ALGORITHM = 'HS256';
+
+// jwt.verify does not require `exp` and accepts any payload; insist on our own shape.
+function isAccessTokenClaims(claims: AccessTokenClaims | undefined): claims is AccessTokenClaims {
+  return (
+    typeof claims?.sub === 'string' &&
+    typeof claims.sid === 'string' &&
+    typeof claims.lid === 'string' &&
+    typeof claims.exp === 'number' &&
+    claims.token_use === 'access'
+  );
 }
 
 function readBearerToken(authorization: string | undefined): string | null {

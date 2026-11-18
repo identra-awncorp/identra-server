@@ -1,13 +1,14 @@
 # Used by BuildKit for Dockerfile (same directory, same base name). Paths are relative to the
-# build context, which is the parent directory. Allow-list: the parent also holds unrelated
-# projects and secrets that must never enter an image or the build context.
+# build context, which is the parent directory. Allow-list of files: the parent also holds
+# unrelated projects and secrets that must never enter an image or the build context.
+# prisma/seed.ts (demo data and a demo password) stays out, so it is not in any image.
 *
 !identra-server/package.json
 !identra-server/package-lock.json
 !identra-server/nest-cli.json
 !identra-server/tsconfig.json
 !identra-server/tsconfig.build.json
-!identra-server/prisma.config.ts
-!identra-server/prisma/
-!identra-server/src/
+!identra-server/prisma/schema.prisma
+!identra-server/prisma/migrations/**
+!identra-server/src/**
 # TODO(identra-sdk): add the SDK sources here (not its node_modules or build output).

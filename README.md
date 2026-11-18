@@ -170,8 +170,9 @@ cp .env.test.example .env.test
 npm test
 ```
 
-The setup step applies the migrations (`prisma migrate deploy`) and stops with an error if
-either database is unreachable. Remove the containers and their volumes afterwards:
+The setup step applies the migrations (`prisma migrate deploy`), empties every table and the
+Redis database (it refuses unless `.env.test` points at a local `*test*` database), and stops
+with an error if either database is unreachable. Remove the containers and their volumes afterwards:
 
 ```bash
 docker rm -f -v identra-s0-pg identra-s0-redis
@@ -190,6 +191,9 @@ docker compose --env-file /etc/identra/server.env -f docker-compose.prod.yml up 
 
 The api container runs `prisma migrate deploy` and then the server; schema changes ship as
 migrations in `prisma/migrations`, never `db push`.
+
+nginx configuration, deploy, image rollback and the failed-migration runbook:
+`deploy/README.md`.
 
 ## Architecture
 

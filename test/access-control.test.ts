@@ -2,11 +2,13 @@ import assert from 'node:assert/strict';
 import { randomBytes } from 'node:crypto';
 import { after, before, describe, it } from 'node:test';
 
+import { ConfigService } from '@nestjs/config';
+import { JwtService } from '@nestjs/jwt';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 
 import { PrismaService } from '../src/infrastructure/prisma/prisma.service';
-import { createTestApp, registerUser, RegisteredUser } from './helpers';
+import { createTestApp, registerUser, RegisteredUser, TEST_PASSWORD } from './helpers';
 
 let app: NestExpressApplication;
 let alice: RegisteredUser;
@@ -168,4 +170,83 @@ describe('GraphQL identity comes only from a verified JWT', () => {
     assert.equal(res.status, 401);
     assert.equal(res.body.errors[0].extensions.code, 'UNAUTHENTICATED');
   });
+});
+
+describe('an access token belongs to one login (F1)', () => {
+  it('a token from before logout stays dead after the next login on the same device', async () => {
+    const dave = await registerUser(app);
+    const oldToken = dave.accessToken;
+
+    await http().get('/v1/users/me').auth(oldToken, { type: 'bearer' }).expect(200);
+    await http().post('/v1/auth/logout').auth(oldToken, { type: 'bearer' }).send({}).expect(201);
+    await http().get('/v1/users/me').auth(oldToken, { type: 'bearer' }).expect(401);
+
+    // Same trusted device: password only, the same DeviceSession row is reused.
+    const login = await http()
+      .post('/v1/auth/login/start')
+      .send({ phone: dave.phone, password: TEST_PASSWORD, device: dave.device })
+      .expect(201);
+    const newToken = login.body.data.tokens.accessToken;
+
+    const rest = await http().get('/v1/users/me').auth(oldToken, { type: 'bearer' }).expect(401);
+    assert.equal(rest.body.code, 'SESSION_REVOKED_OR_EXPIRED');
+
+    const graphql = await http()
+      .post('/graphql')
+      .auth(oldToken, { type: 'bearer' })
+      .send({ query: '{ viewer { id } }' });
+    assert.equal(graphql.status, 401);
+
+    const fresh = await http().get('/v1/users/me').auth(newToken, { type: 'bearer' }).expect(200);
+    assert.equal(fresh.body.data.id, dave.id);
+  });
+
+  it('the access token carries no phone number', () => {
+    const claims = app.get(JwtService, { strict: false }).decode(alice.accessToken);
+
+    assert.equal(claims.phone, undefined);
+    assert.equal(JSON.stringify(claims).includes(alice.phone.slice(1)), false);
+  });
+});
+
+describe('access-token verification (F7)', () => {
+  const jwt = () => app.get(JwtService, { strict: false });
+  const secret = () => app.get(ConfigService).getOrThrow<string>('JWT_ACCESS_SECRET');
+  const claimsOf = (token: string) => {
+    const { iat: _iat, exp: _exp, ...claims } = jwt().decode(token);
+
+    return claims;
+  };
+  const meWith = (token: string) => http().get('/v1/users/me').auth(token, { type: 'bearer' });
+
+  it('accepts a correctly re-signed token (control for the cases below)', async () => {
+    const token = jwt().sign(claimsOf(alice.accessToken), { secret: secret(), expiresIn: 300 });
+
+    await meWith(token).expect(200);
+  });
+
+  const cases: Array<[string, () => string]> = [
+    ['signed with HS512', () =>
+      jwt().sign(claimsOf(alice.accessToken), { secret: secret(), algorithm: 'HS512', expiresIn: 300 })],
+    ['without exp', () => jwt().sign(claimsOf(alice.accessToken), { secret: secret() })],
+    ['expired', () =>
+      jwt().sign({ ...claimsOf(alice.accessToken), exp: Math.floor(Date.now() / 1000) - 10 }, { secret: secret() })],
+    ['with token_use other than access', () =>
+      jwt().sign({ ...claimsOf(alice.accessToken), token_use: 'refresh' }, { secret: secret(), expiresIn: 300 })],
+    ['without lid', () => {
+      const { lid: _lid, ...claims } = claimsOf(alice.accessToken);
+
+      return jwt().sign(claims, { secret: secret(), expiresIn: 300 });
+    }],
+    ['signed with another secret', () =>
+      jwt().sign(claimsOf(alice.accessToken), { secret: randomBytes(32).toString('hex'), expiresIn: 300 })]
+  ];
+
+  for (const [name, makeToken] of cases) {
+    it(`refuses a token ${name} with 401 ACCESS_TOKEN_INVALID`, async () => {
+      const res = await meWith(makeToken()).expect(401);
+
+      assert.equal(res.body.code, 'ACCESS_TOKEN_INVALID');
+    });
+  }
 });

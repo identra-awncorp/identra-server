@@ -8,19 +8,35 @@
 # The server itself also refuses to start with development secrets (src/config/env.validation.ts).
 name: identra-prod
 
+# Bounded logs on every service (the 45 GB disk is shared).
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Memory limits suit a 1 CPU / 3.8 GB host that also runs nginx and cloudflared.
 services:
   api:
     build:
       context: ..
       dockerfile: identra-server/Dockerfile
       target: prod
+    # Tag every deploy (IDENTRA_IMAGE_TAG=<git sha>) so it can be rolled back: deploy/README.md.
+    image: identra-prod-api:${IDENTRA_IMAGE_TAG:-latest}
     restart: unless-stopped
+    logging: *logging
+    mem_limit: 768m
     # No `db push` and no seed in production: apply committed migrations, then start.
     command: ["sh", "-c", "npx prisma migrate deploy && exec node dist/src/main.js"]
     env_file:
       - ${IDENTRA_ENV_FILE:-/etc/identra/server.env}
     environment:
       NODE_ENV: production
+      # The server refuses to start when this is set and NODE_ENV is not production.
+      IDENTRA_DEPLOYMENT: production
+      # Keep the V8 heap well inside mem_limit so GC runs before the OOM killer does.
+      NODE_OPTIONS: --max-old-space-size=512
       HOST: 0.0.0.0
       PORT: 4000
       DATABASE_URL: postgresql://${POSTGRES_USER:?POSTGRES_USER is required}:${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}@db:5432/${POSTGRES_DB:?POSTGRES_DB is required}?schema=public
@@ -53,6 +69,8 @@ services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
+    logging: *logging
+    mem_limit: 768m
     environment:
       POSTGRES_USER: ${POSTGRES_USER:?POSTGRES_USER is required}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
@@ -69,10 +87,18 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    logging: *logging
+    mem_limit: 160m
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
       REDISCLI_AUTH: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
-    command: ["sh", "-c", "exec redis-server --appendonly yes --requirepass \"$${REDIS_PASSWORD}\""]
+    # noeviction: Redis holds sessions, offers and rate-limit counters that must not vanish
+    # silently. When the 128 MB are full, writes fail with an OOM error instead: /v1/auth
+    # answers 503 (rate limiter fail-closed), other REST routes skip rate limiting, the GraphQL
+    # cache falls back to process memory and the GraphQL cost limiter follows
+    # GRAPHQL_RATE_LIMIT_FAIL_CLOSED (true in .env.production.example: GraphQL refuses).
+    # Watch `used_memory` (redis-cli info memory) and raise the limit before it gets there.
+    command: ["sh", "-c", "exec redis-server --appendonly yes --maxmemory 128mb --maxmemory-policy noeviction --requirepass \"$${REDIS_PASSWORD}\""]
     # No ports: reachable only on the Compose network.
     volumes:
       - redis_data:/data

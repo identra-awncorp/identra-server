@@ -1,0 +1,38 @@
+# nginx server block for api-identra.awncorp.vn (ADR-0016 §2). Traffic arrives through the
+# Cloudflare Tunnel: cloudflared connects to nginx on 127.0.0.1:80, nginx proxies to the api
+# container published on 127.0.0.1:4000. See deploy/README.md for where this file goes.
+
+server {
+    listen 127.0.0.1:80;
+    server_name api-identra.awncorp.vn;
+
+    # The only peer is cloudflared on localhost. Take the visitor's address from the header
+    # Cloudflare sets, and from nowhere else: $remote_addr becomes the real client.
+    set_real_ip_from 127.0.0.1;
+    real_ip_header CF-Connecting-IP;
+    real_ip_recursive off;
+
+    # OAuth forms, JWTs and JSON only (the app itself refuses bodies over 64 kB).
+    client_max_body_size 256k;
+
+    access_log /var/log/nginx/api-identra.access.log;
+    error_log /var/log/nginx/api-identra.error.log warn;
+
+    location / {
+        proxy_pass http://127.0.0.1:4000;
+        proxy_http_version 1.1;
+
+        proxy_set_header Host $host;
+        # OVERWRITE, never append ($proxy_add_x_forwarded_for): the app trusts exactly one
+        # hop and reads the last entry, so this single value is the client's IP.
+        proxy_set_header X-Forwarded-For $remote_addr;
+        # TLS ends at Cloudflare; every request reached it over HTTPS.
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header Connection "";
+
+        proxy_connect_timeout 5s;
+        proxy_send_timeout 30s;
+        proxy_read_timeout 30s;
+    }
+}

@@ -20,8 +20,11 @@ export class RedisService implements OnModuleDestroy {
   }
 
   async onModuleDestroy() {
-    if (this.client.status !== 'end') {
+    // quit() waits for a connection; while Redis is unreachable it would block shutdown.
+    if (this.client.status === 'ready') {
       await this.client.quit();
+    } else {
+      this.client.disconnect();
     }
   }
 }

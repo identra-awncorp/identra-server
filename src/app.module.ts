@@ -3,6 +3,7 @@ import { ConfigModule } from '@nestjs/config';
 
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
+import { RateLimitModule } from './common/rate-limit';
 import { validateEnv } from './config/env.validation';
 import { IdentraGraphqlModule } from './graphql/graphql.module';
 import { PrismaModule } from './infrastructure/prisma/prisma.module';
@@ -32,6 +33,7 @@ import { VerificationModule } from './modules/verification/verification.module';
     }),
     PrismaModule,
     RedisModule,
+    RateLimitModule,
     IdentraGraphqlModule,
     HealthModule,
     AuthModule,

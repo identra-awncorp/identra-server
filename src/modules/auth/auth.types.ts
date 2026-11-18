@@ -5,10 +5,13 @@ export interface AuthRequestMeta {
   userAgent: string | null;
 }
 
+// No personal data here: bearer tokens pass through proxies and client logs (ADR-0014 §4).
 export interface AccessTokenClaims {
   sub: string;
   sid: string;
-  phone: string | null;
+  /** DeviceSession.loginId: binds the token to one login, so a re-login revokes older tokens. */
+  lid: string;
+  token_use: 'access';
   role: 'user';
   scopes: string[];
   iat?: number;

@@ -45,8 +45,9 @@ RUN apk add --no-cache openssl libc6-compat
 
 COPY --from=build /app/node_modules ./node_modules
 COPY --from=build /app/dist ./dist
+# Only schema.prisma and migrations/ (Dockerfile.dockerignore). Without prisma.config.ts the
+# Prisma CLI uses its defaults (prisma/schema.prisma, prisma/migrations), the same paths.
 COPY --from=build /app/prisma ./prisma
-COPY --from=build /app/prisma.config.ts ./
 COPY --from=build /app/package*.json ./
 
 # The official image's unprivileged user (uid 1000). Files above stay root-owned (read-only).

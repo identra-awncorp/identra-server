@@ -3,19 +3,12 @@ import { describe, it } from 'node:test';
 
 import { parseCorsOrigins } from '../src/config/cors';
 import { validateEnv } from '../src/config/env.validation';
-
-const strong = (seed: string) => seed.repeat(40).slice(0, 40);
+import { productionEnv as strongProductionEnv } from './helpers';
 
 const productionEnv = {
-  NODE_ENV: 'production',
+  ...strongProductionEnv(),
   DATABASE_URL: 'postgresql://u:p@db:5432/identra',
-  REDIS_URL: 'redis://redis:6379',
-  CORS_ORIGINS: 'https://identra.awncorp.vn',
-  JWT_ACCESS_SECRET: strong('a'),
-  JWT_REFRESH_SECRET: strong('b'),
-  AUTH_REGISTRATION_TOKEN_SECRET: strong('c'),
-  PASSWORD_PEPPER: strong('d'),
-  OTP_HMAC_SECRET: strong('e')
+  REDIS_URL: 'redis://redis:6379'
 };
 
 const SECRETS = [
@@ -25,6 +18,12 @@ const SECRETS = [
   'PASSWORD_PEPPER',
   'OTP_HMAC_SECRET'
 ] as const;
+
+const demoOtpOptIn = {
+  OTP_DEMO_ENABLED: 'true',
+  OTP_DEMO_CODE: '580274',
+  OTP_DEMO_PHONE_ALLOWLIST: '+84900000001, +84900000002'
+};
 
 describe('production env validation', () => {
   it('accepts a complete production configuration with the demo OTP off by default', () => {
@@ -51,7 +50,29 @@ describe('production env validation', () => {
           !error.message.includes(weak)
       );
     });
+
+    it(`refuses a ${name} with fewer than 16 distinct characters`, () => {
+      assert.throws(
+        () => validateEnv({ ...productionEnv, [name]: 'abcdefgh'.repeat(6) }),
+        new RegExp(`${name} must contain at least 16 distinct characters`)
+      );
+    });
+
+    for (const placeholder of ['change_me', 'dev_', 'Secret']) {
+      it(`refuses a ${name} containing "${placeholder}"`, () => {
+        const value = `${placeholder}${productionEnv[name]}`;
+
+        assert.throws(() => validateEnv({ ...productionEnv, [name]: value }), new RegExp(`${name} looks like a placeholder`));
+      });
+    }
   }
+
+  it('refuses two secrets with the same value', () => {
+    assert.throws(
+      () => validateEnv({ ...productionEnv, PASSWORD_PEPPER: productionEnv.JWT_ACCESS_SECRET }),
+      /PASSWORD_PEPPER must differ from JWT_ACCESS_SECRET/
+    );
+  });
 
   for (const cors of [undefined, '', '  ', '*', 'https://identra.awncorp.vn,*']) {
     it(`refuses CORS_ORIGINS=${JSON.stringify(cors)}`, () => {
@@ -61,17 +82,60 @@ describe('production env validation', () => {
     });
   }
 
+  for (const cors of ['null', 'http://identra.awncorp.vn', 'https://identra.awncorp.vn/app', 'identra.awncorp.vn']) {
+    it(`refuses the non-https or malformed origin ${cors}`, () => {
+      assert.throws(
+        () => validateEnv({ ...productionEnv, CORS_ORIGINS: `https://ok.example,${cors}` }),
+        /CORS_ORIGINS entries must be https origins/
+      );
+    });
+  }
+
+  it('refuses IDENTRA_DEPLOYMENT=production without NODE_ENV=production', () => {
+    const { NODE_ENV: _unset, ...env } = productionEnv;
+
+    assert.throws(() => validateEnv({ ...env, IDENTRA_DEPLOYMENT: 'production' }), /requires NODE_ENV=production/);
+    assert.throws(
+      () => validateEnv({ ...env, NODE_ENV: 'development', IDENTRA_DEPLOYMENT: 'production' }),
+      /requires NODE_ENV=production/
+    );
+    assert.equal(validateEnv({ ...productionEnv, IDENTRA_DEPLOYMENT: 'production' }).NODE_ENV, 'production');
+  });
+
   it('refuses OTP_DEMO_CODE without the explicit OTP_DEMO_ENABLED opt-in', () => {
     assert.throws(
-      () => validateEnv({ ...productionEnv, OTP_DEMO_CODE: '123456' }),
+      () => validateEnv({ ...productionEnv, OTP_DEMO_CODE: '580274' }),
       /OTP_DEMO_CODE is set but the demo OTP is not enabled/
     );
   });
 
-  it('allows the demo OTP in production only with OTP_DEMO_ENABLED=true', () => {
-    const env = validateEnv({ ...productionEnv, OTP_DEMO_ENABLED: 'true', OTP_DEMO_CODE: '123456' });
+  it('allows the demo OTP in production with a private code and an allowlist', () => {
+    const env = validateEnv({ ...productionEnv, ...demoOtpOptIn });
 
     assert.equal(env.OTP_DEMO_ENABLED, true);
+    assert.deepEqual(env.OTP_DEMO_PHONE_ALLOWLIST, ['+84900000001', '+84900000002']);
+  });
+
+  for (const code of [undefined, '000000', '123456', '777777']) {
+    it(`refuses the demo OTP in production with OTP_DEMO_CODE=${code}`, () => {
+      const env: Record<string, unknown> = { ...productionEnv, ...demoOtpOptIn, OTP_DEMO_CODE: code };
+
+      assert.throws(() => validateEnv(env), /OTP_DEMO_CODE must be set to a non-guessable 6-digit code/);
+    });
+  }
+
+  it('refuses the demo OTP in production without OTP_DEMO_PHONE_ALLOWLIST', () => {
+    assert.throws(
+      () => validateEnv({ ...productionEnv, ...demoOtpOptIn, OTP_DEMO_PHONE_ALLOWLIST: '' }),
+      /OTP_DEMO_PHONE_ALLOWLIST must list the E.164 numbers/
+    );
+  });
+
+  it('refuses allowlist entries that are not E.164', () => {
+    assert.throws(
+      () => validateEnv({ ...productionEnv, ...demoOtpOptIn, OTP_DEMO_PHONE_ALLOWLIST: '0900000001' }),
+      /OTP_DEMO_PHONE_ALLOWLIST must list E.164 numbers/
+    );
   });
 
   it('keeps development defaults outside production', () => {
@@ -79,6 +143,7 @@ describe('production env validation', () => {
 
     assert.equal(env.OTP_DEMO_ENABLED, true);
     assert.equal(env.JWT_ACCESS_SECRET, 'dev_access_secret_change_me');
+    assert.deepEqual(env.OTP_DEMO_PHONE_ALLOWLIST, []);
     assert.ok(env.CORS_ORIGINS.includes('http://localhost:3000'));
   });
 });

@@ -1,6 +1,7 @@
-import { Module } from '@nestjs/common';
+import { HttpException, Module } from '@nestjs/common';
 import { ApolloDriver, ApolloDriverConfig } from '@nestjs/apollo';
 import { GraphQLModule as NestGraphQLModule } from '@nestjs/graphql';
+import { GraphQLError, GraphQLFormattedError } from 'graphql';
 
 import { AuthModule } from '../modules/auth/auth.module';
 import { createDepthLimitRule } from './graphql-depth-limit.rule';
@@ -18,6 +19,28 @@ import {
   CredentialFieldResolver
 } from './resolvers/credential.resolver';
 import { UserFieldResolver, ViewerResolver } from './resolvers/viewer.resolver';
+
+/**
+ * Production only. Errors we raise on purpose (GraphQLError from our plugins, validation and
+ * context; HttpException from resolvers) keep their message minus "Did you mean" schema hints.
+ * Anything else (Prisma, Redis, bugs) may name hosts, ports or queries and becomes generic.
+ */
+export function formatProductionError(
+  formatted: GraphQLFormattedError,
+  error: unknown
+): GraphQLFormattedError {
+  let original = error;
+
+  while (original instanceof GraphQLError && original.originalError) {
+    original = original.originalError;
+  }
+
+  if (!(original instanceof GraphQLError || original instanceof HttpException)) {
+    return { message: 'Internal server error', extensions: { code: 'INTERNAL_SERVER_ERROR' } };
+  }
+
+  return { ...formatted, message: formatted.message.replace(/\s*Did you mean .*$/s, '') };
+}
 
 const graphqlProviders = [
   GraphqlSecurityConfig,
@@ -57,6 +80,7 @@ class GraphqlProvidersModule {}
         introspection: securityConfig.introspection,
         graphiql: securityConfig.graphiql,
         debug: !securityConfig.isProduction,
+        formatError: securityConfig.isProduction ? formatProductionError : undefined,
         persistedQueries: false,
         validationRules: [createDepthLimitRule(securityConfig.maxDepth)],
         plugins: [securityPlugin],

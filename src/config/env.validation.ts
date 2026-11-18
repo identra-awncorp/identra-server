@@ -33,6 +33,11 @@ const DEV_SECRET_DEFAULTS = {
 
 const DEV_CORS_ORIGINS = 'http://localhost:3000,http://localhost:8081,http://localhost:19006';
 const PRODUCTION_MIN_SECRET_LENGTH = 32;
+const PRODUCTION_MIN_DISTINCT_CHARACTERS = 16;
+const SECRET_PLACEHOLDER = /change_?me|dev_|secret/i;
+// Demo codes anyone would try first.
+const GUESSABLE_OTP_CODE = /^(\d)\1{5}$|^123456$/;
+const E164 = /^\+[1-9]\d{7,14}$/;
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
@@ -59,6 +64,12 @@ const envSchema = z.object({
   // Fixed demo OTP. Defaults to on outside production and off in production (see validateEnv).
   OTP_DEMO_ENABLED: booleanFromEnv.optional(),
   OTP_DEMO_CODE: z.string().regex(/^\d{6}$/).default('000000'),
+  // Comma-separated E.164 numbers that may use the demo OTP. Empty = every number, which
+  // production refuses (see productionProblems).
+  OTP_DEMO_PHONE_ALLOWLIST: z.string().default(''),
+  // Set to `production` by docker-compose.prod.yml so an unset NODE_ENV cannot silently
+  // start the VPS in development mode.
+  IDENTRA_DEPLOYMENT: z.string().optional(),
   OTP_TTL_SECONDS: z.coerce.number().int().positive().default(300),
   OTP_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
   OTP_RESEND_COOLDOWN_SECONDS: z.coerce.number().int().positive().default(60),
@@ -77,9 +88,13 @@ const envSchema = z.object({
   GRAPHQL_TRUSTED_DOCUMENT_HASHES: z.string().default('')
 });
 
-export type Env = Omit<z.infer<typeof envSchema>, 'CORS_ORIGINS' | 'OTP_DEMO_ENABLED'> & {
+export type Env = Omit<
+  z.infer<typeof envSchema>,
+  'CORS_ORIGINS' | 'OTP_DEMO_ENABLED' | 'OTP_DEMO_PHONE_ALLOWLIST'
+> & {
   CORS_ORIGINS: string;
   OTP_DEMO_ENABLED: boolean;
+  OTP_DEMO_PHONE_ALLOWLIST: string[];
 };
 
 export function validateEnv(config: Record<string, unknown>): Env {
@@ -90,11 +105,23 @@ export function validateEnv(config: Record<string, unknown>): Env {
   }
 
   const env = parsed.data;
+
+  if (env.IDENTRA_DEPLOYMENT === 'production' && config.NODE_ENV !== 'production') {
+    throw new Error('Refusing to start: IDENTRA_DEPLOYMENT=production requires NODE_ENV=production');
+  }
+
   const isProduction = env.NODE_ENV === 'production';
+  const allowlist = splitList(env.OTP_DEMO_PHONE_ALLOWLIST);
+
+  if (allowlist.some((phone) => !E164.test(phone))) {
+    throw new Error('Invalid environment variables: OTP_DEMO_PHONE_ALLOWLIST must list E.164 numbers');
+  }
+
   const resolved: Env = {
     ...env,
     CORS_ORIGINS: env.CORS_ORIGINS ?? (isProduction ? '' : DEV_CORS_ORIGINS),
-    OTP_DEMO_ENABLED: env.OTP_DEMO_ENABLED ?? !isProduction
+    OTP_DEMO_ENABLED: env.OTP_DEMO_ENABLED ?? !isProduction,
+    OTP_DEMO_PHONE_ALLOWLIST: allowlist
   };
 
   if (isProduction) {
@@ -112,20 +139,35 @@ export function validateEnv(config: Record<string, unknown>): Env {
 function productionProblems(env: Env, raw: Record<string, unknown>): string[] {
   const problems: string[] = [];
 
+  const seen = new Map<string, string>();
+
   for (const [name, devDefault] of Object.entries(DEV_SECRET_DEFAULTS)) {
     const value = env[name as keyof typeof DEV_SECRET_DEFAULTS];
+    const twin = seen.get(value);
 
     if (value === devDefault) {
       problems.push(`${name} still has its development default`);
     } else if (value.length < PRODUCTION_MIN_SECRET_LENGTH) {
       problems.push(`${name} must be at least ${PRODUCTION_MIN_SECRET_LENGTH} characters`);
+    } else if (SECRET_PLACEHOLDER.test(value)) {
+      problems.push(`${name} looks like a placeholder (contains change_me, dev_ or secret)`);
+    } else if (new Set(value).size < PRODUCTION_MIN_DISTINCT_CHARACTERS) {
+      problems.push(
+        `${name} must contain at least ${PRODUCTION_MIN_DISTINCT_CHARACTERS} distinct characters`
+      );
+    } else if (twin) {
+      problems.push(`${name} must differ from ${twin}`);
     }
+
+    seen.set(value, name);
   }
 
-  const origins = env.CORS_ORIGINS.split(',').map((origin) => origin.trim()).filter(Boolean);
+  const origins = splitList(env.CORS_ORIGINS);
 
   if (origins.length === 0 || origins.includes('*')) {
     problems.push('CORS_ORIGINS must list explicit origins (empty and * are not allowed)');
+  } else if (!origins.every(isHttpsOrigin)) {
+    problems.push('CORS_ORIGINS entries must be https origins without a path (null is not allowed)');
   }
 
   // The demo OTP only runs in production with an explicit OTP_DEMO_ENABLED=true. Setting
@@ -134,5 +176,33 @@ function productionProblems(env: Env, raw: Record<string, unknown>): string[] {
     problems.push('OTP_DEMO_CODE is set but the demo OTP is not enabled; set OTP_DEMO_ENABLED=true to opt in');
   }
 
+  // Opted in: the code must not be public knowledge and only listed numbers may use it.
+  if (env.OTP_DEMO_ENABLED) {
+    if (raw.OTP_DEMO_CODE === undefined || GUESSABLE_OTP_CODE.test(env.OTP_DEMO_CODE)) {
+      problems.push('OTP_DEMO_CODE must be set to a non-guessable 6-digit code when the demo OTP is enabled');
+    }
+
+    if (env.OTP_DEMO_PHONE_ALLOWLIST.length === 0) {
+      problems.push('OTP_DEMO_PHONE_ALLOWLIST must list the E.164 numbers allowed to use the demo OTP');
+    }
+  }
+
   return problems;
+}
+
+function splitList(value: string): string[] {
+  return value
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function isHttpsOrigin(origin: string): boolean {
+  try {
+    const url = new URL(origin);
+
+    return url.protocol === 'https:' && url.origin === origin;
+  } catch {
+    return false;
+  }
 }

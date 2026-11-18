@@ -4,21 +4,19 @@ import { after, before, describe, it } from 'node:test';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
 
-import { createTestApp, randomDevice, randomPhone } from './helpers';
+import { createTestApp, productionEnv, randomDevice, randomPhone } from './helpers';
 
+const CODE = '580274';
+const allowedPhone = randomPhone();
 let app: NestExpressApplication;
 
-// A production-mode app (strong secrets, explicit CORS) that explicitly opts in to the demo OTP.
+// A production-mode app that explicitly opts in to the demo OTP for one listed number.
 before(async () => {
   app = await createTestApp({
-    NODE_ENV: 'production',
+    ...productionEnv(),
     OTP_DEMO_ENABLED: 'true',
-    CORS_ORIGINS: 'https://identra.awncorp.vn',
-    JWT_ACCESS_SECRET: 'p'.repeat(40),
-    JWT_REFRESH_SECRET: 'q'.repeat(40),
-    AUTH_REGISTRATION_TOKEN_SECRET: 'r'.repeat(40),
-    PASSWORD_PEPPER: 's'.repeat(40),
-    OTP_HMAC_SECRET: 't'.repeat(40)
+    OTP_DEMO_CODE: CODE,
+    OTP_DEMO_PHONE_ALLOWLIST: allowedPhone
   });
 });
 
@@ -27,21 +25,42 @@ after(async () => {
 });
 
 describe('demo OTP opted in under NODE_ENV=production', () => {
-  it('never returns demoOtp, but still accepts the code', async () => {
+  it('never returns the code, but accepts it for an allow-listed number', async () => {
     const http = request(app.getHttpServer());
-    const phone = randomPhone();
     const device = randomDevice();
 
-    const start = await http.post('/v1/auth/register/start').send({ phone, device }).expect(201);
+    const start = await http.post('/v1/auth/register/start').send({ phone: allowedPhone, device }).expect(201);
 
     assert.equal(start.body.data.delivery.demoOtp, undefined);
-    assert.ok(!JSON.stringify(start.body).includes('000000'));
+    assert.ok(!JSON.stringify(start.body).includes(CODE));
+
+    await http
+      .post('/v1/auth/register/verify')
+      .send({ challengeId: start.body.data.challengeId, phone: allowedPhone, otpCode: '000000', device })
+      .expect(401);
 
     const verify = await http
       .post('/v1/auth/register/verify')
-      .send({ challengeId: start.body.data.challengeId, phone, otpCode: '000000', device })
+      .send({ challengeId: start.body.data.challengeId, phone: allowedPhone, otpCode: CODE, device })
       .expect(201);
 
     assert.equal(verify.body.data.registration.nextAction, 'SET_PASSWORD');
+  });
+
+  it('refuses numbers outside OTP_DEMO_PHONE_ALLOWLIST with 503', async () => {
+    const res = await request(app.getHttpServer())
+      .post('/v1/auth/register/start')
+      .send({ phone: randomPhone(), device: randomDevice() })
+      .expect(503);
+
+    assert.equal(res.body.code, 'OTP_PROVIDER_UNAVAILABLE');
+  });
+
+  it('does not serve Swagger or advertise it', async () => {
+    await request(app.getHttpServer()).get('/docs').expect(404);
+    await request(app.getHttpServer()).get('/docs-json').expect(404);
+    const info = await request(app.getHttpServer()).get('/v1').expect(200);
+
+    assert.equal(info.body.docs, undefined);
   });
 });

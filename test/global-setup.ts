@@ -54,6 +54,38 @@ async function main() {
   }
 
   execFileSync('npx', ['prisma', 'migrate', 'deploy'], { stdio: 'inherit', env: process.env });
+  await resetTestData();
+}
+
+// Every run starts from empty tables and an empty Redis, so tests leave nothing behind
+// that the next run sees. Refuses anything that does not look like the throwaway setup.
+async function resetTestData() {
+  const db = new URL(process.env.DATABASE_URL!);
+  const local = (url: URL) => ['127.0.0.1', 'localhost'].includes(url.hostname);
+
+  if (!local(db) || !db.pathname.includes('test') || !local(new URL(process.env.REDIS_URL!))) {
+    fail('Refusing to wipe data: .env.test must point at a local *test* database and a local Redis.');
+  }
+
+  const prisma = new PrismaClient();
+  const redis = new Redis(process.env.REDIS_URL!);
+
+  try {
+    const tables = await prisma.$queryRaw<Array<{ tablename: string }>>`
+      SELECT tablename FROM pg_tables
+      WHERE schemaname = 'public' AND tablename <> '_prisma_migrations'`;
+
+    if (tables.length > 0) {
+      await prisma.$executeRawUnsafe(
+        `TRUNCATE ${tables.map((t) => `"${t.tablename}"`).join(', ')} CASCADE`
+      );
+    }
+
+    await redis.flushdb();
+  } finally {
+    await prisma.$disconnect();
+    redis.disconnect();
+  }
 }
 
 function redactUrl(value: string): string {

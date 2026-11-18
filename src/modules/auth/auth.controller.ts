@@ -2,6 +2,7 @@ import { Body, Controller, Delete, Get, Headers, Param, Post, Req, UseGuards } f
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { DeviceSession, User } from '@prisma/client';
 
+import { RateLimit, RateLimitFailClosed } from '../../common/rate-limit';
 import { AuthService } from './auth.service';
 import { PasswordLoginDto, SetRegistrationPasswordDto } from './dto/password.dto';
 import { LogoutDto, RefreshTokenDto } from './dto/refresh-token.dto';
@@ -19,6 +20,9 @@ interface RequestLike {
 
 @ApiTags('auth')
 @Controller('auth')
+// Every auth route also has the global per-IP limit; start/verify/login get `login` (10/min
+// per IP) plus the per-phone budget. Without Redis these routes answer 503 (fail-closed).
+@RateLimitFailClosed()
 export class AuthController {
   constructor(private readonly authService: AuthService) {}
 
@@ -28,31 +32,37 @@ export class AuthController {
   }
 
   @Post('register/start')
+  @RateLimit('login')
   startRegistration(@Body() body: StartAuthDto, @Req() req: RequestLike) {
     return this.authService.startRegistration(body, getRequestMeta(req));
   }
 
   @Post('register/verify')
+  @RateLimit('login')
   verifyRegistration(@Body() body: VerifyRegisterDto, @Req() req: RequestLike) {
     return this.authService.verifyRegistration(body, getRequestMeta(req));
   }
 
   @Post('register/password')
+  @RateLimit('login')
   setRegistrationPassword(@Body() body: SetRegistrationPasswordDto, @Req() req: RequestLike) {
     return this.authService.setRegistrationPassword(body, getRequestMeta(req));
   }
 
   @Post('login/start')
+  @RateLimit('login')
   startLogin(@Body() body: PasswordLoginDto, @Req() req: RequestLike) {
     return this.authService.startLogin(body, getRequestMeta(req));
   }
 
   @Post('login/verify')
+  @RateLimit('login')
   verifyLogin(@Body() body: VerifyAuthDto, @Req() req: RequestLike) {
     return this.authService.verifyLogin(body, getRequestMeta(req));
   }
 
   @Post('token/refresh')
+  @RateLimit('write')
   refreshToken(@Body() body: RefreshTokenDto, @Req() req: RequestLike) {
     return this.authService.refreshToken(body, getRequestMeta(req));
   }

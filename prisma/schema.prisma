@@ -101,6 +101,8 @@ model DeviceSession {
   deviceName       String?
   appVersion       String?
   refreshTokenHash String?   @unique
+  // New random value on every login; access tokens carry it as `lid` (see AuthService).
+  loginId          String?
   trustedAt        DateTime?
   trustRevokedAt   DateTime?
   lastSeenAt       DateTime?
