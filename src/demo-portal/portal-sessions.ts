@@ -3,6 +3,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { CanActivate, ExecutionContext, Injectable, OnModuleInit, createParamDecorator } from '@nestjs/common';
 import { DemoPortalRole } from '@prisma/client';
 import * as argon2 from 'argon2';
+import Redis from 'ioredis';
 
 import { apiError, unavailable } from '../common/http-errors';
 import { createRedisStateStore, StateStore } from '../common/state-store';
@@ -33,6 +34,15 @@ export const sessionHashOf = (token: string) => createHash('sha256').update(`por
  */
 export const MAX_CONCURRENT_HASHES = 2;
 
+/**
+ * Wrong passwords for one registrar account (its name is public) within the window; beyond that the
+ * account's sign-in answers 429 until the window ends, even with the right password, so guessing
+ * gets no further. Students are never counted: their password is public, and a third party must
+ * not be able to lock them out. A third party can delay the registrar's own sign-in this way.
+ */
+export const REGISTRAR_FAILURES = 10;
+export const REGISTRAR_WINDOW_SECONDS = 15 * 60;
+
 export function readBearer(header: string | string[] | undefined): string | null {
   const value = Array.isArray(header) ? header[0] : header;
   const match = /^Bearer ([A-Za-z0-9._~+/=-]{16,512})$/.exec(value ?? '');
@@ -44,6 +54,7 @@ export function readBearer(header: string | string[] | undefined): string | null
 @Injectable()
 export class PortalSessions implements OnModuleInit {
   private readonly store: StateStore;
+  private readonly redis: Redis;
   private dummyHash = '';
   private hashing = 0;
 
@@ -52,6 +63,7 @@ export class PortalSessions implements OnModuleInit {
     redis: RedisService
   ) {
     this.store = createRedisStateStore(redis.getClient(), 'portal-session');
+    this.redis = redis.getClient();
   }
 
   async onModuleInit() {
@@ -61,6 +73,17 @@ export class PortalSessions implements OnModuleInit {
 
   async login(username: string, password: string) {
     const account = await this.prisma.demoPortalAccount.findUnique({ where: { username } });
+    const failures = account?.role === 'registrar' ? `state:portal-registrar-failures:${account.username}` : null;
+
+    if (failures) {
+      const [[, count], [, pttl]] = (await this.redis.multi().get(failures).pttl(failures).exec().catch(() => {
+        throw unavailable();
+      })) as [[null, string | null], [null, number]];
+
+      if (Number(count) >= REGISTRAR_FAILURES) {
+        throw apiError(429, 'RATE_LIMITED', 'Too many failed sign-ins for this account; try again later.', { retryAfter: Math.max(1, Math.ceil(pttl / 1000)) });
+      }
+    }
 
     if (this.hashing >= MAX_CONCURRENT_HASHES) throw apiError(503, 'UNAVAILABLE', 'Too many sign-ins at once; try again.', { retryAfter: 1 });
 
@@ -72,6 +95,8 @@ export class PortalSessions implements OnModuleInit {
       .finally(() => (this.hashing -= 1));
 
     if (!account || !valid) {
+      if (failures) await this.redis.multi().incr(failures).expire(failures, REGISTRAR_WINDOW_SECONDS, 'NX').exec().catch(() => undefined);
+
       throw apiError(401, 'INVALID_CREDENTIALS', 'Username or password is incorrect.');
     }
 

@@ -76,4 +76,29 @@ describe('dependency failures are 503, not 500 (M11, B-7)', () => {
     assert.equal(isDependencyDown(unknown("ERROR: injected failure, Code: `P0001`")), false);
     assert.equal(isDependencyDown(new Prisma.PrismaClientInitializationError("Can't reach database server", '6')), true);
   });
+
+  it('reads a SQLSTATE only where the engine writes one: dates and words that look like class 08 stay a 500', () => {
+    const unknown = (message: string) => new Prisma.PrismaClientUnknownRequestError(message, { clientVersion: '6' });
+
+    // The first is verbatim from Prisma 6 after pg_terminate_backend() during a model query (this test
+    // setup; a raw query gave the fourth's form with 57P01); the others reuse those forms.
+    const real = [
+      'ConnectorError(ConnectorError { user_facing_error: None, kind: QueryError(PostgresError { code: "57P01", message: "terminating connection due to administrator command", severity: "FATAL", detail: None, column: None, hint: None }), transient: false })',
+      'ConnectorError(ConnectorError { user_facing_error: None, kind: QueryError(PostgresError { code: "08006", message: "x", severity: "FATAL", detail: None, column: None, hint: None }), transient: false })',
+      'QueryError(PostgresError { code: "53300", message: "sorry, too many clients already" })',
+      'Raw query failed. Code: `08P01`. Message: `protocol violation`',
+      'Error in PostgreSQL connection: Error { kind: Closed, cause: None }',
+      'server closed the connection unexpectedly'
+    ];
+    const unrelated = [
+      'trigger failed at 2026-11-08T10:00:00Z',
+      'order 08abc not found',
+      'invoice 08123 is locked, Code: `P0001`',
+      'deadline 2026-08-08 08:00 missed',
+      'QueryError(PostgresError { code: "23505", message: "duplicate key value violates unique constraint" })'
+    ];
+
+    for (const message of real) assert.equal(isDependencyDown(unknown(message)), true, message);
+    for (const message of unrelated) assert.equal(isDependencyDown(unknown(message)), false, message);
+  });
 });

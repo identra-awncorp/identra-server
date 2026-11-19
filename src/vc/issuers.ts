@@ -15,7 +15,7 @@ import {
   type StatusListService
 } from '@identra/sdk-server';
 
-import { createLiveCaps, LiveCaps, Reservation } from '../common/live-cap';
+import { Client, createLiveCaps, LiveCaps, Reservation } from '../common/live-cap';
 import { createRedisStateStore, StateStore } from '../common/state-store';
 import { StudentProfile } from '../demo-portal/demo-accounts';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
@@ -31,12 +31,16 @@ export const ISSUER_STATE_NAMESPACE = 'vci';
 export const PORTAL_OFFER_NAMESPACE = 'portal-offer';
 export const offerOwnerKey = (offerId: string) => `owner:${offerId}`;
 
-/** Shares of one client (an IPv4 address or IPv6 /56) inside the global caps (docs/vc-api.md §8). */
+/** Shares of one client (an IPv4 address or IPv6 /56; its /48: NETWORK_SHARES ×) inside the global caps (docs/vc-api.md §8). */
 export const NONCES_PER_CLIENT = 20;
 export const OFFERS_PER_CLIENT = 5;
-/** Offers created in the last 30 minutes (their status stays readable that long): per client, and globally per live offer. */
-export const OFFER_RECORDS_PER_CLIENT = 30;
-export const OFFER_RECORDS_PER_LIVE_OFFER = 10;
+/**
+ * Offers created in the last 30 minutes (their status stays readable that long): per client, and
+ * globally per live offer. Not given back when an offer ends (its record stays readable), so the
+ * share fits a class of about 40 behind one address creating two or three each.
+ */
+export const OFFER_RECORDS_PER_CLIENT = 100;
+export const OFFER_RECORDS_PER_LIVE_OFFER = 20;
 
 export const capKinds = (name: string) => ({
   /** Live offers (10 minutes, until redeemed or cancelled), ISSUANCE_MAX_LIVE_OFFERS; ended at the next start. */
@@ -56,9 +60,9 @@ export interface HostedIssuer {
    * Counts the c_nonce the SDK has just stored against `client`'s share and the global cap; when
    * refused, the nonce is removed again. Its place is freed when a proof uses it, or after 5 minutes.
    */
-  reserveNonce(cNonce: string, client: string): Promise<Reservation>;
+  reserveNonce(cNonce: string, client: Client): Promise<Reservation>;
   /** The same for a new offer (live and 30-minute caps); a refused offer leaves nothing in Redis. */
-  reserveOffer(offerId: string, client: string): Promise<Reservation>;
+  reserveOffer(offerId: string, client: Client): Promise<Reservation>;
 }
 
 /**
@@ -231,7 +235,7 @@ export const issuerProviders: Provider[] = [
           caps,
           async reserveNonce(cNonce, client) {
             const id = nonceId(cNonce);
-            const slot = await caps.reserve(kinds.nonces, id, NONCE_SECONDS, { cap: maxNonces, perClient: { key: client, cap: NONCES_PER_CLIENT } });
+            const slot = await caps.reserve(kinds.nonces, id, NONCE_SECONDS, { cap: maxNonces, perClient: { ...client, cap: NONCES_PER_CLIENT } });
 
             if (!slot.ok) await store.take(sdkKey(issuerUri, 'nonce', id));
 
@@ -240,10 +244,10 @@ export const issuerProviders: Provider[] = [
           async reserveOffer(offerId, client) {
             const records = await caps.reserve(kinds.offerRecords, offerId, OFFER_STATUS_SECONDS, {
               cap: maxOffers * OFFER_RECORDS_PER_LIVE_OFFER,
-              perClient: { key: client, cap: OFFER_RECORDS_PER_CLIENT }
+              perClient: { ...client, cap: OFFER_RECORDS_PER_CLIENT }
             });
             const live = records.ok
-              ? await caps.reserve(kinds.offers, offerId, OFFER_SECONDS, { cap: maxOffers, perClient: { key: client, cap: OFFERS_PER_CLIENT } })
+              ? await caps.reserve(kinds.offers, offerId, OFFER_SECONDS, { cap: maxOffers, perClient: { ...client, cap: OFFERS_PER_CLIENT } })
               : records;
 
             if (live.ok) return live;

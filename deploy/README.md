@@ -62,8 +62,10 @@ The school portal's sample accounts: Deploy, step 7.
   `phongdaotao`), whose profiles are the claims of the diplomas issued; it touches no other
   table and never prints a password. It needs two: `DEMO_PORTAL_PASSWORD` for the three students
   (public, printed on the portal's sign-in page) and `DEMO_PORTAL_REGISTRAR_PASSWORD` for the
-  registrar (private, at least 12 characters, different: the registrar can suspend and revoke
-  every diploma). Never publish the second one.
+  registrar (private, at least 20 characters, different: the registrar can suspend and revoke
+  every diploma, and its account name is public). Never publish the second one. After 10 wrong
+  passwords in 15 minutes the registrar's sign-in waits until those 15 minutes end (anyone can
+  cause that delay; the student accounts are never locked).
 - Every visitor of a student account works in their own portal session: offers, the diplomas
   issued from them and their revocation belong to that session (docs/vc-api.md §5). Issued diplomas are recorded in `VcIssuedCredential`
   (status entry, cnf thumbprint, no claims); the credential itself is never stored.
@@ -172,7 +174,9 @@ the admin only, since whatever is in it can end up in the image):
    `Loaded the keys of 5 of 5 hosted organisations` and `Verifier nha-tuyen-dung-mau is ready`.
 6. Keep the tag: `echo "$IDENTRA_IMAGE_TAG" >> /srv/awncorp/identra-api/DEPLOYED` (the rollback list).
 7. First time (and to reset the demo passwords), the sample data. Type the passwords, so they
-   stay out of the shell history and the process list:
+   stay out of the shell history and the process list. Generate the registrar's on the admin
+   machine (`openssl rand -base64 24`: 32 characters; at least 20 are required) and keep it in
+   the password manager:
 
    ```bash
    read -rs -p 'student password (public): ' DEMO_PORTAL_PASSWORD; echo
@@ -246,7 +250,8 @@ Redis runs with `--maxmemory 128mb --maxmemory-policy noeviction`: nothing is ev
 silently. When full, writes fail; `/v1/auth/*` then answers 503 (rate limiting fails
 closed) and other REST routes run without rate limits; routes that must write answer 503.
 The anonymous protocol state (verification sessions, c_nonces, offers) is capped across all
-clients at about 38 MB in the worst case, each client holding a fixed share of every cap
+clients at about 56 MB in the worst case, each client (and each IPv6 /48) holding a fixed share
+of every cap, and portal sessions are bounded by the sign-in rate at about 11 MB
 (docs/vc-api.md §8; `VERIFICATION_MAX_LIVE_SESSIONS`, `ISSUANCE_MAX_LIVE_NONCES`,
 `ISSUANCE_MAX_LIVE_OFFERS`). `/v1/health` reports `redis: degraded` (and `status: degraded`,
 still HTTP 200) above 80 % of `maxmemory` or when a write is refused. Check with
@@ -254,8 +259,9 @@ still HTTP 200) above 80 % of `maxmemory` or when a write is refused. Check with
 
 ## Edge rate limits (Cloudflare; a human must add them)
 
-Every cap of docs/vc-api.md §8 has a per-client share, so one client, or ten, cannot block the
-others. A distributed attacker with a hundred or more addresses still can fill a global cap
+Every cap of docs/vc-api.md §8 has a per-client share (and a share per IPv6 /48), so one client,
+or ten, cannot block the others. A distributed attacker with a hundred or more IPv4 addresses,
+or 25 or more IPv6 /48s (tunnel brokers hand out several per free account), still can fill a global cap
 (the memory bound) and keep the demo's offers, nonces or sessions refused (`503`) while it
 lasts. The app cannot tell such clients apart; the remedy is at the edge. In the Cloudflare
 dashboard of `awncorp.vn`: Security → WAF → Rate limiting rules, one rule per line, each

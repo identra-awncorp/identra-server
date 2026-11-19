@@ -142,8 +142,8 @@ even of the same account, does not see, poll, cancel or revoke it (it gets `404`
 
 | Method and path | Auth | Body | Success | Errors |
 |---|---|---|---|---|
-| `POST /v1/demo/school/login` | none, rate limited | `{ username, password }` | `201 { token, expiresAt, serverTime, role: "student" \| "registrar", profile }` | `400 VALIDATION_FAILED`, `401 INVALID_CREDENTIALS`, `429 RATE_LIMITED`, `503 UNAVAILABLE` (also when the server is hashing too many passwords at once; retry after `Retry-After`) |
-| `POST /v1/demo/school/offers` | student | none | `201 { offerId, offerUri, txCode, expiresAt, serverTime }` | `403 FORBIDDEN` (registrar), `429 RATE_LIMITED` (this client already holds 5 live offers, or created 30 in the last 30 minutes), `503 UNAVAILABLE` (all clients together hold the cap); both with `Retry-After` |
+| `POST /v1/demo/school/login` | none, rate limited | `{ username, password }` | `201 { token, expiresAt, serverTime, role: "student" \| "registrar", profile }` | `400 VALIDATION_FAILED`, `401 INVALID_CREDENTIALS`, `429 RATE_LIMITED` (also the registrar account after 10 wrong passwords in 15 minutes, section 8), `503 UNAVAILABLE` (also when the server is hashing too many passwords at once; retry after `Retry-After`) |
+| `POST /v1/demo/school/offers` | student | none | `201 { offerId, offerUri, txCode, expiresAt, serverTime }` | `403 FORBIDDEN` (registrar), `429 RATE_LIMITED` (this client already holds 5 live offers, or created 100 in the last 30 minutes; an IPv6 /48: 4 times that), `503 UNAVAILABLE` (all clients together hold the cap); both with `Retry-After` |
 | `GET /v1/demo/school/offers/:offerId` | student, the session that created it | none | `200 { status: "pending" \| "issued" \| "expired", serverTime }` | `404 NOT_FOUND` (unknown, older than 30 minutes, or another session's) |
 | `DELETE /v1/demo/school/offers/:offerId` | student, the session that created it | none | `200 { offerId, status: "expired" \| "issued", serverTime }`: a pending offer is cancelled (its code stops working, its place is freed); an issued one stays issued; repeating it is harmless | `404 NOT_FOUND` as above |
 | `GET /v1/demo/school/credentials?limit&cursor` | student or registrar | none | `200 { items: [{ id, studentCode, studentName, issuedAt, status, canRevoke }], nextCursor }`, newest first, `limit` 1–100 (default 50), `nextCursor` `null` on the last page | `400 VALIDATION_FAILED` (limit, cursor) |
@@ -178,7 +178,7 @@ token is `401 SESSION_EXPIRED`. Writes are rate limited per client (section 8).
 
 Seeded sample accounts (fictional people): students `sv001`, `sv002`, `sv003`, whose password
 is public (shown on the portal's sign-in page, `Identra@2026` on the demo deployment), and the
-registrar `phongdaotao`, whose password is private (set by the operator, never published; the
+registrar `phongdaotao`, whose password is private (at least 20 characters, set by the operator, never published; the
 public student password does not open it). `profile` of a student:
 `{ hoTen, ngaySinh, maSinhVien, nganh, hangTotNghiep, namTotNghiep, soHieuBang }`
 (the university's own record, the source of the diploma's claims); of the
@@ -191,7 +191,7 @@ a client cannot ask for arbitrary claims.
 
 | Method and path | Auth | Purpose |
 |---|---|---|
-| `POST /v1/verification/sessions` `{ verifier, scenario }` | none, rate limited (section 8) | `201 { id, qr, expiresAt, serverTime }`, `Cache-Control: no-store` (the `id` reads the result); `400 VALIDATION_FAILED` for a malformed body, `404 NOT_FOUND` for an unknown verifier or scenario (neither uses any capacity); `429 RATE_LIMITED` with `Retry-After` while this client holds 10 open sessions; `503 UNAVAILABLE` with `Retry-After` while the verifier is not in a valid trust list or all clients together hold the cap |
+| `POST /v1/verification/sessions` `{ verifier, scenario }` | none, rate limited (section 8) | `201 { id, qr, expiresAt, serverTime }`, `Cache-Control: no-store` (the `id` reads the result); `400 VALIDATION_FAILED` for a malformed body, `404 NOT_FOUND` for an unknown verifier or scenario (neither uses any capacity); `429 RATE_LIMITED` with `Retry-After` while this client holds 10 open sessions or created 100 in the last 30 minutes (an IPv6 /48: 4 times that; a session's place is freed once it is final); `503 UNAVAILABLE` with `Retry-After` while the verifier is not in a valid trust list or all clients together hold the cap |
 | `GET /v1/verification/sessions/:id` | knowledge of `id` | Session state and result |
 | `GET /oid4vp/request/:requestId` | none | `200 application/oauth-authz-req+jwt` (signed Request Object with `x5c`) |
 | `POST /oid4vp/response/:requestId` | none | `direct_post.jwt` body `response=<JWE>` → `200 {}` |
@@ -281,44 +281,72 @@ IPv6 /64 counts as one client (GraphQL's cost limiter too). Login 10/min, sessio
 bounded by the 5 attempts per offer, section 4), other writes 60/min, reads 300/min (polling a
 session once per second and an offer every two seconds stays well inside). The public signed
 resources of section 3 and the product events allow 1200/min: verifiers behind one address
-fetch them, and they are cacheable. Exceeding → `429 RATE_LIMITED` (`temporarily_unavailable`
-on protocol routes) with `Retry-After`, and the fixed message `Too many requests; try again
-later.` GraphQL over its cost budget answers HTTP `429` too (`extensions.code: RATE_LIMITED`,
-`Retry-After`). The portal hashes at most two passwords at once; a sign-in beyond that is `503
-UNAVAILABLE` with `Retry-After: 1` (the per-client login limit applies before any hashing).
+fetch them, and they are cacheable. An IPv6 **/48** (65,536 /64s, free from tunnel brokers) also
+has a budget of **4 clients** on every route: login 40/min, session creation 120/min, token
+480/min, other writes (offers, nonces, portal writes, wallet responses) 240/min, reads 1200/min,
+public resources 4800/min; IPv4 has no second level. Exceeding → `429 RATE_LIMITED`
+(`temporarily_unavailable` on protocol routes) with `Retry-After`, and the fixed message `Too many
+requests; try again later.` GraphQL over its cost budget answers HTTP `429` too
+(`extensions.code: RATE_LIMITED`, `Retry-After`). The portal hashes at most two passwords at once;
+a sign-in beyond that is `503 UNAVAILABLE` with `Retry-After: 1` (the per-client login limits
+apply before any hashing). The registrar account (its name is public) also counts its wrong
+passwords: after 10 within 15 minutes, from any address, its sign-in answers `429 RATE_LIMITED`
+with `Retry-After` until those 15 minutes end, even with the right password. Anyone can thus
+delay the registrar's sign-in (never anything else); the student accounts are never counted, so
+nobody can lock them.
 
 Anonymous protocol state lives in Redis (128 MB, `noeviction`: when full, writes fail). Its
 cost is bounded by a **global cap** per kind (the memory bound, whatever the number of
 addresses), and inside it each client holds at most a fixed **share**, enforced in the same
 atomic reservation, so one client (or ten) cannot use up what the others need. A client of the
-shares is an IPv4 address or an IPv6 **/56** (256 /64s are one customer at most ISPs). A request
-is checked completely (body, verifier, scenario, session) before it reserves anything; a
-refused one stores nothing.
+shares is an IPv4 address or an IPv6 **/56** (256 /64s are one customer at most ISPs); an IPv6
+client is counted twice, in its /56 share and in its **/48's share, 4 × the /56 share**, so the
+256 /56s of one /48 hold 4 shares, not 256. A request is checked completely (body, verifier,
+scenario, session) before it reserves anything; a refused one stores nothing.
 
-| State | Global cap (env, default) | Per client | A place is freed | Redis bytes each | Worst case |
-|---|---|---|---|---|---|
-| Verification session, first 5 minutes (signed request object, session key, record) | `VERIFICATION_MAX_LIVE_SESSIONS`, 2000 | 10 | after 5 minutes, answered or not (the place is also the creation budget) | ≈ 7.4 KB (measured) | 2000 × 7.4 KB ≈ 15 MB |
-| Session after 5 minutes (record, retrieved marker, result) until 30 minutes | creations in 30 minutes ≤ 6 × 2000 = 12 000 | | | ≈ 0.3–1.2 KB (measured) | 12 000 × 1.2 KB ≈ 14 MB |
-| `c_nonce` (5 minutes) | `ISSUANCE_MAX_LIVE_NONCES`, 2000 | 20 | when a proof uses it, or after 5 minutes | ≈ 0.45 KB (measured) | ≈ 0.9 MB |
-| Offer, first 10 minutes (offer, code) | `ISSUANCE_MAX_LIVE_OFFERS` per issuer, 500 | 5 | when redeemed (token endpoint), cancelled (`DELETE`, five wrong PINs, restart) or after 10 minutes | ≈ 1.4 KB (measured) | ≈ 0.7 MB |
-| Offer status and portal records until 30 minutes | 10 × `ISSUANCE_MAX_LIVE_OFFERS` = 5000 created in 30 minutes | 30 | after 30 minutes | ≈ 0.6 KB (status 0.4 + portal owner record 0.18, measured) | ≈ 3 MB |
-| Bookkeeping of the caps (sorted sets, owner hash) | one entry per place above, 9500 | | with its place | ≈ 0.4 KB (measured, every client distinct) | ≈ 3.8 MB |
+| State | Global cap (env, default) | Per IPv4 / IPv6 /56 | Per IPv6 /48 | A place is freed | Redis bytes each | Worst case |
+|---|---|---|---|---|---|---|
+| Verification session, until final or 5 minutes (signed request object, session key, record) | `VERIFICATION_MAX_LIVE_SESSIONS`, 2000 | 10 | 40 | when a wallet's response makes it final (verified, failed, or 10 refused responses: the result is stored and the request object deleted), or after 5 minutes | ≈ 7.4 KB (measured) | 2000 × 7.4 KB ≈ 15 MB |
+| Verification session created in the last 30 minutes (record, retrieved marker, result) | 6 × `VERIFICATION_MAX_LIVE_SESSIONS` = 12 000 | 100 | 400 | after 30 minutes (never earlier: freeing live places early cannot buy more) | ≈ 0.3–1.2 KB (measured) | 12 000 × 1.2 KB ≈ 14 MB |
+| `c_nonce` (5 minutes) | `ISSUANCE_MAX_LIVE_NONCES`, 2000 | 20 | 80 | when a proof uses it, or after 5 minutes | ≈ 0.45 KB (measured) | ≈ 0.9 MB |
+| Offer, first 10 minutes (offer, code) | `ISSUANCE_MAX_LIVE_OFFERS` per issuer, 500 | 5 | 20 | when redeemed (token endpoint), cancelled (`DELETE`, five wrong PINs, restart) or after 10 minutes | ≈ 1.4 KB (measured) | ≈ 0.7 MB |
+| Offer created in the last 30 minutes (status and portal records) | 20 × `ISSUANCE_MAX_LIVE_OFFERS` = 10 000 | 100 | 400 | after 30 minutes (its status stays readable that long, also once redeemed or cancelled) | ≈ 0.6 KB (status 0.4 + portal owner record 0.18, measured) | ≈ 6 MB |
+| Bookkeeping of the caps (sorted sets, owner hash; a session's place id) | one entry per place above, 26 500 | | | with its place | ≈ 0.38 KB per place for IPv4, 0.70 KB for IPv6 (both measured, every client distinct, each IPv6 client its own /48); 0.14 KB per open session | ≤ 26 500 × 0.70 KB + 0.3 MB ≈ 19 MB |
+| Portal session (30 minutes; only successful sign-ins) | none: bounded by the sign-in rate, at most two password hashes at once on the api's 0.75 CPU (≈ 30 ms each, measured) ≈ 25 sign-ins/s, so ≤ 45 000 in 30 minutes | (login limits above) | | after 30 minutes | ≈ 0.24 KB (measured) | ≈ 11 MB |
 
-About 38 MB, under a third of `maxmemory`. The global per-minute budget of session creation
-(`VERIFICATION_SESSIONS_PER_MINUTE`) is gone: it counted refused requests too, so 300 malformed
-POSTs from ten addresses blocked every visitor for a minute; the live cap now bounds creations
-by itself (a place is held 5 minutes, so at most 2000 per 5 minutes, 12 000 per 30). Beyond a
-share the route answers `429` (`RATE_LIMITED` under `/v1`, `temporarily_unavailable` on the
-nonce endpoint), beyond a global cap `503` (`UNAVAILABLE` / `temporarily_unavailable`), both
-with `Retry-After` (the seconds until the oldest entry of that share or cap ends); sign-in,
-issuance and everything else keep their share of Redis. `/v1/health` reports `redis: degraded`
-above 80 % of `maxmemory` or when a write is refused (checked every 10 s).
+About 67 MB, about half of `maxmemory` and below the 80 % health threshold. Portal sessions are
+not capped on purpose: their memory is already bounded by the CPU spent on hashing, and a cap
+would let a few hundred addresses (the student password is public) refuse every sign-in for 30
+minutes. The global per-minute budget of session creation (`VERIFICATION_SESSIONS_PER_MINUTE`)
+is gone: it counted refused requests too, so 300 malformed POSTs from ten addresses blocked every
+visitor for a minute; the two session caps bound creations by themselves (at most 12 000 per 30
+minutes). Beyond a share (of the /56 or of the /48) the route answers `429` (`RATE_LIMITED` under
+`/v1`, `temporarily_unavailable` on the nonce endpoint), beyond a global cap `503` (`UNAVAILABLE`
+/ `temporarily_unavailable`), both with `Retry-After` (the seconds until the oldest entry of that
+share or cap ends; for the 30-minute kinds up to 30 minutes); sign-in, issuance and everything
+else keep their share of Redis. `/v1/health` reports `redis: degraded` above 80 % of `maxmemory`
+or when a write is refused (checked every 10 s).
 
-What remains: an attacker with many addresses can still fill a global cap (about 100 addresses
-for nonces or live offers, 167 for the 30-minute offer records, 200 for sessions) and keep that
-kind refused for everyone while the flood lasts (no data is lost, nothing else is affected).
-The server cannot tell such clients from real ones; the remedy is a rate limit at the edge
-(deploy/README.md, "Edge rate limits": Cloudflare rules for `POST /issuers/*/nonce`,
-`POST /v1/verification/sessions`, `POST /v1/demo/school/login` and
-`POST /v1/demo/school/offers`). Visitors behind one NAT address (a venue's Wi-Fi) share one
-client's shares: 5 live offers, 10 open sessions.
+What remains: an attacker with many addresses can still fill a global cap and keep that kind
+refused for everyone while the flood lasts (no data is lost, nothing else is affected). With the
+shares above it takes, per kind: live verification sessions 200 IPv4 addresses or 50 IPv6 /48s;
+sessions of 30 minutes 120 IPv4 addresses or 30 /48s; nonces 100 addresses or 25 /48s; live
+offers 100 addresses or 25 /48s (each also needs a portal sign-in); offers of 30 minutes 100
+addresses or 25 /48s (or any mix: a /48 counts as four addresses). A tunnel broker hands out
+several /48s per free account, so 25 /48s are within one person's reach. The server cannot tell
+such clients from real ones; the remedy is a rate limit at the edge (deploy/README.md, "Edge
+rate limits": Cloudflare rules for `POST /issuers/*/nonce`, `POST /v1/verification/sessions`,
+`POST /v1/demo/school/login` and `POST /v1/demo/school/offers`).
+
+Visitors behind one NAT address (a class on the school's Wi-Fi) share one client's limits and
+shares. For a class of 40 on one IPv4 address: signing in is paced at 10 per minute (the 11th in
+a minute waits for `Retry-After`, at most a minute; two hashed at the same instant, a third
+retries after a second), so the whole class is in after about 4 minutes; at most **5 diploma
+codes wait to be collected at once** for the whole class (the 6th student gets `429` until a
+code is redeemed or cancelled; `Retry-After` names the oldest code's 10 minutes, but a place
+comes back as soon as a wallet redeems a code, so retrying earlier often works), and 100 codes
+in 30 minutes (two or three per student); at most 10 verification sessions open at once, each
+freed as soon as its presentation is answered, and 100 sessions in 30 minutes. A class that
+does everything in the same minute will see these `429`s; one that works through the steps
+over a lesson will not. The same class on IPv6 gets the /56 shares above (and, behind one /48,
+at most four times them).

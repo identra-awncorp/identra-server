@@ -4,11 +4,12 @@ import { Body, Controller, Get, HttpCode, Inject, Logger, Param, Post, Req, Res,
 import { ConfigService } from '@nestjs/config';
 import { ApiTags } from '@nestjs/swagger';
 import { IsString, Matches } from 'class-validator';
-import { SESSION_SECONDS } from '@identra/sdk-server';
+import { SESSION_KEEP_SECONDS, SESSION_SECONDS } from '@identra/sdk-server';
 import type { Clock } from '@identra/sdk-core';
 
 import { apiError, oauthError, ProtocolErrorFilter, unavailable, V1ErrorFilter } from '../common/http-errors';
 import { clientOf, createLiveCaps, LiveCaps } from '../common/live-cap';
+import { createRedisStateStore, StateStore } from '../common/state-store';
 import { RateLimit, RateLimitFailClosed } from '../common/rate-limit';
 import { RedisService } from '../infrastructure/redis/redis.service';
 import { RawRequest, RawResponse, sdkRequest, send } from './issuer.controllers';
@@ -18,8 +19,16 @@ import { HostedVerifiers, VERIFIER_CLOCK, VERIFIERS } from './verifiers';
 const NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const logger = new Logger('Verification');
 const KIND = 'vp-sessions';
-/** Live sessions of one client (an IPv4 address or IPv6 /56) inside the global cap (docs/vc-api.md §8). */
+/** Sessions created in the last 30 minutes (their record and result stay readable that long). */
+const RECORDS_KIND = 'vp-session-records';
+/** Live sessions of one client (an IPv4 address or IPv6 /56; its /48: NETWORK_SHARES ×) inside the global cap (docs/vc-api.md §8). */
 export const SESSIONS_PER_CLIENT = 10;
+/** Sessions created in 30 minutes: per client, and globally per live session (the bound before places were freed early). */
+export const SESSION_RECORDS_PER_CLIENT = 100;
+export const SESSION_RECORDS_PER_LIVE_SESSION = SESSION_KEEP_SECONDS / SESSION_SECONDS;
+
+/** Session id → the id of its live place (5 minutes), so that a final response frees the place. */
+const placesOf = (redis: RedisService) => createRedisStateStore(redis.getClient(), 'vp-place');
 
 const known = (verifier: string, scenario: string) =>
   HOSTED_VERIFIERS.some((v) => v.name === verifier && Object.hasOwn(v.scenarios, scenario));
@@ -37,10 +46,12 @@ class CreateSessionDto {
 /**
  * Verification sessions for the website (docs/vc-api.md §6). Anonymous, so their Redis cost is
  * bounded (§8) by a global cap on live sessions (VERIFICATION_MAX_LIVE_SESSIONS, each holding its
- * ~7 KB request object for 5 minutes) with a share per client inside it, reserved only for a
- * valid request (body, verifier and scenario checked first). A place is held for the full 5
- * minutes, so the cap also bounds creations: at most cap × 6 sessions in their 30 minutes.
- * Responses are `Cache-Control: no-store` (configureApp): the id reads the result.
+ * ~7 KB request object until it is final or 5 minutes pass) and one on sessions created in 30
+ * minutes (their records: 6 × the live cap), each with a share per client inside it, reserved
+ * only for a valid request (body, verifier and scenario checked first). A live place is freed by
+ * the response that makes the session final (the SDK has then stored the result and deleted the
+ * request object); the 30-minute place is never freed early, so freeing live places cannot buy
+ * more records. Responses are `Cache-Control: no-store` (configureApp): the id reads the result.
  */
 @ApiTags('verification')
 @Controller('verification/sessions')
@@ -49,6 +60,7 @@ class CreateSessionDto {
 @RateLimitFailClosed()
 export class VerificationSessionsController {
   private readonly caps: LiveCaps;
+  private readonly places: StateStore;
   private readonly cap: number;
 
   constructor(
@@ -58,6 +70,7 @@ export class VerificationSessionsController {
     redis: RedisService
   ) {
     this.caps = createLiveCaps(redis.getClient(), clock);
+    this.places = placesOf(redis);
     this.cap = config.getOrThrow<number>('VERIFICATION_MAX_LIVE_SESSIONS');
   }
 
@@ -72,21 +85,29 @@ export class VerificationSessionsController {
     if (!verifier) throw unavailable('This verifier cannot create sessions at the moment.');
 
     const id = randomBytes(16).toString('base64url');
-    const slot = await this.caps.reserve(KIND, id, SESSION_SECONDS, { cap: this.cap, perClient: { key: clientOf(req.ip), cap: SESSIONS_PER_CLIENT } });
+    const client = clientOf(req.ip);
+    const records = await this.caps.reserve(RECORDS_KIND, id, SESSION_KEEP_SECONDS, {
+      cap: this.cap * SESSION_RECORDS_PER_LIVE_SESSION,
+      perClient: { ...client, cap: SESSION_RECORDS_PER_CLIENT }
+    });
+    const slot = records.ok ? await this.caps.reserve(KIND, id, SESSION_SECONDS, { cap: this.cap, perClient: { ...client, cap: SESSIONS_PER_CLIENT } }) : records;
+    const giveBack = () => Promise.all([this.caps.release(KIND, id), this.caps.release(RECORDS_KIND, id)]);
 
     if (!slot.ok) {
+      if (records.ok) await this.caps.release(RECORDS_KIND, id);
+
       throw slot.scope === 'client'
         ? apiError(429, 'RATE_LIMITED', 'This client has too many verification sessions open; wait for one to end.', { retryAfter: slot.retryAfterSeconds })
         : apiError(503, 'UNAVAILABLE', 'Too many verification sessions are open; try again shortly.', { retryAfter: slot.retryAfterSeconds });
     }
 
     const created = await verifier.createSession({ scenario: body.scenario }).catch(async (error: unknown) => {
-      await this.caps.release(KIND, id).catch(() => undefined);
+      await giveBack().catch(() => undefined);
       throw error;
     });
 
     if (!created.ok) {
-      await this.caps.release(KIND, id);
+      await giveBack();
 
       if (created.reason === 'unknown_scenario') throw apiError(404, 'NOT_FOUND', 'No such verifier or scenario.');
 
@@ -95,6 +116,9 @@ export class VerificationSessionsController {
     }
 
     const { session } = created;
+
+    // Best effort: without it the place is freed after its 5 minutes.
+    await this.places.put(session.id, id, SESSION_SECONDS).catch(() => undefined);
 
     // requestId is never handed out on its own: it is inside the QR, which only a wallet reads.
     return { id: session.id, qr: session.qr, expiresAt: session.expiresAt, serverTime: session.serverTime };
@@ -121,7 +145,17 @@ export class VerificationSessionsController {
 @Controller('oid4vp')
 @UseFilters(ProtocolErrorFilter)
 export class Oid4vpController {
-  constructor(@Inject(VERIFIERS) private readonly verifiers: HostedVerifiers) {}
+  private readonly caps: LiveCaps;
+  private readonly places: StateStore;
+
+  constructor(
+    @Inject(VERIFIERS) private readonly verifiers: HostedVerifiers,
+    @Inject(VERIFIER_CLOCK) clock: Clock,
+    redis: RedisService
+  ) {
+    this.caps = createLiveCaps(redis.getClient(), clock);
+    this.places = placesOf(redis);
+  }
 
   @Get('request/:requestId')
   async request(@Param('requestId') requestId: string, @Res() res: RawResponse) {
@@ -150,6 +184,14 @@ export class Oid4vpController {
       const what = outcome.final ? (outcome.ok ? 'verified' : 'failed') : 'refused';
 
       logger.log(`Presentation ${outcome.sessionId.slice(0, 8)}: ${what}${outcome.code ? ` (${outcome.code})` : ''}`);
+
+      // Final: the result is stored and the request object deleted, so its live place is free
+      // (taken once: of concurrent responses only one is final). Best effort, as above.
+      if (outcome.final) {
+        const place = await this.places.take(outcome.sessionId).catch(() => null);
+
+        if (place) await this.caps.release(KIND, place).catch(() => undefined);
+      }
 
       return send(res, handled.response);
     }

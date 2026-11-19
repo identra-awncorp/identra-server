@@ -9,7 +9,7 @@ import request from 'supertest';
 
 import { PrismaService } from '../src/infrastructure/prisma/prisma.service';
 import { RedisService } from '../src/infrastructure/redis/redis.service';
-import { MAX_CONCURRENT_HASHES, sessionHashOf } from '../src/demo-portal/portal-sessions';
+import { MAX_CONCURRENT_HASHES, REGISTRAR_FAILURES, sessionHashOf } from '../src/demo-portal/portal-sessions';
 import { createTestApp, portalLogin, randomIp, seedPortalAccounts, TEST_PORTAL_PASSWORD, TEST_REGISTRAR_PASSWORD } from './helpers';
 
 // Runs without keys: the portal itself needs none. Credential rows are inserted directly.
@@ -39,8 +39,10 @@ describe('npm run demo:provision', () => {
       [{}, /DEMO_PORTAL_PASSWORD/],
       [{ DEMO_PORTAL_PASSWORD: TEST_PORTAL_PASSWORD }, /DEMO_PORTAL_REGISTRAR_PASSWORD/],
       [{ DEMO_PORTAL_REGISTRAR_PASSWORD: TEST_REGISTRAR_PASSWORD }, /DEMO_PORTAL_PASSWORD/],
-      [{ DEMO_PORTAL_PASSWORD: 'Same-Pass-20261', DEMO_PORTAL_REGISTRAR_PASSWORD: 'Same-Pass-20261' }, /must differ/],
-      [{ DEMO_PORTAL_PASSWORD: TEST_PORTAL_PASSWORD, DEMO_PORTAL_REGISTRAR_PASSWORD: 'short' }, /at least 12/]
+      [{ DEMO_PORTAL_PASSWORD: 'Same-Pass-2026-Same-1', DEMO_PORTAL_REGISTRAR_PASSWORD: 'Same-Pass-2026-Same-1' }, /must differ/],
+      [{ DEMO_PORTAL_PASSWORD: TEST_PORTAL_PASSWORD, DEMO_PORTAL_REGISTRAR_PASSWORD: 'short' }, /at least 20/],
+      // 19 characters: the registrar's name is public, so its password must resist guessing on its own.
+      [{ DEMO_PORTAL_PASSWORD: TEST_PORTAL_PASSWORD, DEMO_PORTAL_REGISTRAR_PASSWORD: 'Registrar-Pass-2026' }, /at least 20/]
     ];
 
     for (const [extra, message] of refused) {
@@ -54,13 +56,13 @@ describe('npm run demo:provision', () => {
   it('upserts the four sample accounts, idempotently, and nothing else; the registrar has its own password', async (t) => {
     t.after(() => seedPortalAccounts(prisma)); // back to the test passwords, even on failure
     const usersBefore = await prisma.user.count();
-    const env = { ...process.env, DEMO_PORTAL_PASSWORD: 'Another-Pass-2026', DEMO_PORTAL_REGISTRAR_PASSWORD: 'Registrar-Pass-2026' };
+    const env = { ...process.env, DEMO_PORTAL_PASSWORD: 'Another-Pass-2026', DEMO_PORTAL_REGISTRAR_PASSWORD: 'Registrar-Pass-2026-Other' };
 
     execFileSync(process.execPath, [script], { env, stdio: 'pipe' });
     const output = execFileSync(process.execPath, [script], { env, stdio: 'pipe' }).toString();
 
     assert.match(output, /sv001 \(student\)[\s\S]*phongdaotao \(registrar\)/);
-    assert.ok(!output.includes('Another-Pass-2026') && !output.includes('Registrar-Pass-2026'));
+    assert.ok(!output.includes('Another-Pass-2026') && !output.includes('Registrar-Pass-2026-Other'));
     assert.equal(await prisma.demoPortalAccount.count({ where: { username: { in: ['sv001', 'sv002', 'sv003', 'phongdaotao'] } } }), 4);
     assert.equal(await prisma.user.count(), usersBefore);
 
@@ -77,7 +79,7 @@ describe('npm run demo:provision', () => {
     // The public student password does not open the registrar account; its own does.
     const refused = await login('phongdaotao', 'Another-Pass-2026').expect(401);
     assert.equal(refused.body.code, 'INVALID_CREDENTIALS');
-    assert.equal((await login('phongdaotao', 'Registrar-Pass-2026').expect(201)).body.role, 'registrar');
+    assert.equal((await login('phongdaotao', 'Registrar-Pass-2026-Other').expect(201)).body.role, 'registrar');
   });
 });
 
@@ -140,6 +142,33 @@ describe('POST /v1/demo/school/login', () => {
 
     // Afterwards nothing is held: a sign-in works.
     await login('sv001', TEST_PORTAL_PASSWORD).expect(201);
+  });
+
+  it(`locks the registrar account after ${REGISTRAR_FAILURES} wrong passwords from anywhere (429, also for the right one); a student account is never locked`, async (t) => {
+    const key = 'state:portal-registrar-failures:phongdaotao';
+    const redis = app.get(RedisService).getClient();
+
+    await redis.del(key); // the wrong passwords of the tests above
+    t.after(() => redis.del(key)); // the other tests sign in as the registrar
+    // Rotating addresses: the per-client limit never applies.
+    for (let i = 0; i < REGISTRAR_FAILURES; i += 1) await login('phongdaotao', `guess-${i}`, `192.0.2.${10 + i}`).expect(401);
+
+    for (const password of ['guess-x', TEST_REGISTRAR_PASSWORD]) {
+      const locked = await login('phongdaotao', password, '192.0.2.99').expect(429);
+
+      assert.equal(locked.body.code, 'RATE_LIMITED');
+      // Until the window that began with the first wrong password ends.
+      assert.ok(Number(locked.headers['retry-after']) > 14 * 60 && Number(locked.headers['retry-after']) <= 15 * 60, locked.headers['retry-after']);
+    }
+
+    // The public student accounts: three times as many wrong passwords, then the right one works.
+    for (let i = 0; i < 3 * REGISTRAR_FAILURES; i += 1) await login('sv002', `guess-${i}`, `192.0.2.${100 + i}`).expect(401);
+    await login('sv002', TEST_PORTAL_PASSWORD, '192.0.2.200').expect(201);
+    assert.deepEqual(await redis.keys('state:portal-registrar-failures:sv*'), []);
+
+    // Once the window ends the registrar signs in again.
+    await redis.del(key);
+    await login('phongdaotao', TEST_REGISTRAR_PASSWORD, '192.0.2.99').expect(201);
   });
 });
 

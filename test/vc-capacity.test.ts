@@ -7,13 +7,14 @@ import { after, before, describe, it } from 'node:test';
 
 import { NestExpressApplication } from '@nestjs/platform-express';
 import request from 'supertest';
+import { MAX_RESPONSE_ATTEMPTS } from '@identra/sdk-server';
 
 import { PrismaService } from '../src/infrastructure/prisma/prisma.service';
 import { RedisService } from '../src/infrastructure/redis/redis.service';
 import { HealthService } from '../src/modules/health/health.service';
 import { NONCES_PER_CLIENT, OFFERS_PER_CLIENT } from '../src/vc/issuers';
 import { ISSUER_CLOCK } from '../src/vc/vc.providers';
-import { SESSIONS_PER_CLIENT } from '../src/vc/verification.controllers';
+import { SESSION_RECORDS_PER_CLIENT, SESSIONS_PER_CLIENT } from '../src/vc/verification.controllers';
 import { HostedVerifiers, VERIFIER_CLOCK, VERIFIERS } from '../src/vc/verifiers';
 import { adjustableClock } from './e2e-world';
 import { createTestApp, portalLogin, seedPortalAccounts, testKeysDir } from './helpers';
@@ -166,6 +167,52 @@ describe('per-client share of live verification sessions', () => {
     assert.equal(limited.body.message, 'Too many requests; try again later.');
     // Another /64 is another client of the rate limit.
     await createSessionFrom('2001:db8:1:3::1').expect(201);
+  });
+});
+
+describe('a final verification session gives its live place back (classroom NAT)', () => {
+  const requestIdOf = (qr: string) => new URL(new URL(qr).searchParams.get('request_uri')!).pathname.split('/').pop()!;
+  // MAX_RESPONSE_ATTEMPTS refused responses (from wallets' own addresses) make a session final: failed.
+  const finish = async (qr: string) => {
+    for (let i = 0; i < MAX_RESPONSE_ATTEMPTS; i += 1) {
+      await http().post(`/oid4vp/response/${requestIdOf(qr)}`).set('X-Forwarded-For', nextIp()).set('Content-Type', 'text/plain').send('x').expect(400);
+    }
+  };
+
+  it(`at once, not after 5 minutes; the ${SESSION_RECORDS_PER_CLIENT} sessions of 30 minutes still bound what one client creates`, async () => {
+    // The 30-minute records of the earlier tests end; only this client's count from here.
+    verifierClock.advance(1801);
+    await clearRateLimits();
+
+    const ip = '203.0.113.70';
+    const open: Array<{ id: string; qr: string }> = [];
+
+    for (let i = 0; i < SESSIONS_PER_CLIENT; i += 1) open.push((await createSessionFrom(ip).expect(201)).body);
+    await createSessionFrom(ip).expect(429);
+
+    const done = open.shift()!;
+
+    await finish(done.qr);
+    assert.equal((await http().get(`/v1/verification/sessions/${done.id}`).expect(200)).body.status, 'failed');
+    assert.equal(await redis().exists(`state:vp-place:${done.id}`), 0, 'its place mapping is taken');
+    open.push((await createSessionFrom(ip).expect(201)).body);
+
+    // Freeing live places does not buy more: creations stop at the 30-minute share.
+    for (let created = SESSIONS_PER_CLIENT + 1; created < SESSION_RECORDS_PER_CLIENT; created += 1) {
+      if (created % 25 === 0) await clearRateLimits(); // the 30/min creation limit is not what is tested
+      await finish(open.shift()!.qr);
+      open.push((await createSessionFrom(ip).expect(201)).body);
+    }
+
+    await finish(open.shift()!.qr);
+    await clearRateLimits();
+    const refused = await createSessionFrom(ip).expect(429);
+
+    assert.equal(refused.body.code, 'RATE_LIMITED');
+    // Until the oldest of its 30-minute records ends, not a 5-minute live place.
+    assert.ok(Number(refused.headers['retry-after']) > 1500, refused.headers['retry-after']);
+    await createSessionFrom('203.0.113.71').expect(201);
+    verifierClock.advance(1801);
   });
 });
 

@@ -174,7 +174,7 @@ export async function registerUser(app: NestExpressApplication): Promise<Registe
 
 /** The public student password, and the registrar's own (private) one: demo:provision needs both. */
 export const TEST_PORTAL_PASSWORD = 'Identra@2026';
-export const TEST_REGISTRAR_PASSWORD = 'Registrar-Only-2026';
+export const TEST_REGISTRAR_PASSWORD = 'Registrar-Only-Pass-2026';
 export const PROVISION_ENV = { DEMO_PORTAL_PASSWORD: TEST_PORTAL_PASSWORD, DEMO_PORTAL_REGISTRAR_PASSWORD: TEST_REGISTRAR_PASSWORD };
 export const portalPasswordOf = (username: string) =>
   DEMO_ACCOUNTS.some((a) => a.username === username && a.role === 'student') ? TEST_PORTAL_PASSWORD : TEST_REGISTRAR_PASSWORD;

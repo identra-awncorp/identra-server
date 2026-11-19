@@ -57,8 +57,11 @@ const DEPENDENCY_RETRY_AFTER = 5;
 const PRISMA_UNREACHABLE = ['P1001', 'P1002', 'P1008', 'P1017', 'P2024', 'P2037'];
 // What the engine reports, as an unknown request error, when Postgres goes away mid-query: SQLSTATE
 // class 08 (connection exception), 57P01–57P03 (shut down, restarting), 53300 (too many
-// connections), or a closed connection. Any other unknown error (a failing trigger) stays a 500.
-const POSTGRES_GONE = /\b(08[0-9A-Z]{3}|57P0[1-3]|53300)\b|kind: Closed|terminating connection|server closed the connection/i;
+// connections), or a closed connection. A SQLSTATE counts only where the engine writes one
+// (`code: "57P01"` in its debug form, ``Code: `57P01` `` in its message), never a bare match:
+// "order 08abc" or the "-08T" of a date are not a lost connection. Any other unknown error (a
+// failing trigger) stays a 500.
+const POSTGRES_GONE = /\bcode: ?(["`])(08[0-9A-Z]{3}|57P0[1-3]|53300)\1|kind: Closed|terminating connection|server closed the connection/i;
 // ioredis messages, and the replies of a Redis that cannot write (disk: MISCONF), is still loading
 // its data after a restart (LOADING) or is a replica (READONLY).
 const REDIS_UNREACHABLE = /^(Command timed out|Connection is closed\.|Stream isn't writeable|OOM command not allowed|MISCONF |LOADING |READONLY )/;

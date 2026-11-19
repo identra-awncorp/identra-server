@@ -8,12 +8,14 @@ import { after, before, describe, it } from 'node:test';
 
 import { NestExpressApplication } from '@nestjs/platform-express';
 
+import { NETWORK_SHARES } from '../src/common/live-cap';
+import { RATE_LIMITS } from '../src/common/rate-limit';
 import { PrismaService } from '../src/infrastructure/prisma/prisma.service';
 import { RedisService } from '../src/infrastructure/redis/redis.service';
 import { NONCES_PER_CLIENT, OFFERS_PER_CLIENT } from '../src/vc/issuers';
 import { SESSIONS_PER_CLIENT } from '../src/vc/verification.controllers';
 import { call, keysDir, LOCAL, login, newOffer, newWallet, offerState, PORT } from './e2e-world';
-import { createTestApp, seedPortalAccounts } from './helpers';
+import { createTestApp, seedPortalAccounts, TEST_PORTAL_PASSWORD } from './helpers';
 
 let app: NestExpressApplication;
 
@@ -191,5 +193,57 @@ describe('B-4: two visitors on the same public student account', () => {
     assert.deepEqual([suspended.status, suspended.body.status], [200, 'suspended']);
     // A student token is not a registrar on the status route.
     assert.equal((await call('POST', `/v1/issuers/truong-mau/credentials/${bobItems[0]!.id}/status`, { token: bob, body: { status: 'valid' } })).status, 403);
+  });
+});
+
+// The second review's IPv6 finding: a free routed /48 (a tunnel broker) holds 256 /56s and 65,536
+// /64s. Before the /48 tier, 256 /56s × 5 offers filled the 500 offers and the next student, on
+// IPv4, got 503; logins from many /64s each had their own 10/min.
+const in48 = (net: number, i: number) => `2001:db8:${net.toString(16)}:${(i << 8).toString(16)}::1`;
+
+describe('B-5: one IPv6 /48, 256 /56s asking for offers', () => {
+  it('the /48 gets its share; an IPv4 student and an IPv6 student of another /48 still get offers', async () => {
+    const attacker = await login('sv001');
+    const live = () => redis().zcard('state:live:vci-offers:truong-mau');
+    const before = await live();
+    const tasks: Array<() => Promise<number>> = [];
+
+    for (let i = 0; i < 256; i += 1) {
+      for (let k = 0; k < OFFERS_PER_CLIENT; k += 1) tasks.push(() => call('POST', '/v1/demo/school/offers', { token: attacker, ip: in48(0xab, i) }).then((r) => r.status));
+    }
+
+    const statuses = tally(await pool(tasks));
+
+    console.log(`offers from 256 /56s of one /48: ${JSON.stringify(statuses)}`);
+    assert.deepEqual(statuses, { 201: NETWORK_SHARES * OFFERS_PER_CLIENT, 429: 256 * OFFERS_PER_CLIENT - NETWORK_SHARES * OFFERS_PER_CLIENT });
+    assert.equal((await live()) - before, NETWORK_SHARES * OFFERS_PER_CLIENT);
+
+    for (const ip of ['203.0.113.60', in48(0xcd, 1)]) {
+      const victim = await call('POST', '/v1/demo/school/offers', { token: await login('sv002'), ip });
+
+      assert.equal(victim.status, 201, `${ip}: ${JSON.stringify(victim.body)}`);
+    }
+  });
+});
+
+describe('B-6: sign-in from many /64s of one /48', () => {
+  it('is throttled at the /48 bucket; another client still signs in to the same (public) account', async () => {
+    const budget = RATE_LIMITS.login.limit * NETWORK_SHARES;
+    const attempt = (ip: string, password = 'wrong-password') =>
+      call('POST', '/v1/demo/school/login', { body: { username: 'sv003', password }, ip });
+    const statuses: number[] = [];
+
+    // One request per /64 (65,536 of them in a /48): the per-/64 limit never applies. One at a
+    // time, so the two-at-once hashing does not answer 503.
+    for (let i = 0; i <= budget; i += 1) statuses.push((await attempt(`2001:db8:77:${i.toString(16)}::1`)).status);
+
+    assert.deepEqual(tally(statuses), { 401: budget, 429: 1 });
+
+    const limited = await attempt('2001:db8:77:ffff::1', TEST_PORTAL_PASSWORD);
+
+    assert.deepEqual([limited.status, limited.body.code], [429, 'RATE_LIMITED']);
+    assert.ok(Number(limited.headers.get('retry-after')) > 0);
+    assert.equal((await attempt('203.0.113.61', TEST_PORTAL_PASSWORD)).status, 201);
+    assert.equal((await attempt('2001:db8:78::1', TEST_PORTAL_PASSWORD)).status, 201);
   });
 });

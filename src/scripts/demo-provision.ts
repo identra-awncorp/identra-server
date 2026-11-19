@@ -2,7 +2,8 @@
 // (docs/vc-api.md §5). Idempotent and safe on production: it only upserts the rows of
 // DemoPortalAccount listed in DEMO_ACCOUNTS and touches no other table. Two passwords:
 // DEMO_PORTAL_PASSWORD for the students (public: the portal's sign-in page prints it) and
-// DEMO_PORTAL_REGISTRAR_PASSWORD for the registrar (private: it can revoke every diploma).
+// DEMO_PORTAL_REGISTRAR_PASSWORD for the registrar (private: it can revoke every diploma; at least
+// 20 characters, its account name is public).
 import { PrismaClient } from '@prisma/client';
 import * as argon2 from 'argon2';
 
@@ -10,7 +11,9 @@ import { DEMO_ACCOUNTS, DEMO_ISSUER, PORTAL_PASSWORD_HASH } from '../demo-portal
 
 function refusal(student: string | undefined, registrar: string | undefined): string | null {
   if (!student || student.length < 8) return 'set DEMO_PORTAL_PASSWORD (the public student password, at least 8 characters)';
-  if (!registrar || registrar.length < 12) return 'set DEMO_PORTAL_REGISTRAR_PASSWORD (the private registrar password, at least 12 characters)';
+  if (!registrar || registrar.length < 20) {
+    return 'set DEMO_PORTAL_REGISTRAR_PASSWORD (the private registrar password, at least 20 characters, e.g. `openssl rand -base64 24`)';
+  }
   if (registrar === student) return 'DEMO_PORTAL_REGISTRAR_PASSWORD must differ from the public DEMO_PORTAL_PASSWORD';
 
   return null;
