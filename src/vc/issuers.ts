@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import { Logger, Provider } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { base64Decode, base64UrlEncode, VCT, type Clock, type DiplomaClaims, type TrustRegistry } from '@identra/sdk-core';
@@ -7,13 +9,14 @@ import {
   generateIssuerKeys,
   NONCE_SECONDS,
   OFFER_SECONDS,
+  OFFER_STATUS_SECONDS,
   type CredentialHandlers,
   type CredentialIssuer,
   type StatusListService
 } from '@identra/sdk-server';
 
-import { createLiveCap, LiveCap } from '../common/live-cap';
-import { createRedisStateStore } from '../common/state-store';
+import { createLiveCaps, LiveCaps, Reservation } from '../common/live-cap';
+import { createRedisStateStore, StateStore } from '../common/state-store';
 import { StudentProfile } from '../demo-portal/demo-accounts';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { RedisService } from '../infrastructure/redis/redis.service';
@@ -24,23 +27,79 @@ import { ISSUER_CLOCK, PKI, Pki, STATUS_LIST_SERVICE, TRUST_REGISTRY } from './v
 export const ISSUERS = Symbol('ISSUERS');
 /** The protocol state of every hosted issuer (the SDK prefixes its keys with the issuer URI). */
 export const ISSUER_STATE_NAMESPACE = 'vci';
+/** The school portal's own offer state: `owner:<offerId>` = the creating portal session's hash. */
+export const PORTAL_OFFER_NAMESPACE = 'portal-offer';
+export const offerOwnerKey = (offerId: string) => `owner:${offerId}`;
+
+/** Shares of one client (an IPv4 address or IPv6 /56) inside the global caps (docs/vc-api.md §8). */
+export const NONCES_PER_CLIENT = 20;
+export const OFFERS_PER_CLIENT = 5;
+/** Offers created in the last 30 minutes (their status stays readable that long): per client, and globally per live offer. */
+export const OFFER_RECORDS_PER_CLIENT = 30;
+export const OFFER_RECORDS_PER_LIVE_OFFER = 10;
+
+export const capKinds = (name: string) => ({
+  /** Live offers (10 minutes, until redeemed or cancelled), ISSUANCE_MAX_LIVE_OFFERS; ended at the next start. */
+  offers: `vci-offers:${name}`,
+  /** Offers whose status is still readable (30 minutes): bounds the records left by ended offers. */
+  offerRecords: `vci-offer-records:${name}`,
+  /** Live c_nonces (5 minutes, until used; anonymous), ISSUANCE_MAX_LIVE_NONCES. */
+  nonces: `vci-nonces:${name}`
+});
 
 export interface HostedIssuer {
   name: string;
   issuerUri: string;
   issuer: CredentialIssuer;
-  /** Live offers (10 minutes each), capped (ISSUANCE_MAX_LIVE_OFFERS); ended at the next start. */
-  offers: LiveCap;
-  /** Live c_nonces (5 minutes each; anonymous), capped (ISSUANCE_MAX_LIVE_NONCES). */
-  nonces: LiveCap;
+  caps: LiveCaps;
+  /**
+   * Counts the c_nonce the SDK has just stored against `client`'s share and the global cap; when
+   * refused, the nonce is removed again. Its place is freed when a proof uses it, or after 5 minutes.
+   */
+  reserveNonce(cNonce: string, client: string): Promise<Reservation>;
+  /** The same for a new offer (live and 30-minute caps); a refused offer leaves nothing in Redis. */
+  reserveOffer(offerId: string, client: string): Promise<Reservation>;
+}
+
+/**
+ * The SDK's key layout (sdk-server issuance/issuer.ts, `key()` and `hashedKey()`), known only here:
+ * secret values (a c_nonce) appear as base64url(SHA-256). The live-cap test fails when it changes.
+ */
+const sdkKey = (issuerUri: string, kind: 'nonce' | 'offer' | 'status', id: string) => `vci:${issuerUri}:${kind}:${id}`;
+const SDK_TAKEN = /^(nonce|offer):([A-Za-z0-9_-]+)$/;
+export const nonceId = (cNonce: string) => createHash('sha256').update(cNonce, 'utf8').digest('base64url');
+
+/**
+ * The SDK's store, plus: a nonce or offer record taken (atomically, so by exactly one caller) gives
+ * its place back. That covers a nonce used by a proof, an offer redeemed at the token endpoint, and
+ * an offer ended (cancelled, five wrong PINs, a restart). Expiry is handled by the caps' scores.
+ */
+function releasingOnTake(store: StateStore, issuerUri: string, release: (kind: 'nonce' | 'offer', id: string) => Promise<void>): StateStore {
+  const prefix = `vci:${issuerUri}:`;
+
+  return {
+    ...store,
+    async take(key) {
+      const value = await store.take(key);
+      const taken = value !== null && key.startsWith(prefix) ? SDK_TAKEN.exec(key.slice(prefix.length)) : null;
+
+      // Best effort: a place not given back ends with its lifetime.
+      if (taken) await release(taken[1] as 'nonce' | 'offer', taken[2]!).catch(() => undefined);
+
+      return value;
+    }
+  };
 }
 
 export type IssuerRegistry = ReadonlyMap<string, HostedIssuer>;
 
-type HandlerFactory = (issuerName: string, deps: { prisma: PrismaService; credentials: VcCredentialsService }) => CredentialHandlers;
+type HandlerFactory = (
+  issuerName: string,
+  deps: { prisma: PrismaService; credentials: VcCredentialsService; portalState: StateStore }
+) => CredentialHandlers;
 
 /** The diploma's seven claims come from the school portal's own record of the student. */
-const diplomaFromPortal: HandlerFactory = (issuerName, { prisma, credentials }) => ({
+const diplomaFromPortal: HandlerFactory = (issuerName, { prisma, credentials, portalState }) => ({
   async resolveClaims(subjectRef): Promise<DiplomaClaims | null> {
     const account = await prisma.demoPortalAccount.findUnique({ where: { username: subjectRef } });
 
@@ -59,7 +118,12 @@ const diplomaFromPortal: HandlerFactory = (issuerName, { prisma, credentials }) 
 
     return Object.values(claims).every((v) => typeof v === 'string' && v !== '') ? (claims as DiplomaClaims) : null;
   },
-  onIssued: (event) => credentials.recordIssued({ issuerName, vct: VCT.diploma, ...event })
+  // The portal session that created the offer (null if its record is gone): it lists and may revoke the credential.
+  onIssued: async (event) => {
+    const portalSessionHash = await portalState.get(offerOwnerKey(event.offerId)).catch(() => null);
+
+    return credentials.recordIssued({ issuerName, vct: VCT.diploma, ...event, portalSessionHash });
+  }
 });
 
 const HANDLERS: Record<string, HandlerFactory> = { 'bang-tot-nghiep-v1': diplomaFromPortal };
@@ -90,11 +154,12 @@ async function trustListRefusal(pki: Pki, trustRegistry: TrustRegistry, name: st
  */
 async function endPreviousOffers(hosted: HostedIssuer): Promise<void> {
   try {
-    const ids = await hosted.offers.live();
+    const kind = capKinds(hosted.name).offers;
+    const ids = await hosted.caps.live(kind);
 
     for (const id of ids) await hosted.issuer.cancelOffer(id);
 
-    await hosted.offers.clear();
+    await hosted.caps.clear(kind);
     if (ids.length > 0) logger.log(`Issuer ${hosted.name}: ended ${ids.length} offers of the previous process`);
   } catch {
     logger.warn(`Issuer ${hosted.name}: could not end the offers of the previous process (Redis)`);
@@ -120,6 +185,10 @@ export const issuerProviders: Provider[] = [
       config: ConfigService
     ): Promise<IssuerRegistry> => {
       const store = createRedisStateStore(redis.getClient(), ISSUER_STATE_NAMESPACE);
+      const portalState = createRedisStateStore(redis.getClient(), PORTAL_OFFER_NAMESPACE);
+      const caps = createLiveCaps(redis.getClient(), clock);
+      const maxOffers = config.getOrThrow<number>('ISSUANCE_MAX_LIVE_OFFERS');
+      const maxNonces = config.getOrThrow<number>('ISSUANCE_MAX_LIVE_NONCES');
       const registry = new Map<string, HostedIssuer>();
 
       for (const hosted of OPENID4VCI_ISSUERS) {
@@ -137,6 +206,8 @@ export const issuerProviders: Provider[] = [
         }
 
         const issuerUri = pki.issuerUri(hosted.name);
+        const kinds = capKinds(hosted.name);
+        const issuerStore = releasingOnTake(store, issuerUri, (kind, id) => caps.release(kind === 'nonce' ? kinds.nonces : kinds.offers, id));
         const issuer = createCredentialIssuer({
           issuerUri,
           display: hosted.display,
@@ -146,21 +217,44 @@ export const issuerProviders: Provider[] = [
           verifier: pki.verifier,
           random: pki.random,
           clock,
-          store,
+          store: issuerStore,
           keys: await generateIssuerKeys(pki.random),
           credentials: Object.fromEntries(
-            hosted.credentials.map((id) => [id, HANDLERS[id]!(hosted.name, { prisma, credentials })])
+            hosted.credentials.map((id) => [id, HANDLERS[id]!(hosted.name, { prisma, credentials, portalState })])
           )
         });
 
-        const cap = (kind: string, max: string, lifetimeSeconds: number) =>
-          createLiveCap(redis.getClient(), `vci-${kind}:${hosted.name}`, { max: config.getOrThrow<number>(max), lifetimeSeconds, clock });
         const entry: HostedIssuer = {
           name: hosted.name,
           issuerUri,
           issuer,
-          offers: cap('offers', 'ISSUANCE_MAX_LIVE_OFFERS', OFFER_SECONDS),
-          nonces: cap('nonces', 'ISSUANCE_MAX_LIVE_NONCES', NONCE_SECONDS)
+          caps,
+          async reserveNonce(cNonce, client) {
+            const id = nonceId(cNonce);
+            const slot = await caps.reserve(kinds.nonces, id, NONCE_SECONDS, { cap: maxNonces, perClient: { key: client, cap: NONCES_PER_CLIENT } });
+
+            if (!slot.ok) await store.take(sdkKey(issuerUri, 'nonce', id));
+
+            return slot;
+          },
+          async reserveOffer(offerId, client) {
+            const records = await caps.reserve(kinds.offerRecords, offerId, OFFER_STATUS_SECONDS, {
+              cap: maxOffers * OFFER_RECORDS_PER_LIVE_OFFER,
+              perClient: { key: client, cap: OFFER_RECORDS_PER_CLIENT }
+            });
+            const live = records.ok
+              ? await caps.reserve(kinds.offers, offerId, OFFER_SECONDS, { cap: maxOffers, perClient: { key: client, cap: OFFERS_PER_CLIENT } })
+              : records;
+
+            if (live.ok) return live;
+            if (records.ok) await caps.release(kinds.offerRecords, offerId);
+
+            // Its status record first, so that ending the offer writes no `ended` flag either.
+            await store.take(sdkKey(issuerUri, 'status', offerId));
+            await issuer.cancelOffer(offerId);
+
+            return live;
+          }
         };
 
         await endPreviousOffers(entry);

@@ -15,7 +15,7 @@ import { PrismaService } from '../src/infrastructure/prisma/prisma.service';
 import { RedisService } from '../src/infrastructure/redis/redis.service';
 import { VERIFIER_CLOCK } from '../src/vc/verifiers';
 import { adjustableClock, call, issueDiplomaTo, keysDir, LOCAL, login, newWallet, PORT } from './e2e-world';
-import { createTestApp, demoPkiDir, TEST_PORTAL_PASSWORD } from './helpers';
+import { createTestApp, demoPkiDir, PROVISION_ENV, uniqueIp } from './helpers';
 
 const verifierClock = adjustableClock();
 const logs: string[] = [];
@@ -42,7 +42,7 @@ before(async () => {
   app.useLogger({ log: capture, warn: capture, error: capture, debug: capture, verbose: capture });
   await app.listen(PORT, '127.0.0.1');
   execFileSync(process.execPath, [join(__dirname, '../src/scripts/demo-provision.js')], {
-    env: { ...process.env, DEMO_PORTAL_PASSWORD: TEST_PORTAL_PASSWORD },
+    env: { ...process.env, ...PROVISION_ENV },
     stdio: 'pipe'
   });
 });
@@ -51,7 +51,8 @@ after(async () => {
   await app?.close();
 });
 
-const createSession = async (ip?: string) =>
+// Its own client by default: a client holds at most 10 live sessions (docs/vc-api.md §8).
+const createSession = async (ip = uniqueIp()) =>
   call('POST', '/v1/verification/sessions', { body: { verifier: 'nha-tuyen-dung-mau', scenario: 'ung-tuyen' }, ip });
 const session = async (id: string) => call('GET', `/v1/verification/sessions/${id}`);
 const requestIdOf = (qr: string) => new URL(new URLSearchParams(qr.split('?')[1]).get('request_uri')!).pathname.split('/').pop()!;
@@ -228,8 +229,8 @@ describe('negative paths over real HTTP', () => {
     assert.deepEqual([extra.status, extra.body.code], [400, 'VALIDATION_FAILED']);
   });
 
-  it('limits session creation to 30 per minute per IP (429 RATE_LIMITED with Retry-After)', async () => {
-    for (let i = 0; i < 30; i += 1) assert.equal((await createSession('203.0.113.160')).status, 201);
+  it('a client holds at most 10 live sessions (then 429 RATE_LIMITED with Retry-After)', async () => {
+    for (let i = 0; i < 10; i += 1) assert.equal((await createSession('203.0.113.160')).status, 201);
 
     const limited = await createSession('203.0.113.160');
     assert.deepEqual([limited.status, limited.body.code], [429, 'RATE_LIMITED']);

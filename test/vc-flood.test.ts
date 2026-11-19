@@ -24,9 +24,7 @@ const used = async () => Number(/used_memory:(\d+)/.exec(await redis().info('mem
 before(async () => {
   app = await createTestApp({
     IDENTRA_KEYS_DIR: keysDir,
-    VERIFICATION_MAX_LIVE_SESSIONS: String(CAP),
-    // Only the cap is under test here.
-    VERIFICATION_SESSIONS_PER_MINUTE: '100000'
+    VERIFICATION_MAX_LIVE_SESSIONS: String(CAP)
   });
   await app.listen(PORT, '127.0.0.1');
   await seedPortalAccounts(app.get(PrismaService));

@@ -16,9 +16,22 @@ export interface PortalSessionData {
   username: string;
   role: DemoPortalRole;
   issuerName: string;
+  /**
+   * Names this session in what it creates (offers, the credentials issued from them): SHA-256 of
+   * the token under its own label, so it is neither the token nor the session's Redis key.
+   */
+  sessionHash: string;
 }
 
 const hashToken = (token: string) => createHash('sha256').update(token).digest('hex');
+export const sessionHashOf = (token: string) => createHash('sha256').update(`portal-session-ref:${token}`).digest('base64url');
+
+/**
+ * Password hashes verified at once (argon2id, 19 MiB, about 50 ms of the one CPU each). Beyond that
+ * a sign-in is refused with 503 and Retry-After instead of queueing: rotating addresses cannot turn
+ * the login route into a CPU sink for the whole box. The per-client limit runs before (a guard).
+ */
+export const MAX_CONCURRENT_HASHES = 2;
 
 export function readBearer(header: string | string[] | undefined): string | null {
   const value = Array.isArray(header) ? header[0] : header;
@@ -32,6 +45,7 @@ export function readBearer(header: string | string[] | undefined): string | null
 export class PortalSessions implements OnModuleInit {
   private readonly store: StateStore;
   private dummyHash = '';
+  private hashing = 0;
 
   constructor(
     private readonly prisma: PrismaService,
@@ -47,14 +61,22 @@ export class PortalSessions implements OnModuleInit {
 
   async login(username: string, password: string) {
     const account = await this.prisma.demoPortalAccount.findUnique({ where: { username } });
-    const valid = await argon2.verify(account?.passwordHash ?? this.dummyHash, password).catch(() => false);
+
+    if (this.hashing >= MAX_CONCURRENT_HASHES) throw apiError(503, 'UNAVAILABLE', 'Too many sign-ins at once; try again.', { retryAfter: 1 });
+
+    this.hashing += 1;
+    // Unknown users are verified against a dummy hash: the same time as a wrong password.
+    const valid = await argon2
+      .verify(account?.passwordHash ?? this.dummyHash, password)
+      .catch(() => false)
+      .finally(() => (this.hashing -= 1));
 
     if (!account || !valid) {
       throw apiError(401, 'INVALID_CREDENTIALS', 'Username or password is incorrect.');
     }
 
     const token = randomBytes(32).toString('base64url');
-    const session: PortalSessionData = { username: account.username, role: account.role, issuerName: account.issuerName };
+    const session: Omit<PortalSessionData, 'sessionHash'> = { username: account.username, role: account.role, issuerName: account.issuerName };
     const now = new Date();
 
     await this.store.put(hashToken(token), JSON.stringify(session), PORTAL_SESSION_SECONDS).catch(() => {
@@ -76,7 +98,7 @@ export class PortalSessions implements OnModuleInit {
       throw unavailable();
     });
 
-    return stored ? (JSON.parse(stored) as PortalSessionData) : null;
+    return stored ? { ...(JSON.parse(stored) as Omit<PortalSessionData, 'sessionHash'>), sessionHash: sessionHashOf(token) } : null;
   }
 }
 

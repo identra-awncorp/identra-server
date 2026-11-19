@@ -1,0 +1,195 @@
+// The final review's denial-of-service sequences (B-1, B-2, B-3; reviewer's dos.mjs), at the
+// production caps, over real HTTP, plus the shared public accounts (B-4). Before the fixes:
+// 2006 nonces from 34 addresses filled the 2000 global nonces and every wallet failed; 504 offers
+// from one sign-in filled the 500 offers; 300 INVALID session requests from 10 addresses spent the
+// 300/min global session budget. Now each client has a share inside every cap.
+import assert from 'node:assert/strict';
+import { after, before, describe, it } from 'node:test';
+
+import { NestExpressApplication } from '@nestjs/platform-express';
+
+import { PrismaService } from '../src/infrastructure/prisma/prisma.service';
+import { RedisService } from '../src/infrastructure/redis/redis.service';
+import { NONCES_PER_CLIENT, OFFERS_PER_CLIENT } from '../src/vc/issuers';
+import { SESSIONS_PER_CLIENT } from '../src/vc/verification.controllers';
+import { call, keysDir, LOCAL, login, newOffer, newWallet, offerState, PORT } from './e2e-world';
+import { createTestApp, seedPortalAccounts } from './helpers';
+
+let app: NestExpressApplication;
+
+before(async () => {
+  // The production defaults: 2000 sessions, 2000 nonces, 500 offers.
+  app = await createTestApp({ IDENTRA_KEYS_DIR: keysDir });
+  await app.listen(PORT, '127.0.0.1');
+  await seedPortalAccounts(app.get(PrismaService));
+});
+
+after(async () => {
+  await app?.close();
+});
+
+const redis = () => app.get(RedisService).getClient();
+const ipN = (a: number, b: number) => `198.18.${a}.${b}`;
+
+async function pool<T>(tasks: Array<() => Promise<T>>, concurrency = 40): Promise<T[]> {
+  const out: T[] = [];
+  let next = 0;
+
+  await Promise.all(
+    Array.from({ length: concurrency }, async () => {
+      while (next < tasks.length) {
+        const k = next++;
+
+        out[k] = await tasks[k]!();
+      }
+    })
+  );
+
+  return out;
+}
+
+const tally = (statuses: number[]) => statuses.reduce<Record<number, number>>((m, s) => ((m[s] = (m[s] ?? 0) + 1), m), {});
+const flood = async (clients: number, perClient: number, request: (ip: string) => Promise<number>, range: number) => {
+  const tasks: Array<() => Promise<number>> = [];
+
+  for (let a = 1; a <= clients; a += 1) for (let k = 0; k < perClient; k += 1) tasks.push(() => request(ipN(range, a)));
+
+  const started = Date.now();
+  const statuses = tally(await pool(tasks));
+
+  return { statuses, ms: Date.now() - started };
+};
+const nonce = async (ip: string) => {
+  const r = await fetch(`${LOCAL}/issuers/truong-mau/nonce`, { method: 'POST', headers: { 'x-forwarded-for': ip } });
+
+  await r.text();
+
+  return r.status;
+};
+
+describe('B-1: the anonymous nonce endpoint', () => {
+  it('one client, then the reviewer\'s 2006 requests from 34 addresses: each gets its share; a wallet still collects its diploma', async () => {
+    const one = await flood(1, 59, nonce, 1);
+    const many = await flood(34, 59, nonce, 2);
+
+    console.log(`nonces, 1 client x 59: ${JSON.stringify(one.statuses)}; 34 clients x 59 (${many.ms} ms): ${JSON.stringify(many.statuses)}`);
+    assert.deepEqual(one.statuses, { 200: NONCES_PER_CLIENT, 429: 59 - NONCES_PER_CLIENT });
+    assert.deepEqual(many.statuses, { 200: 34 * NONCES_PER_CLIENT, 429: 34 * (59 - NONCES_PER_CLIENT) });
+
+    // The victim: a student's wallet (its own address) goes through token, nonce and credential.
+    const kind = 'state:live:vci-nonces:truong-mau';
+    const liveBefore = await redis().zcard(kind);
+    const offer = await newOffer(await login('sv003'));
+    const { wallet } = newWallet();
+    const resolved = await wallet.offers.resolve(offer.offerUri);
+
+    assert.ok(resolved.ok);
+    if (!resolved.ok) return;
+    const accepted = await wallet.offers.accept(resolved.offer, { txCode: offer.txCode });
+
+    assert.ok(accepted.ok, JSON.stringify(accepted));
+    // Its nonce was used by the proof: its place is free again (and the redeemed offer's too).
+    assert.equal(await redis().zcard(kind), liveBefore);
+    assert.equal(await redis().zscore('state:live:vci-offers:truong-mau', offer.offerId), null);
+    assert.equal(await nonce('203.0.113.51'), 200);
+  });
+});
+
+describe('B-2: offers of the shared student accounts', () => {
+  it('one sign-in from one address, then from ten (56 each, the reviewer\'s rate): they hold their share; another student gets an offer', async () => {
+    const attacker = await login('sv001');
+    const post = (ip: string) => call('POST', '/v1/demo/school/offers', { token: attacker, ip }).then((r) => r.status);
+    const one = await flood(1, 56, post, 3);
+    const ten = await flood(10, 56, post, 4);
+
+    console.log(`offers as sv001, 1 client x 56: ${JSON.stringify(one.statuses)}; 10 clients x 56 (${ten.ms} ms): ${JSON.stringify(ten.statuses)}`);
+    assert.deepEqual(one.statuses, { 201: OFFERS_PER_CLIENT, 429: 56 - OFFERS_PER_CLIENT });
+    assert.deepEqual(ten.statuses, { 201: 10 * OFFERS_PER_CLIENT, 429: 10 * (56 - OFFERS_PER_CLIENT) });
+    assert.equal(await redis().zcard('state:live:vci-offers:truong-mau'), 11 * OFFERS_PER_CLIENT);
+
+    const victim = await call('POST', '/v1/demo/school/offers', { token: await login('sv002'), ip: '203.0.113.50' });
+
+    assert.equal(victim.status, 201, JSON.stringify(victim.body));
+  });
+});
+
+describe('B-3: verification session creation', () => {
+  const create = (body: object) => (ip: string) => call('POST', '/v1/verification/sessions', { body, ip }).then((r) => r.status);
+  const valid = { verifier: 'nha-tuyen-dung-mau', scenario: 'ung-tuyen' };
+
+  it('300 INVALID bodies from 10 addresses spend nothing; then valid floods from 1 and 10 addresses hold their share; a visitor still gets a session', async () => {
+    const junk = await flood(10, 30, create({ verifier: 'x' }), 5);
+    const afterJunk = await call('POST', '/v1/verification/sessions', { body: valid, ip: '203.0.113.52' });
+    const one = await flood(1, 30, create(valid), 6);
+    const ten = await flood(10, 30, create(valid), 7);
+    const victim = await call('POST', '/v1/verification/sessions', { body: valid, ip: '203.0.113.53' });
+
+    console.log(
+      `sessions: 10 clients x 30 invalid: ${JSON.stringify(junk.statuses)}, then a visitor: ${afterJunk.status}; ` +
+        `valid 1 client x 30: ${JSON.stringify(one.statuses)}; 10 clients x 30: ${JSON.stringify(ten.statuses)}; then a visitor: ${victim.status}`
+    );
+    assert.deepEqual(junk.statuses, { 400: 300 });
+    assert.equal(afterJunk.status, 201);
+    assert.deepEqual(one.statuses, { 201: SESSIONS_PER_CLIENT, 429: 30 - SESSIONS_PER_CLIENT });
+    assert.deepEqual(ten.statuses, { 201: 10 * SESSIONS_PER_CLIENT, 429: 10 * (30 - SESSIONS_PER_CLIENT) });
+    assert.equal(victim.status, 201);
+  });
+});
+
+describe('B-4: two visitors on the same public student account', () => {
+  it('keep their own offers, listings and revocations; neither sees nor revokes the other\'s', async () => {
+    const [alice, bob] = [await login('sv002'), await login('sv002')];
+    const [aliceOffer, bobOffer] = [await newOffer(alice), await newOffer(bob)];
+
+    // Bob's offer did not end Alice's; neither reads the other's.
+    assert.equal((await offerState(alice, aliceOffer.offerId)).body.status, 'pending');
+    assert.equal((await offerState(bob, bobOffer.offerId)).body.status, 'pending');
+    assert.equal((await offerState(bob, aliceOffer.offerId)).status, 404);
+    assert.equal((await call('DELETE', `/v1/demo/school/offers/${aliceOffer.offerId}`, { token: bob })).status, 404);
+
+    const collect = async (offer: typeof aliceOffer) => {
+      const { wallet } = newWallet();
+      const resolved = await wallet.offers.resolve(offer.offerUri);
+
+      assert.ok(resolved.ok);
+      if (!resolved.ok) throw new Error('unresolved');
+      const accepted = await wallet.offers.accept(resolved.offer, { txCode: offer.txCode });
+
+      assert.ok(accepted.ok, JSON.stringify(accepted));
+    };
+
+    await collect(aliceOffer);
+    await collect(bobOffer);
+
+    const list = async (token: string) => (await call('GET', '/v1/demo/school/credentials', { token })).body.items as Array<{ id: string; status: string; canRevoke: boolean }>;
+    const [aliceItems, bobItems] = [await list(alice), await list(bob)];
+
+    assert.equal(aliceItems.length, 1);
+    assert.equal(bobItems.length, 1);
+    assert.notEqual(aliceItems[0]!.id, bobItems[0]!.id);
+    assert.deepEqual([aliceItems[0]!.status, aliceItems[0]!.canRevoke], ['valid', true]);
+    // A third visitor on the account sees nothing of either.
+    assert.deepEqual(await list(await login('sv002')), []);
+
+    const revoke = (token: string, id: string) => call('POST', `/v1/demo/school/credentials/${id}/revoke`, { token });
+
+    assert.deepEqual([(await revoke(bob, aliceItems[0]!.id)).status, (await revoke(bob, aliceItems[0]!.id)).body.code], [404, 'NOT_FOUND']);
+    const revoked = await revoke(alice, aliceItems[0]!.id);
+
+    assert.deepEqual([revoked.status, revoked.body.id, revoked.body.status], [200, aliceItems[0]!.id, 'revoked']);
+    assert.ok(revoked.body.updatedAt);
+    assert.deepEqual([(await revoke(alice, aliceItems[0]!.id)).status, (await revoke(alice, aliceItems[0]!.id)).body.code], [409, 'CONFLICT']);
+    assert.deepEqual((await list(alice)).map((i) => [i.status, i.canRevoke]), [['revoked', false]]);
+    assert.deepEqual((await list(bob)).map((i) => i.status), ['valid']);
+
+    // Students only revoke; the registrar (its own password) keeps the full list and the status route.
+    const registrar = await login('phongdaotao');
+    assert.equal((await revoke(registrar, bobItems[0]!.id)).status, 403);
+    const all = await list(registrar);
+    assert.ok([aliceItems[0]!.id, bobItems[0]!.id].every((id) => all.some((i) => i.id === id)));
+    const suspended = await call('POST', `/v1/issuers/truong-mau/credentials/${bobItems[0]!.id}/status`, { token: registrar, body: { status: 'suspended' } });
+    assert.deepEqual([suspended.status, suspended.body.status], [200, 'suspended']);
+    // A student token is not a registrar on the status route.
+    assert.equal((await call('POST', `/v1/issuers/truong-mau/credentials/${bobItems[0]!.id}/status`, { token: bob, body: { status: 'valid' } })).status, 403);
+  });
+});

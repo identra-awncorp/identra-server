@@ -1,4 +1,4 @@
-// Shared by the end-to-end tests: the app listens on 127.0.0.1:47400 (IDENTRA_TEST_PORT); wallets are the SDK's own
+// Shared by the end-to-end tests: the app listens on 127.0.0.1:IDENTRA_TEST_PORT (.env.test, default 47400); wallets are the SDK's own
 // (@identra/sdk-app), reaching the canonical origin through createMappedFetch.
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -14,7 +14,7 @@ import {
   createWallet
 } from '@identra/sdk-app';
 
-import { randomIp, TEST_PORTAL_PASSWORD, testKeysDir } from './helpers';
+import { portalPasswordOf, randomIp, testKeysDir, uniqueIp } from './helpers';
 
 export const PORT = Number(process.env.IDENTRA_TEST_PORT ?? 47400);
 export const LOCAL = `http://127.0.0.1:${PORT}`;
@@ -92,9 +92,10 @@ export async function call(method: string, path: string, options: { token?: stri
 
 // Its own client address per sign-in, so the files' many logins do not share one per-IP budget.
 export const login = async (username: string) =>
-  (await call('POST', '/v1/demo/school/login', { body: { username, password: TEST_PORTAL_PASSWORD }, ip: randomIp() })).body.token as string;
-export const newOffer = async (token: string) => {
-  const res = await call('POST', '/v1/demo/school/offers', { token });
+  (await call('POST', '/v1/demo/school/login', { body: { username, password: portalPasswordOf(username) }, ip: randomIp() })).body.token as string;
+// Its own client too: a client holds at most 5 live offers (docs/vc-api.md §8).
+export const newOffer = async (token: string, ip = uniqueIp()) => {
+  const res = await call('POST', '/v1/demo/school/offers', { token, ip });
 
   assert.equal(res.status, 201, JSON.stringify(res.body));
 

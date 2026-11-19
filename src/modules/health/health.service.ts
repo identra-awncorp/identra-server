@@ -1,6 +1,7 @@
 import { Injectable } from '@nestjs/common';
 import { ModuleRef } from '@nestjs/core';
 
+import { BUILD } from '../../build-info';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service';
 import { RedisService } from '../../infrastructure/redis/redis.service';
 import { TRUST_LIST_MONITOR, TrustListMonitor } from '../../vc/trust-list';
@@ -30,14 +31,17 @@ export class HealthService {
       this.checkRedis(),
       this.checkCredentials()
     ]);
-    // `status` (the container healthcheck) follows the stores only: a broken trust-list source
-    // must not make Docker restart the api. Monitoring watches `trustList` and `verifier`
-    // (ADR-0014 §7).
-    const isHealthy = database.status === 'up' && redis.status === 'up';
+    // `status` follows the stores only: a broken trust-list source must not make Docker restart
+    // the api. Monitoring watches `trustList` and `verifier` (ADR-0014 §7). `down` (HTTP 503, the
+    // container healthcheck fails): Postgres or Redis unreachable; `degraded` (200): Redis is
+    // near or at maxmemory, which a restart would not fix.
+    const status =
+      database.status === 'down' || redis.status === 'down' ? 'down' : database.status === 'up' && redis.status === 'up' ? 'ok' : 'degraded';
 
     return {
-      status: isHealthy ? 'ok' : 'degraded',
+      status,
       timestamp: new Date().toISOString(),
+      build: BUILD,
       services: {
         database,
         redis,

@@ -5,8 +5,7 @@ import {
   SetMetadata,
   ServiceUnavailableException
 } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
-import { APP_GUARD, Reflector } from '@nestjs/core';
+import { APP_GUARD } from '@nestjs/core';
 import {
   Throttle,
   ThrottlerGuard,
@@ -20,7 +19,6 @@ import { RedisService } from '../infrastructure/redis/redis.service';
 import { normalizePhone } from '../modules/auth/auth.utils';
 
 const MINUTE = 60_000;
-const reflector = new Reflector();
 
 /**
  * Per-client limits per route (docs/vc-api.md §8). A client is an IPv4 address or an IPv6 /64
@@ -39,14 +37,6 @@ export const RATE_LIMITS = {
 } as const;
 
 export const RateLimit = (name: keyof typeof RATE_LIMITS) => Throttle({ default: RATE_LIMITS[name] });
-
-const GLOBAL_LIMIT = 'identra:global-rate-limit';
-
-/**
- * One budget per route for ALL clients together, on top of the per-client one: rotating
- * addresses does not buy more (VERIFICATION_SESSIONS_PER_MINUTE for session creation).
- */
-export const GlobalRateLimit = () => SetMetadata(GLOBAL_LIMIT, true);
 
 const FAIL_CLOSED = 'identra:rate-limit-fail-closed';
 
@@ -155,8 +145,8 @@ function phoneOf(context: ExecutionContext): string | null {
 @Module({
   imports: [
     ThrottlerModule.forRootAsync({
-      inject: [RedisService, ConfigService],
-      useFactory: (redis: RedisService, config: ConfigService) => ({
+      inject: [RedisService],
+      useFactory: (redis: RedisService) => ({
         storage: new RedisThrottlerStorage(redis.getClient()),
         throttlers: [
           { name: 'default', ...RATE_LIMITS.default },
@@ -165,16 +155,6 @@ function phoneOf(context: ExecutionContext): string | null {
             ...RATE_LIMITS.login,
             skipIf: (context) => context.getType() !== 'http' || phoneOf(context) === null,
             getTracker: (_req, context) => `phone:${phoneOf(context)}`
-          },
-          {
-            name: 'global',
-            limit: config.getOrThrow<number>('VERIFICATION_SESSIONS_PER_MINUTE'),
-            ttl: MINUTE,
-            skipIf: (context) =>
-              context.getType() !== 'http' || !reflector.getAllAndOverride<boolean>(GLOBAL_LIMIT, [context.getHandler(), context.getClass()]),
-            getTracker: () => 'all-clients',
-            // The shared count is nobody's business.
-            setHeaders: false
           }
         ]
       })

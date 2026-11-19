@@ -1,5 +1,6 @@
 import {
   Controller,
+  Delete,
   Get,
   HttpCode,
   Inject,
@@ -12,19 +13,24 @@ import {
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import type { Clock } from '@identra/sdk-core';
-import { ACCESS_TOKEN_SECONDS, type HttpRequest, type HttpResponse as SdkResponse } from '@identra/sdk-server';
+import { ACCESS_TOKEN_SECONDS, OFFER_STATUS_SECONDS, type HttpRequest, type HttpResponse as SdkResponse } from '@identra/sdk-server';
 
 import { allowAnyOrigin, apiError, HttpResponse, oauthError, ProtocolErrorFilter, V1ErrorFilter } from '../common/http-errors';
 import { RateLimit, RateLimitFailClosed } from '../common/rate-limit';
+import { clientOf, Reservation } from '../common/live-cap';
 import { createRedisStateStore, StateStore } from '../common/state-store';
 import { DemoPortalGuard, PortalSession, PortalSessionData } from '../demo-portal/portal-sessions';
+import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { RedisService } from '../infrastructure/redis/redis.service';
 import { OPENID4VCI_ISSUERS } from './hosted-issuers';
-import { HostedIssuer, ISSUERS, IssuerRegistry } from './issuers';
+import { HostedIssuer, ISSUERS, IssuerRegistry, offerOwnerKey, PORTAL_OFFER_NAMESPACE } from './issuers';
+import { VcCredentialsService } from './vc-credentials.service';
 import { ISSUER_CLOCK } from './vc.providers';
 
 export interface RawRequest {
   headers: Record<string, string | string[] | undefined>;
+  /** The client address (trust proxy: the last X-Forwarded-For hop, set by nginx). */
+  ip?: string;
   /** Set by the body parsers when the app is created with `rawBody: true` (main.ts, tests). */
   rawBody?: Buffer;
   body?: unknown;
@@ -114,19 +120,25 @@ export class IssuerProtocolController {
     send(res, await this.issuer(name).token(sdkRequest(req)));
   }
 
+  /**
+   * Unauthenticated, as OpenID4VCI 1.0 §7 defines it. Anonymous state (a c_nonce, 5 minutes until
+   * used): each client has a share of the global cap (§8), so one client cannot use up the others'.
+   */
   @Post('issuers/:name/nonce')
   @RateLimit('write')
-  async nonce(@Param('name') name: string, @Res() res: RawResponse) {
+  async nonce(@Param('name') name: string, @Req() req: RawRequest, @Res() res: RawResponse) {
     const hosted = this.hosted(name);
-    // Anonymous state (a c_nonce for 5 minutes): a global cap bounds its Redis cost (§8).
-    const slot = await hosted.nonces.reserve();
+    const answer = await hosted.issuer.nonce();
+    const slot = await hosted.reserveNonce((JSON.parse(answer.body) as { c_nonce: string }).c_nonce, clientOf(req.ip));
 
     if (!slot.ok) {
       res.setHeader('Retry-After', String(slot.retryAfterSeconds));
-      throw oauthError(503, 'temporarily_unavailable', 'too many nonces are outstanding; try again shortly');
+      throw slot.scope === 'client'
+        ? oauthError(429, 'temporarily_unavailable', 'this client holds too many unused nonces; use one or wait')
+        : oauthError(503, 'temporarily_unavailable', 'too many nonces are outstanding; try again shortly');
     }
 
-    send(res, await hosted.issuer.nonce());
+    send(res, answer);
   }
 
   @Post('issuers/:name/credential')
@@ -136,15 +148,27 @@ export class IssuerProtocolController {
   }
 }
 
-const PORTAL_OFFER_SECONDS = 1800;
 const CONFIGURATION = 'bang-tot-nghiep-v1';
+const CREDENTIAL_ID = /^[A-Za-z0-9_-]{22}$/;
+
+/** 429 when this client used its share, 503 when everybody's cap is full (docs/vc-api.md §8). */
+function refusal(slot: Exclude<Reservation, { ok: true }>, what: string) {
+  return slot.scope === 'client'
+    ? apiError(429, 'RATE_LIMITED', `This client has too many ${what} open; finish or cancel one, or wait.`, { retryAfter: slot.retryAfterSeconds })
+    : apiError(503, 'UNAVAILABLE', `Too many ${what} are open; try again shortly.`, { retryAfter: slot.retryAfterSeconds });
+}
+
+interface PortalRequest {
+  ip?: string;
+}
 
 /**
- * School portal, second half (docs/vc-api.md §5). At most one pending offer per student: a new
- * offer supersedes the previous one, whose code stops working and whose state reads `expired`.
+ * School portal, second half (docs/vc-api.md §5): a student's offers and the credentials issued
+ * from them. Everything belongs to the portal SESSION that created it (the accounts are shared by
+ * every visitor): another session, even of the same account, does not see or touch it.
  */
 @ApiTags('demo-school')
-@Controller('demo/school/offers')
+@Controller('demo/school')
 @UseFilters(V1ErrorFilter)
 @UseGuards(DemoPortalGuard)
 @RateLimitFailClosed()
@@ -155,9 +179,11 @@ export class PortalOffersController {
   constructor(
     @Inject(ISSUERS) private readonly issuers: IssuerRegistry,
     @Inject(ISSUER_CLOCK) private readonly clock: Clock,
+    private readonly prisma: PrismaService,
+    private readonly credentials: VcCredentialsService,
     redis: RedisService
   ) {
-    this.portalState = createRedisStateStore(redis.getClient(), 'portal-offer');
+    this.portalState = createRedisStateStore(redis.getClient(), PORTAL_OFFER_NAMESPACE);
   }
 
   private hosted(session: PortalSessionData) {
@@ -168,47 +194,81 @@ export class PortalOffersController {
     return hosted;
   }
 
-  @Post()
+  private student(session: PortalSessionData, action: string) {
+    if (session.role !== 'student') throw apiError(403, 'FORBIDDEN', `Only students can ${action}.`);
+  }
+
+  @Post('offers')
   @HttpCode(201)
   @RateLimit('write')
-  async create(@PortalSession() session: PortalSessionData) {
-    if (session.role !== 'student') throw apiError(403, 'FORBIDDEN', 'Only students can collect a diploma.');
+  async create(@PortalSession() session: PortalSessionData, @Req() req: PortalRequest) {
+    this.student(session, 'collect a diploma');
 
-    const { issuer, offers } = this.hosted(session);
+    const hosted = this.hosted(session);
     // The PIN (txCode) exists only in this response: the SDK keeps a keyed hash of it.
-    const offer = await issuer.createOffer({ subjectRef: session.username, configurationId: CONFIGURATION });
-    // Counted once created (its id is the member, ended at the next start, L1); over the cap it is
-    // ended at once, leaving only its small status record.
-    const slot = await offers.reserve(offer.offerId);
+    const offer = await hosted.issuer.createOffer({ subjectRef: session.username, configurationId: CONFIGURATION });
+    // Counted once created (its id is the member); refused, it is removed again at once.
+    const slot = await hosted.reserveOffer(offer.offerId, clientOf(req.ip));
 
-    if (!slot.ok) {
-      await issuer.cancelOffer(offer.offerId);
-      throw apiError(503, 'UNAVAILABLE', 'Too many offers are open; try again shortly.', { retryAfter: slot.retryAfterSeconds });
-    }
+    if (!slot.ok) throw refusal(slot, 'offers');
 
-    const previous = await this.portalState.swap(
-      `current:${session.issuerName}:${session.username}`,
-      offer.offerId,
-      PORTAL_OFFER_SECONDS
-    );
-
-    // Safe on a used, expired or unknown offer: an issued one stays issued.
-    if (previous && previous !== offer.offerId) await issuer.cancelOffer(previous);
+    await this.portalState.put(offerOwnerKey(offer.offerId), session.sessionHash, OFFER_STATUS_SECONDS);
 
     return { ...offer, serverTime: new Date().toISOString() };
   }
 
-  @Get(':offerId')
-  async status(@PortalSession() session: PortalSessionData, @Param('offerId') offerId: string) {
+  /** The offer if this session created it (unknown, too old or someone else's: the same 404). */
+  private async owned(session: PortalSessionData, offerId: string) {
     const hosted = this.hosted(session);
-    const state = await hosted.issuer.offerStatus(offerId);
+    const [state, owner] = await Promise.all([hosted.issuer.offerStatus(offerId), this.portalState.get(offerOwnerKey(offerId))]);
 
-    // Unknown, too old, or someone else's: the same answer.
-    if (!state || state.subjectRef !== session.username) throw apiError(404, 'NOT_FOUND', 'No such offer.');
+    if (!state || state.subjectRef !== session.username || owner !== session.sessionHash) throw apiError(404, 'NOT_FOUND', 'No such offer.');
+
+    return { hosted, state };
+  }
+
+  @Get('offers/:offerId')
+  async status(@PortalSession() session: PortalSessionData, @Param('offerId') offerId: string) {
+    const { hosted, state } = await this.owned(session, offerId);
 
     return { status: state.status === 'pending' ? await this.pendingOrRedeemed(hosted, offerId) : state.status, serverTime: new Date().toISOString() };
   }
 
+  /** Cancels a pending offer (its code stops working, its place is freed); an issued one stays issued. */
+  @Delete('offers/:offerId')
+  @RateLimit('write')
+  async cancel(@PortalSession() session: PortalSessionData, @Param('offerId') offerId: string) {
+    const { hosted } = await this.owned(session, offerId);
+
+    // Safe on a used or expired offer.
+    await hosted.issuer.cancelOffer(offerId);
+
+    const after = await hosted.issuer.offerStatus(offerId);
+
+    return { offerId, status: after?.status === 'issued' ? 'issued' : 'expired', serverTime: new Date().toISOString() };
+  }
+
+  /**
+   * A student revokes a credential issued in THIS session ("I lost my phone"): revocation only,
+   * final. Anything else, also another session's credential of the same account, is 404.
+   */
+  @Post('credentials/:credentialId/revoke')
+  @HttpCode(200)
+  @RateLimit('write')
+  async revoke(@PortalSession() session: PortalSessionData, @Param('credentialId') id: string) {
+    this.student(session, 'revoke their own copy; the registrar uses the status route');
+
+    const row = CREDENTIAL_ID.test(id)
+      ? await this.prisma.vcIssuedCredential.findFirst({
+          where: { id, issuerName: session.issuerName, subjectRef: session.username, portalSessionHash: session.sessionHash }
+        })
+      : null;
+
+    if (!row) throw apiError(404, 'NOT_FOUND', 'No such credential in this session.');
+    if (row.status === 'revoked') throw apiError(409, 'CONFLICT', 'The credential is already revoked.');
+
+    return this.credentials.changeStatus(session.issuerName, id, 'revoked');
+  }
   /**
    * L5: the SDK reads `pending` until the offer's 10 minutes pass, also after the token endpoint
    * consumed the code (the offer record is gone: offer() answers 404) when the credential was then
@@ -223,7 +283,7 @@ export class PortalOffersController {
     // Two polls racing here record nearly the same time; either is fine.
     const seen = Number((await this.portalState.get(key)) ?? now);
 
-    if (seen === now) await this.portalState.put(key, String(now), PORTAL_OFFER_SECONDS);
+    if (seen === now) await this.portalState.put(key, String(now), OFFER_STATUS_SECONDS);
 
     return now - seen >= ACCESS_TOKEN_SECONDS * 1000 ? 'expired' : 'pending';
   }

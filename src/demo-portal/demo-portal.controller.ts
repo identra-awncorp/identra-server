@@ -70,7 +70,10 @@ export class DemoPortalController {
     return this.sessions.login(body.username, body.password);
   }
 
-  /** Student: their own diplomas; registrar: every diploma of their issuer. */
+  /**
+   * Student: the diplomas issued in THIS portal session (the sample accounts are shared by every
+   * visitor); registrar: every diploma of their issuer. `canRevoke`: this session may revoke it now.
+   */
   @Get('credentials')
   @ApiBearerAuth()
   @UseGuards(DemoPortalGuard)
@@ -78,7 +81,7 @@ export class DemoPortalController {
     const after = query.cursor === undefined ? undefined : decodeCursor(query.cursor);
     const where: Prisma.VcIssuedCredentialWhereInput = {
       issuerName: session.issuerName,
-      ...(session.role === 'student' ? { subjectRef: session.username } : {}),
+      ...(session.role === 'student' ? { subjectRef: session.username, portalSessionHash: session.sessionHash } : {}),
       // Newest first; the next page continues strictly after the cursor's (issuedAt, id).
       ...(after
         ? { OR: [{ issuedAt: { lt: after.issuedAt } }, { issuedAt: after.issuedAt, id: { lt: after.id } }] }
@@ -103,7 +106,8 @@ export class DemoPortalController {
         studentCode: profiles.get(row.subjectRef)?.maSinhVien ?? null,
         studentName: profiles.get(row.subjectRef)?.hoTen ?? null,
         issuedAt: row.issuedAt.toISOString(),
-        status: row.status
+        status: row.status,
+        canRevoke: row.status !== 'revoked'
       })),
       nextCursor: page.length > query.limit && last ? encodeCursor(last.issuedAt, last.id) : null
     };

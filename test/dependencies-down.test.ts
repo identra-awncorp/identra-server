@@ -38,8 +38,8 @@ const http = () => request(app.getHttpServer());
 const leaks = (body: unknown) => /127\.0\.0\.1|nowhere|prisma|ECONNREFUSED/i.test(JSON.stringify(body));
 
 describe('production errors do not leak infrastructure details (F6)', () => {
-  it('GET /v1/health reports components down without reasons', async () => {
-    const res = await http().get('/v1/health').expect(200);
+  it('GET /v1/health reports components down without reasons, as HTTP 503 (B-10)', async () => {
+    const res = await http().get('/v1/health').expect(503);
 
     // The trust list needs neither store: it is signed from the key files and the source file.
     assert.deepEqual(res.body.services, {
@@ -50,7 +50,9 @@ describe('production errors do not leak infrastructure details (F6)', () => {
       statusLists: { status: 'down' },
       verifier: { status: 'up' }
     });
-    assert.equal(res.body.status, 'degraded');
+    assert.equal(res.body.status, 'down');
+    // The commits inside the image (unknown outside an image build).
+    assert.deepEqual(res.body.build, { server: 'unknown', sdk: 'unknown' });
   });
 
   it('GraphQL replaces database errors with a generic message', async () => {

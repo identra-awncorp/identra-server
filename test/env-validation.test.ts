@@ -235,8 +235,8 @@ describe('credential feature configuration', () => {
     const env = validateEnv({ ...dev });
 
     assert.deepEqual(
-      [env.VERIFICATION_MAX_LIVE_SESSIONS, env.VERIFICATION_SESSIONS_PER_MINUTE, env.ISSUANCE_MAX_LIVE_NONCES, env.ISSUANCE_MAX_LIVE_OFFERS],
-      [2000, 300, 2000, 500]
+      [env.VERIFICATION_MAX_LIVE_SESSIONS, env.ISSUANCE_MAX_LIVE_NONCES, env.ISSUANCE_MAX_LIVE_OFFERS],
+      [2000, 2000, 500]
     );
   });
 });

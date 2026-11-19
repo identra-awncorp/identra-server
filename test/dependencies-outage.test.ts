@@ -150,7 +150,7 @@ describe('dependency outages (M4)', () => {
 
     assertNoSlow500(results);
     assert.deepEqual(byRoute(results), {
-      'GET /v1/health': 200,
+      'GET /v1/health': 503,
       'GET /trust-list': 200,
       'GET /issuers/truong-mau/status': 200,
       'GET /.well-known/openid-credential-issuer/issuers': 200,
@@ -183,7 +183,7 @@ describe('dependency outages (M4)', () => {
 
     assertNoSlow500(results);
     assert.deepEqual(byRoute(results), {
-      'GET /v1/health': 200,
+      'GET /v1/health': 503,
       'GET /trust-list': 200,
       'GET /issuers/truong-mau/status': 200,
       'GET /.well-known/openid-credential-issuer/issuers': 200,

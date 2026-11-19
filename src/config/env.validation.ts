@@ -98,11 +98,10 @@ const envSchema = z.object({
   // Comma list of `org:sha256hex`: the SHA-256 of each organisation's back-office API key.
   // Empty = no API-key access.
   IDENTRA_ORG_API_KEY_HASHES: z.string().default(''),
-  // Redis budget of the anonymous protocol state (docs/vc-api.md §8): live verification sessions
-  // (5 minutes each), session creations per minute across all clients, live c_nonces (5 minutes)
-  // and live offers per issuer (10 minutes).
+  // Redis budget of the anonymous protocol state (docs/vc-api.md §8), global caps: live
+  // verification sessions (5 minutes each), live c_nonces (5 minutes) and live offers per issuer
+  // (10 minutes). Each client has a fixed share inside each cap.
   VERIFICATION_MAX_LIVE_SESSIONS: z.coerce.number().int().positive().default(2000),
-  VERIFICATION_SESSIONS_PER_MINUTE: z.coerce.number().int().positive().default(300),
   ISSUANCE_MAX_LIVE_NONCES: z.coerce.number().int().positive().default(2000),
   ISSUANCE_MAX_LIVE_OFFERS: z.coerce.number().int().positive().default(500),
   OTP_TTL_SECONDS: z.coerce.number().int().positive().default(300),

@@ -426,12 +426,16 @@ model VcIssuedCredential {
   cnfThumbprint    String
   // The OpenID4VCI offer it was issued for: makes recording an issuance idempotent.
   offerId          String?            @unique
+  // School portal: a hash of the portal session that created the offer (never the token). That
+  // session lists the credential and may revoke it (docs/vc-api.md §5).
+  portalSessionHash String?
   status           VcCredentialStatus @default(valid)
   issuedAt         DateTime           @default(now())
   statusChangedAt  DateTime           @default(now())
 
   @@unique([issuerName, statusListNumber, statusIndex])
   @@index([issuerName, subjectRef])
+  @@index([portalSessionHash])
 }
 
 enum DemoPortalRole {

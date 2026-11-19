@@ -78,6 +78,8 @@ export class VcCredentialsService {
     statusIdx: number;
     cnfThumbprint: string;
     issuedAt: Date;
+    /** Hash of the portal session that created the offer (portal-sessions.ts), never the token. */
+    portalSessionHash?: string | null;
   }): Promise<{ credentialId: string }> {
     const prefix = this.statusLists.uri(input.issuerName, 1).replace(/1$/, '');
 
@@ -92,6 +94,7 @@ export class VcCredentialsService {
       statusListNumber: Number(input.statusUri.slice(prefix.length)),
       statusIndex: input.statusIdx,
       cnfThumbprint: input.cnfThumbprint,
+      portalSessionHash: input.portalSessionHash ?? null,
       issuedAt: input.issuedAt,
       statusChangedAt: input.issuedAt
     };

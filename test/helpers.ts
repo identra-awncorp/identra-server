@@ -122,6 +122,15 @@ export function randomIp(): string {
   return `198.51.100.${randomInt(1, 255)}`;
 }
 
+let clientSeq = 0;
+
+/** A client address no other request of this process uses (per-client shares, docs/vc-api.md §8). */
+export function uniqueIp(): string {
+  clientSeq += 1;
+
+  return `100.64.${(clientSeq >> 8) & 255}.${clientSeq & 255}`;
+}
+
 export interface RegisteredUser {
   id: string;
   phone: string;
@@ -163,17 +172,23 @@ export async function registerUser(app: NestExpressApplication): Promise<Registe
   };
 }
 
+/** The public student password, and the registrar's own (private) one: demo:provision needs both. */
 export const TEST_PORTAL_PASSWORD = 'Identra@2026';
+export const TEST_REGISTRAR_PASSWORD = 'Registrar-Only-2026';
+export const PROVISION_ENV = { DEMO_PORTAL_PASSWORD: TEST_PORTAL_PASSWORD, DEMO_PORTAL_REGISTRAR_PASSWORD: TEST_REGISTRAR_PASSWORD };
+export const portalPasswordOf = (username: string) =>
+  DEMO_ACCOUNTS.some((a) => a.username === username && a.role === 'student') ? TEST_PORTAL_PASSWORD : TEST_REGISTRAR_PASSWORD;
 
 /** The sample portal accounts, plus a registrar of another issuer for authorisation tests. */
 export async function seedPortalAccounts(prisma: PrismaService): Promise<void> {
-  const passwordHash = await argon2.hash(TEST_PORTAL_PASSWORD, PORTAL_PASSWORD_HASH);
   const accounts = [
     ...DEMO_ACCOUNTS.map((a) => ({ username: a.username, role: a.role, issuerName: DEMO_ISSUER, profile: { ...a.profile } })),
     { username: 'phongqlcl-nsx', role: 'registrar' as const, issuerName: 'nha-san-xuat', profile: { hoTen: 'Mẫu', donVi: 'DEMO' } }
   ];
 
   for (const { username, ...data } of accounts) {
+    const passwordHash = await argon2.hash(portalPasswordOf(username), PORTAL_PASSWORD_HASH);
+
     await prisma.demoPortalAccount.upsert({
       where: { username },
       create: { username, passwordHash, ...data },
@@ -186,7 +201,7 @@ export async function portalLogin(app: NestExpressApplication, username: string)
   const res = await request(app.getHttpServer())
     .post('/v1/demo/school/login')
     .set('X-Forwarded-For', randomIp())
-    .send({ username, password: TEST_PORTAL_PASSWORD })
+    .send({ username, password: portalPasswordOf(username) })
     .expect(201);
 
   return res.body.token;

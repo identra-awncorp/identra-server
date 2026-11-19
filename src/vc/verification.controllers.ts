@@ -1,3 +1,5 @@
+import { randomBytes } from 'node:crypto';
+
 import { Body, Controller, Get, HttpCode, Inject, Logger, Param, Post, Req, Res, UseFilters } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { ApiTags } from '@nestjs/swagger';
@@ -6,16 +8,21 @@ import { SESSION_SECONDS } from '@identra/sdk-server';
 import type { Clock } from '@identra/sdk-core';
 
 import { apiError, oauthError, ProtocolErrorFilter, unavailable, V1ErrorFilter } from '../common/http-errors';
-import { createLiveCap, LiveCap } from '../common/live-cap';
-import { GlobalRateLimit, RateLimit, RateLimitFailClosed } from '../common/rate-limit';
+import { clientOf, createLiveCaps, LiveCaps } from '../common/live-cap';
+import { RateLimit, RateLimitFailClosed } from '../common/rate-limit';
 import { RedisService } from '../infrastructure/redis/redis.service';
 import { RawRequest, RawResponse, sdkRequest, send } from './issuer.controllers';
 import { HOSTED_VERIFIERS } from './hosted-issuers';
 import { HostedVerifiers, VERIFIER_CLOCK, VERIFIERS } from './verifiers';
 
 const NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
-const HOSTED_NAMES = new Set(HOSTED_VERIFIERS.map((v) => v.name));
 const logger = new Logger('Verification');
+const KIND = 'vp-sessions';
+/** Live sessions of one client (an IPv4 address or IPv6 /56) inside the global cap (docs/vc-api.md §8). */
+export const SESSIONS_PER_CLIENT = 10;
+
+const known = (verifier: string, scenario: string) =>
+  HOSTED_VERIFIERS.some((v) => v.name === verifier && Object.hasOwn(v.scenarios, scenario));
 
 class CreateSessionDto {
   @IsString()
@@ -29,8 +36,10 @@ class CreateSessionDto {
 
 /**
  * Verification sessions for the website (docs/vc-api.md §6). Anonymous, so their Redis cost is
- * bounded three ways (§8): per client, per minute across all clients, and by a global cap on live
- * sessions (VERIFICATION_MAX_LIVE_SESSIONS, each holding its ~6 KB request object for 5 minutes).
+ * bounded (§8) by a global cap on live sessions (VERIFICATION_MAX_LIVE_SESSIONS, each holding its
+ * ~7 KB request object for 5 minutes) with a share per client inside it, reserved only for a
+ * valid request (body, verifier and scenario checked first). A place is held for the full 5
+ * minutes, so the cap also bounds creations: at most cap × 6 sessions in their 30 minutes.
  * Responses are `Cache-Control: no-store` (configureApp): the id reads the result.
  */
 @ApiTags('verification')
@@ -39,7 +48,8 @@ class CreateSessionDto {
 // Sessions live in Redis: without it there is nothing to create or read (503).
 @RateLimitFailClosed()
 export class VerificationSessionsController {
-  private readonly live: LiveCap;
+  private readonly caps: LiveCaps;
+  private readonly cap: number;
 
   constructor(
     @Inject(VERIFIERS) private readonly verifiers: HostedVerifiers,
@@ -47,37 +57,36 @@ export class VerificationSessionsController {
     config: ConfigService,
     redis: RedisService
   ) {
-    this.live = createLiveCap(redis.getClient(), 'vp-sessions', {
-      max: config.getOrThrow<number>('VERIFICATION_MAX_LIVE_SESSIONS'),
-      lifetimeSeconds: SESSION_SECONDS,
-      clock
-    });
+    this.caps = createLiveCaps(redis.getClient(), clock);
+    this.cap = config.getOrThrow<number>('VERIFICATION_MAX_LIVE_SESSIONS');
   }
 
   @Post()
   @HttpCode(201)
   @RateLimit('sessionCreation')
-  @GlobalRateLimit()
-  async create(@Body() body: CreateSessionDto) {
-    if (!HOSTED_NAMES.has(body.verifier)) throw apiError(404, 'NOT_FOUND', 'No such verifier or scenario.');
+  async create(@Body() body: CreateSessionDto, @Req() req: { ip?: string }) {
+    if (!known(body.verifier, body.scenario)) throw apiError(404, 'NOT_FOUND', 'No such verifier or scenario.');
 
     const verifier = await this.verifiers.available(body.verifier);
 
     if (!verifier) throw unavailable('This verifier cannot create sessions at the moment.');
 
-    const slot = await this.live.reserve();
+    const id = randomBytes(16).toString('base64url');
+    const slot = await this.caps.reserve(KIND, id, SESSION_SECONDS, { cap: this.cap, perClient: { key: clientOf(req.ip), cap: SESSIONS_PER_CLIENT } });
 
     if (!slot.ok) {
-      throw apiError(503, 'UNAVAILABLE', 'Too many verification sessions are open; try again shortly.', { retryAfter: slot.retryAfterSeconds });
+      throw slot.scope === 'client'
+        ? apiError(429, 'RATE_LIMITED', 'This client has too many verification sessions open; wait for one to end.', { retryAfter: slot.retryAfterSeconds })
+        : apiError(503, 'UNAVAILABLE', 'Too many verification sessions are open; try again shortly.', { retryAfter: slot.retryAfterSeconds });
     }
 
     const created = await verifier.createSession({ scenario: body.scenario }).catch(async (error: unknown) => {
-      await this.live.release(slot.member).catch(() => undefined);
+      await this.caps.release(KIND, id).catch(() => undefined);
       throw error;
     });
 
     if (!created.ok) {
-      await this.live.release(slot.member);
+      await this.caps.release(KIND, id);
 
       if (created.reason === 'unknown_scenario') throw apiError(404, 'NOT_FOUND', 'No such verifier or scenario.');
 

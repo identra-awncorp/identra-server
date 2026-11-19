@@ -1,4 +1,4 @@
-// End to end over real HTTP: the Nest app listens on 127.0.0.1:47400; the WALLET is the SDK's
+// End to end over real HTTP: the Nest app listens on 127.0.0.1:IDENTRA_TEST_PORT (.env.test); the WALLET is the SDK's
 // own (@identra/sdk-app), reaching the canonical origin through createMappedFetch.
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -13,7 +13,7 @@ import { PrismaService } from '../src/infrastructure/prisma/prisma.service';
 import { RedisService } from '../src/infrastructure/redis/redis.service';
 import { ISSUER_CLOCK } from '../src/vc/vc.providers';
 import { adjustableClock, call, ISS, issueDiplomaTo, keysDir, LOCAL, login, newOffer, newWallet, offerState, PORT, wrongPin } from './e2e-world';
-import { createTestApp, TEST_PORTAL_PASSWORD } from './helpers';
+import { createTestApp, PROVISION_ENV } from './helpers';
 
 const issuerClock = adjustableClock();
 let app: NestExpressApplication;
@@ -26,7 +26,7 @@ before(async () => {
   await app.listen(PORT, '127.0.0.1');
   // The real provisioning command, as an operator runs it.
   execFileSync(process.execPath, [join(__dirname, '../src/scripts/demo-provision.js')], {
-    env: { ...process.env, DEMO_PORTAL_PASSWORD: TEST_PORTAL_PASSWORD },
+    env: { ...process.env, ...PROVISION_ENV },
     stdio: 'pipe'
   });
 });
@@ -130,21 +130,31 @@ describe('negative paths over real HTTP', () => {
     assert.equal((await offerState(student, offer.offerId)).body.status, 'expired');
   });
 
-  it('only the owner can poll an offer; a new offer supersedes the pending one', async () => {
+  it('only the session that created an offer sees it; a second offer does not end the first; DELETE cancels one', async () => {
     const owner = await login('sv001');
     const first = await newOffer(owner);
     const second = await newOffer(owner);
 
-    for (const token of [await login('sv002'), await login('phongdaotao')]) {
+    // Another visitor on the SAME public account, another student, the registrar: all 404.
+    for (const token of [await login('sv001'), await login('sv002'), await login('phongdaotao')]) {
       const res = await offerState(token, second.offerId);
 
       assert.deepEqual([res.status, res.body.code], [404, 'NOT_FOUND']);
+      assert.equal((await call('DELETE', `/v1/demo/school/offers/${first.offerId}`, { token })).status, 404);
     }
 
     assert.equal((await offerState(owner, 'A'.repeat(22))).status, 404);
-    assert.equal((await offerState(owner, first.offerId)).body.status, 'expired');
+    assert.equal((await offerState(owner, first.offerId)).body.status, 'pending');
     assert.equal((await offerState(owner, second.offerId)).body.status, 'pending');
+
+    const cancelled = await call('DELETE', `/v1/demo/school/offers/${first.offerId}`, { token: owner });
+    assert.deepEqual([cancelled.status, cancelled.body.offerId, cancelled.body.status], [200, first.offerId, 'expired']);
+    assert.ok(cancelled.body.serverTime);
+    assert.equal((await offerState(owner, first.offerId)).body.status, 'expired');
     assert.equal((await fetch(`${LOCAL}/issuers/truong-mau/offers/${first.offerId}`)).status, 404);
+    // Idempotent; the second offer is untouched.
+    assert.equal((await call('DELETE', `/v1/demo/school/offers/${first.offerId}`, { token: owner })).body.status, 'expired');
+    assert.equal((await fetch(`${LOCAL}/issuers/truong-mau/offers/${second.offerId}`)).status, 200);
     assert.equal((await call('POST', '/v1/demo/school/offers', { token: await login('phongdaotao') })).status, 403);
     evidence.pins.push(first.txCode, second.txCode);
   });
