@@ -1,11 +1,14 @@
 # Production stack for the VPS (ADR-0016 §3): api + Postgres + Redis.
 #
-#   docker compose --env-file /etc/identra/server.env -f docker-compose.prod.yml up -d --build
+#   IDENTRA_IMAGE_TAG=<tag> docker compose --env-file /etc/identra/server.env -f docker-compose.prod.yml up -d
 #
-# `--env-file` feeds the ${VAR:?...} substitutions below; `env_file:` hands the same file to
-# the api container. Every secret is required and has no default: Compose refuses to start
-# when one is missing. Without --env-file Compose would read ./.env, so always pass it.
-# The server itself also refuses to start with development secrets (src/config/env.validation.ts).
+# The api image is built beforehand with `docker build` (deploy/README.md, "Deploy"): Compose
+# never builds or pulls it. `--env-file` feeds the ${VAR:?...} substitutions below and the
+# optional settings listed without a value; the api container gets exactly the variables listed
+# here (the database and Redis passwords only inside their URLs). Every secret is required and
+# has no default: Compose refuses to start when one is missing. Without --env-file Compose would
+# read ./.env, so always pass it. The server itself also refuses to start with development
+# secrets (src/config/env.validation.ts).
 name: identra-prod
 
 # Bounded logs on every service (the 45 GB disk is shared).
@@ -15,22 +18,29 @@ x-logging: &logging
     max-size: "10m"
     max-file: "3"
 
-# Memory limits suit a 1 CPU / 3.8 GB host that also runs nginx and cloudflared.
+# Limits suit a 1 CPU / 3.8 GB host that also runs nginx and cloudflared.
 services:
   api:
-    build:
-      context: ..
-      dockerfile: identra-server/Dockerfile
-      target: prod
-    # Tag every deploy (IDENTRA_IMAGE_TAG=<git sha>) so it can be rolled back: deploy/README.md.
-    image: identra-prod-api:${IDENTRA_IMAGE_TAG:-latest}
+    # Tag every deploy (the server commit) so it can be rolled back: deploy/README.md.
+    image: identra-prod-api:${IDENTRA_IMAGE_TAG:?IDENTRA_IMAGE_TAG is required (deploy/README.md)}
+    pull_policy: never
     restart: unless-stopped
     logging: *logging
     mem_limit: 768m
-    # No `db push` and no seed in production: apply committed migrations, then start.
-    command: ["sh", "-c", "npx prisma migrate deploy && exec node dist/src/main.js"]
-    env_file:
-      - ${IDENTRA_ENV_FILE:-/etc/identra/server.env}
+    # Leaves a quarter of the one CPU to Postgres, Redis, nginx and cloudflared.
+    cpus: 0.75
+    pids_limit: 256
+    # The image's dedicated user; its files are root-owned and the root filesystem is read-only.
+    # Nothing at start-up writes outside /tmp (Prisma's migrate step included).
+    user: "10001:10001"
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    # The image's command: `prisma migrate deploy` (the local CLI, no npm, no network), then the
+    # server. No `db push` and no seed in production.
     environment:
       NODE_ENV: production
       # The server refuses to start when this is set and NODE_ENV is not production.
@@ -51,15 +61,44 @@ services:
       AUTH_REGISTRATION_TOKEN_SECRET: ${AUTH_REGISTRATION_TOKEN_SECRET:?AUTH_REGISTRATION_TOKEN_SECRET is required}
       PASSWORD_PEPPER: ${PASSWORD_PEPPER:?PASSWORD_PEPPER is required}
       OTP_HMAC_SECRET: ${OTP_HMAC_SECRET:?OTP_HMAC_SECRET is required}
+      # Optional (.env.production.example): taken from the env file when set there, else unset.
+      IDENTRA_ORG_API_KEY_HASHES:
+      OTP_DEMO_ENABLED:
+      OTP_DEMO_CODE:
+      OTP_DEMO_PHONE_ALLOWLIST:
+      APP_NAME:
+      API_PREFIX:
+      JWT_ACCESS_TTL_SECONDS:
+      JWT_REFRESH_TTL_DAYS:
+      AUTH_REGISTRATION_TOKEN_TTL_SECONDS:
+      PASSWORD_PEPPER_VERSION:
+      GRAPHQL_INTROSPECTION:
+      GRAPHQL_GRAPHIQL:
+      GRAPHQL_RATE_LIMIT_FAIL_CLOSED:
+      VERIFICATION_MAX_LIVE_SESSIONS:
+      ISSUANCE_MAX_LIVE_NONCES:
+      ISSUANCE_MAX_LIVE_OFFERS:
     ports:
       # nginx on the host proxies api-identra.awncorp.vn here; never bind 0.0.0.0.
       - "127.0.0.1:4000:4000"
     volumes:
-      # Signing keys live on the host, outside the repo and the image (ADR-0016 §6).
-      # The container runs as uid 1000 (`node`): the files must be readable by that uid.
+      # Signing keys live on the host, outside the repo and the image (ADR-0016 §6), owned by
+      # uid 10001 (deploy/README.md, "Keys").
       - /etc/identra/keys:/run/identra/keys:ro
     depends_on:
       db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # /v1/health answers 503 when Postgres or Redis is down (200 for ok and degraded).
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:4000/v1/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 60s
+      retries: 3
+
+  db:
         condition: service_healthy
       redis:
         condition: service_healthy

@@ -12,17 +12,17 @@
 !identra-server/prisma/migrations/migration_lock.toml
 !identra-server/prisma/migrations/*/migration.sql
 !identra-server/src/**/*.ts
-# The SDK: manifests and the built JavaScript of the two packages the server uses. No sources,
-# no tests, no .pki/ test keys, no node_modules (installed inside the image).
+# The SDK: its manifests, compiler settings and the TypeScript sources of its packages, built
+# inside the image (the sdk-build stage). No tests, examples, scripts, docs, no .pki/ test keys,
+# no node_modules or dist/ of the host (installed and built inside the image).
 !identra-sdk/package.json
 !identra-sdk/package-lock.json
+!identra-sdk/.npmrc
+!identra-sdk/tsconfig.json
+!identra-sdk/tsconfig.base.json
 !identra-sdk/packages/*/package.json
-!identra-sdk/packages/core/dist/**/*.js
-!identra-sdk/packages/core/dist/**/*.d.ts
-!identra-sdk/packages/core/dist/**/*.json
-!identra-sdk/packages/server/dist/**/*.js
-!identra-sdk/packages/server/dist/**/*.d.ts
-!identra-sdk/packages/server/dist/**/*.json
+!identra-sdk/packages/*/tsconfig.json
+!identra-sdk/packages/*/src/**/*.ts
 # Whatever matched above: never keys, env files, test PKIs or build caches (later lines win).
 **/*.pem
 **/*.key
@@ -30,3 +30,5 @@
 **/.pki
 **/.pki/**
 **/*.tsbuildinfo
+**/node_modules
+**/node_modules/**

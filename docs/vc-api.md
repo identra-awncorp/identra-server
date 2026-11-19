@@ -109,7 +109,7 @@ proof type `jwt` with ES256).
 | `GET /issuers/:name/jwks` | Keys that sign access tokens |
 | `GET /issuers/:name/offers/:offerId` | Credential Offer by reference; `404` once expired or used |
 | `POST /issuers/:name/token` | Pre-authorized code + `tx_code` → access token (300 s) |
-| `POST /issuers/:name/nonce` | `c_nonce` (300 s, single use); `503 temporarily_unavailable` with `Retry-After` while too many are outstanding (section 8) |
+| `POST /issuers/:name/nonce` | `c_nonce` (300 s, single use). Unauthenticated (OpenID4VCI 1.0 §7). `429 temporarily_unavailable` with `Retry-After` while this client holds 20 unused nonces, `503 temporarily_unavailable` with `Retry-After` while all clients together hold the global cap (section 8) |
 | `POST /issuers/:name/credential` | Proof of possession → `{ credentials: [{ credential }] }`, encrypted when the wallet asks |
 
 Rules:
@@ -135,37 +135,54 @@ Rules:
 A stand-in for a university's own student portal. Accounts are seeded sample
 data; nothing here is a real person.
 
-| Method and path | Auth | Response |
-|---|---|---|
-| `POST /v1/demo/school/login` `{ username, password }` | none, rate limited | `{ token, expiresAt, serverTime, role: "student" \| "registrar", profile }` |
-| `POST /v1/demo/school/offers` | student | `{ offerId, offerUri, txCode, expiresAt, serverTime }`; creating one cancels the student's previous pending offer; `503 UNAVAILABLE` with `Retry-After` while too many offers are open (section 8) |
-| `GET /v1/demo/school/offers/:offerId` | student (owner) | `{ status: "pending" \| "issued" \| "expired", serverTime }` |
-| `GET /v1/demo/school/credentials?limit&cursor` | student: own; registrar: all of the issuer | `{ items: [{ id, studentCode, studentName, issuedAt, status }], nextCursor }`, newest first, `limit` ≤ 100 |
+The three student accounts are shared by every visitor (their password is public), so
+everything a student creates belongs to the **portal session** that created it, not to the
+account: a session is one successful `POST /login`, identified by its `token`. Another session,
+even of the same account, does not see, poll, cancel or revoke it (it gets `404`).
 
-The portal token is an opaque bearer token (Redis, 30 minutes). The `txCode`
-is shown once in the response and stored only as a keyed hash.
+| Method and path | Auth | Body | Success | Errors |
+|---|---|---|---|---|
+| `POST /v1/demo/school/login` | none, rate limited | `{ username, password }` | `201 { token, expiresAt, serverTime, role: "student" \| "registrar", profile }` | `400 VALIDATION_FAILED`, `401 INVALID_CREDENTIALS`, `429 RATE_LIMITED`, `503 UNAVAILABLE` (also when the server is hashing too many passwords at once; retry after `Retry-After`) |
+| `POST /v1/demo/school/offers` | student | none | `201 { offerId, offerUri, txCode, expiresAt, serverTime }` | `403 FORBIDDEN` (registrar), `429 RATE_LIMITED` (this client already holds 5 live offers, or created 30 in the last 30 minutes), `503 UNAVAILABLE` (all clients together hold the cap); both with `Retry-After` |
+| `GET /v1/demo/school/offers/:offerId` | student, the session that created it | none | `200 { status: "pending" \| "issued" \| "expired", serverTime }` | `404 NOT_FOUND` (unknown, older than 30 minutes, or another session's) |
+| `DELETE /v1/demo/school/offers/:offerId` | student, the session that created it | none | `200 { offerId, status: "expired" \| "issued", serverTime }`: a pending offer is cancelled (its code stops working, its place is freed); an issued one stays issued; repeating it is harmless | `404 NOT_FOUND` as above |
+| `GET /v1/demo/school/credentials?limit&cursor` | student or registrar | none | `200 { items: [{ id, studentCode, studentName, issuedAt, status, canRevoke }], nextCursor }`, newest first, `limit` 1–100 (default 50), `nextCursor` `null` on the last page | `400 VALIDATION_FAILED` (limit, cursor) |
+| `POST /v1/demo/school/credentials/:credentialId/revoke` | student, the session the credential was issued in | none | `200 { id, status: "revoked", updatedAt }` | `403 FORBIDDEN` (registrar: use section 3), `404 NOT_FOUND` (unknown, another session's or another student's), `409 CONFLICT` (already revoked), `503 UNAVAILABLE` |
 
-An offer's state stays readable for 30 minutes after it was created: `pending`
-until the wallet collects it or 10 minutes pass, then `issued` or `expired`;
-after 30 minutes the route answers `404`. An offer whose code was redeemed but
-whose credential was never collected reads `expired` once the access token
-(300 s) would have expired. A server restart ends every pending offer (the PIN
-key lives only in memory): the portal reads `expired` and the wallet is told the
-offer expired; the student asks for a new one. Every portal answer is
-`Cache-Control: no-store`. A student may ask for a new offer at
-any time, including when they already hold a diploma: each collected offer is a
-new credential with its own status entry (a lost phone is handled by issuing
-again and revoking the old one). In `GET /v1/demo/school/credentials`,
-`status` is `valid`, `suspended` or `revoked`.
+Every route but `login` needs `Authorization: Bearer <token>`; a missing, unknown or expired
+token is `401 SESSION_EXPIRED`. Writes are rate limited per client (section 8).
 
-Seeded sample accounts (fictional people, public on purpose, shown on the
-portal's sign-in page): students `sv001`, `sv002`, `sv003` and registrar
-`phongdaotao`, all with the password `Identra@2026`. `profile` of a student:
+- **Login.** The portal token is an opaque bearer token (Redis, 30 minutes; only a hash of it
+  is stored). The `txCode` of an offer is shown once in its creation response and stored only as
+  a keyed hash.
+- **Offers.** A student session may hold several live offers at once: creating one never ends
+  another. An offer's state stays readable for 30 minutes after it was created: `pending` until
+  the wallet collects it or 10 minutes pass, then `issued` or `expired`; after 30 minutes the
+  route answers `404`. An offer whose code was redeemed but whose credential was never collected
+  reads `expired` once the access token (300 s) would have expired. A server restart ends every
+  pending offer (the PIN key lives only in memory): the portal reads `expired` and the wallet is
+  told the offer expired; the student asks for a new one. Each collected offer is a new
+  credential with its own status entry, also when the student already holds a diploma.
+- **Credentials listing.** A student session lists only the credentials issued from offers it
+  created (others of the same account are not listed); the registrar lists every credential of
+  its issuer. `status` is `valid`, `suspended` or `revoked`. `canRevoke` is `true` when the
+  session may revoke the item now: for a student every listed item that is not `revoked`, for
+  the registrar every item that is not `revoked`; `false` once revoked (revocation is final).
+- **Revocation by the student** ("I lost my phone, cancel that copy"): only revocation, only of
+  a credential issued in this session, final. Verifiers see it at once through this server and
+  within the status list's `ttl` (15 minutes) elsewhere.
+- **Registrar.** The registrar changes any diploma's status (`valid`, `suspended`, `revoked`)
+  through `POST /v1/issuers/truong-mau/credentials/:credentialId/status` (section 3) with its
+  portal token. A student token there is `403 FORBIDDEN`.
+- Every portal answer is `Cache-Control: no-store`.
+
+Seeded sample accounts (fictional people): students `sv001`, `sv002`, `sv003`, whose password
+is public (shown on the portal's sign-in page, `Identra@2026` on the demo deployment), and the
+registrar `phongdaotao`, whose password is private (set by the operator, never published; the
+public student password does not open it). `profile` of a student:
 `{ hoTen, ngaySinh, maSinhVien, nganh, hangTotNghiep, namTotNghiep, soHieuBang }`
 (the university's own record, the source of the diploma's claims); of the
-registrar: `{ hoTen, donVi }`. The registrar changes a diploma's status through
-`POST /v1/issuers/truong-mau/credentials/:credentialId/status` (section 3) with
-the portal token.
+registrar: `{ hoTen, donVi }`.
 
 ## 6. Presentation: OpenID4VP 1.0, cross-device
 
@@ -174,7 +191,7 @@ a client cannot ask for arbitrary claims.
 
 | Method and path | Auth | Purpose |
 |---|---|---|
-| `POST /v1/verification/sessions` `{ verifier, scenario }` | none, rate limited (section 8) | `201 { id, qr, expiresAt, serverTime }`, `Cache-Control: no-store` (the `id` reads the result); `503 UNAVAILABLE` with `Retry-After` while the verifier is not in a valid trust list or too many sessions are open |
+| `POST /v1/verification/sessions` `{ verifier, scenario }` | none, rate limited (section 8) | `201 { id, qr, expiresAt, serverTime }`, `Cache-Control: no-store` (the `id` reads the result); `400 VALIDATION_FAILED` for a malformed body, `404 NOT_FOUND` for an unknown verifier or scenario (neither uses any capacity); `429 RATE_LIMITED` with `Retry-After` while this client holds 10 open sessions; `503 UNAVAILABLE` with `Retry-After` while the verifier is not in a valid trust list or all clients together hold the cap |
 | `GET /v1/verification/sessions/:id` | knowledge of `id` | Session state and result |
 | `GET /oid4vp/request/:requestId` | none | `200 application/oauth-authz-req+jwt` (signed Request Object with `x5c`) |
 | `POST /oid4vp/response/:requestId` | none | `direct_post.jwt` body `response=<JWE>` → `200 {}` |
@@ -258,27 +275,50 @@ canonical origin, in-process; it never fetches a status list from another host.
 
 ## 8. Rate limits and capacity
 
-Per client and per route. A client is the IP address nginx passes on; an IPv6 /64 counts as one
-client (GraphQL's cost limiter too). Login 10/min, session creation 30/min, token endpoint
-120/min (visitors of a venue share one NAT address; PIN guessing is bounded by the 5 attempts
-per offer, section 4), other writes 60/min, reads 300/min (polling a session once per second and
-an offer every two seconds stays well inside). The public signed resources of section 3 and the
-product events allow 1200/min: verifiers behind one address fetch them, and they are cacheable.
-Exceeding → `429 RATE_LIMITED` (`temporarily_unavailable` on protocol routes) with
-`Retry-After`, and the fixed message `Too many requests; try again later.`
+Per client and per route. A client of the rate limits is the IP address nginx passes on; an
+IPv6 /64 counts as one client (GraphQL's cost limiter too). Login 10/min, session creation
+30/min, token endpoint 120/min (visitors of a venue share one NAT address; PIN guessing is
+bounded by the 5 attempts per offer, section 4), other writes 60/min, reads 300/min (polling a
+session once per second and an offer every two seconds stays well inside). The public signed
+resources of section 3 and the product events allow 1200/min: verifiers behind one address
+fetch them, and they are cacheable. Exceeding → `429 RATE_LIMITED` (`temporarily_unavailable`
+on protocol routes) with `Retry-After`, and the fixed message `Too many requests; try again
+later.` GraphQL over its cost budget answers HTTP `429` too (`extensions.code: RATE_LIMITED`,
+`Retry-After`). The portal hashes at most two passwords at once; a sign-in beyond that is `503
+UNAVAILABLE` with `Retry-After: 1` (the per-client login limit applies before any hashing).
 
-Anonymous protocol state lives in Redis (128 MB, `noeviction`: when full, writes fail). Its cost
-is bounded across all clients, whatever the number of addresses:
+Anonymous protocol state lives in Redis (128 MB, `noeviction`: when full, writes fail). Its
+cost is bounded by a **global cap** per kind (the memory bound, whatever the number of
+addresses), and inside it each client holds at most a fixed **share**, enforced in the same
+atomic reservation, so one client (or ten) cannot use up what the others need. A client of the
+shares is an IPv4 address or an IPv6 **/56** (256 /64s are one customer at most ISPs). A request
+is checked completely (body, verifier, scenario, session) before it reserves anything; a
+refused one stores nothing.
 
-| State | Bound | Redis bytes each (measured) | Worst case |
-|---|---|---|---|
-| Verification session, first 5 minutes (signed request object, session key, record) | `VERIFICATION_MAX_LIVE_SESSIONS` live, default 2000; creation `VERIFICATION_SESSIONS_PER_MINUTE` in total, default 300/min | ≈ 7.4 KB | 2000 × 7.4 KB ≈ 15 MB |
-| Session after 5 minutes (record, retrieved marker, result) until 30 minutes | creations in 30 minutes: ≤ 9000 at 300/min | ≈ 0.3–1.2 KB | 9000 × 1.2 KB ≈ 11 MB |
-| `c_nonce` (5 minutes) | `ISSUANCE_MAX_LIVE_NONCES` live, default 2000 | ≈ 0.45 KB | ≈ 0.9 MB |
-| Offer, first 10 minutes (offer, code, status) | `ISSUANCE_MAX_LIVE_OFFERS` per issuer, default 500 (a cancelled offer keeps its place until its 10 minutes end) | ≈ 1.4 KB | ≈ 0.7 MB |
-| Offer status until 30 minutes | ≤ 3 × 500 offers | ≈ 0.4 KB | ≈ 0.6 MB |
+| State | Global cap (env, default) | Per client | A place is freed | Redis bytes each | Worst case |
+|---|---|---|---|---|---|
+| Verification session, first 5 minutes (signed request object, session key, record) | `VERIFICATION_MAX_LIVE_SESSIONS`, 2000 | 10 | after 5 minutes, answered or not (the place is also the creation budget) | ≈ 7.4 KB (measured) | 2000 × 7.4 KB ≈ 15 MB |
+| Session after 5 minutes (record, retrieved marker, result) until 30 minutes | creations in 30 minutes ≤ 6 × 2000 = 12 000 | | | ≈ 0.3–1.2 KB (measured) | 12 000 × 1.2 KB ≈ 14 MB |
+| `c_nonce` (5 minutes) | `ISSUANCE_MAX_LIVE_NONCES`, 2000 | 20 | when a proof uses it, or after 5 minutes | ≈ 0.45 KB (measured) | ≈ 0.9 MB |
+| Offer, first 10 minutes (offer, code) | `ISSUANCE_MAX_LIVE_OFFERS` per issuer, 500 | 5 | when redeemed (token endpoint), cancelled (`DELETE`, five wrong PINs, restart) or after 10 minutes | ≈ 1.4 KB (measured) | ≈ 0.7 MB |
+| Offer status and portal records until 30 minutes | 10 × `ISSUANCE_MAX_LIVE_OFFERS` = 5000 created in 30 minutes | 30 | after 30 minutes | ≈ 0.6 KB (status 0.4 + portal owner record 0.18, measured) | ≈ 3 MB |
+| Bookkeeping of the caps (sorted sets, owner hash) | one entry per place above, 9500 | | with its place | ≈ 0.4 KB (measured, every client distinct) | ≈ 3.8 MB |
 
-About 28 MB, under a quarter of `maxmemory`. Beyond a bound the route answers `503` with
-`Retry-After` (the seconds until the oldest live entry ends) and nothing is stored; sign-in,
+About 38 MB, under a third of `maxmemory`. The global per-minute budget of session creation
+(`VERIFICATION_SESSIONS_PER_MINUTE`) is gone: it counted refused requests too, so 300 malformed
+POSTs from ten addresses blocked every visitor for a minute; the live cap now bounds creations
+by itself (a place is held 5 minutes, so at most 2000 per 5 minutes, 12 000 per 30). Beyond a
+share the route answers `429` (`RATE_LIMITED` under `/v1`, `temporarily_unavailable` on the
+nonce endpoint), beyond a global cap `503` (`UNAVAILABLE` / `temporarily_unavailable`), both
+with `Retry-After` (the seconds until the oldest entry of that share or cap ends); sign-in,
 issuance and everything else keep their share of Redis. `/v1/health` reports `redis: degraded`
 above 80 % of `maxmemory` or when a write is refused (checked every 10 s).
+
+What remains: an attacker with many addresses can still fill a global cap (about 100 addresses
+for nonces or live offers, 167 for the 30-minute offer records, 200 for sessions) and keep that
+kind refused for everyone while the flood lasts (no data is lost, nothing else is affected).
+The server cannot tell such clients from real ones; the remedy is a rate limit at the edge
+(deploy/README.md, "Edge rate limits": Cloudflare rules for `POST /issuers/*/nonce`,
+`POST /v1/verification/sessions`, `POST /v1/demo/school/login` and
+`POST /v1/demo/school/offers`). Visitors behind one NAT address (a venue's Wi-Fi) share one
+client's shares: 5 live offers, 10 open sessions.

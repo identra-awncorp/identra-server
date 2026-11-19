@@ -67,7 +67,8 @@ mkdir -m 700 ~/.identra/server-keys && for f in orgs trust-list-signer root.cert
 
 Then set `IDENTRA_KEYS_DIR=$HOME/.identra/server-keys` (absolute path) in `.env`. Without it the
 server runs without those routes. Sample data, after `npm run build`:
-`DEMO_PORTAL_PASSWORD='Identra@2026' npm run demo:provision` (school portal accounts) and
+`DEMO_PORTAL_PASSWORD='Identra@2026' DEMO_PORTAL_REGISTRAR_PASSWORD='<private, 12+ characters>' npm run demo:provision`
+(school portal accounts: the students' public password and the registrar's own) and
 `DEMO_PRODUCT_PROVISION=yes npm run demo:provision-product` (the sample product chain; add
 `DEMO_PRODUCT_SERIAL=SN-2026-000002 DEMO_PRODUCT_STAGES=2` for a product still in progress).
 
@@ -207,6 +208,9 @@ cp .env.test.example .env.test
 npm test
 ```
 
+The end-to-end files listen on `127.0.0.1:47400`; on a shared machine pick a free port with
+`IDENTRA_TEST_PORT` in `.env.test` (and other container ports in its URLs).
+
 The setup step applies the migrations (`prisma migrate deploy`), empties every table and the
 Redis database (it refuses unless `.env.test` points at a local `*test*` database), and stops
 with an error if either database is unreachable.
@@ -226,18 +230,16 @@ docker rm -f -v identra-s0-pg identra-s0-redis
 ## Production
 
 The VPS runs `docker-compose.prod.yml` (ADR-0016); `docker-compose.yml` is for developer
-machines only. Both build from the parent directory (`context: ..`). Secrets come from
+machines only. The production image is built on the VPS with `docker build` from the parent
+directory holding `identra-sdk/` and `identra-server/` at pinned commits (the SDK is compiled
+inside the image; the VPS needs only Docker); Compose then runs that tag. Secrets come from
 `/etc/identra/server.env` (template: `.env.production.example`), signing keys from
-`/etc/identra/keys`:
+`/etc/identra/keys` (owned by uid 10001, the container's user). The api container runs
+`prisma migrate deploy` and then the server; schema changes ship as migrations in
+`prisma/migrations`, never `db push`.
 
-```bash
-docker compose --env-file /etc/identra/server.env -f docker-compose.prod.yml up -d --build
-```
-
-The api container runs `prisma migrate deploy` and then the server; schema changes ship as
-migrations in `prisma/migrations`, never `db push`.
-
-nginx configuration, deploy, image rollback and the failed-migration runbook:
+The exact procedure (layout, build with the two commits, first boot, provisioning, update,
+rollback), nginx, the Cloudflare rules, rotation and the failed-migration runbook:
 `deploy/README.md`.
 
 ## Architecture
