@@ -9,7 +9,6 @@ import request from 'supertest';
 
 import { verifyTrustListToken } from '@identra/sdk-core';
 import { PKI, Pki } from '../src/vc/vc.providers';
-import { VERIFIERS } from '../src/vc/verifiers';
 import { createTestApp, testKeysDir } from './helpers';
 
 // The source is a copy (public data, no keys): the demo PKI itself is read-only for tests.
@@ -30,12 +29,9 @@ let app: NestExpressApplication;
 let pki: Pki;
 
 before(async () => {
-  // The source file does not exist yet: the first request has nothing good to serve.
-  // No hosted verifier here: constructing one needs a trust list, and this test starts without one.
-  app = await createTestApp(
-    { IDENTRA_KEYS_DIR: keysDir, IDENTRA_TRUST_LIST_SOURCE: sourcePath },
-    { override: (builder) => builder.overrideProvider(VERIFIERS).useValue(new Map()) }
-  );
+  // The source file does not exist yet: the first request has nothing good to serve. The server
+  // still starts (M1): its verifier waits, degraded, for a trust list that lists it.
+  app = await createTestApp({ IDENTRA_KEYS_DIR: keysDir, IDENTRA_TRUST_LIST_SOURCE: sourcePath });
   pki = app.get(PKI);
 });
 
@@ -45,15 +41,35 @@ after(async () => {
 });
 
 const http = () => request(app.getHttpServer());
+let ipSeq = 0;
+const createSession = () =>
+  http()
+    .post('/v1/verification/sessions')
+    .set('X-Forwarded-For', `198.51.100.${(ipSeq += 1)}`)
+    .send({ verifier: 'nha-tuyen-dung-mau', scenario: 'ung-tuyen' });
+const verifierHealth = async () => (await http().get('/v1/health')).body.services.verifier.status as string;
 const verify = (token: string) =>
   verifyTrustListToken(token, { chainValidator: pki.chainValidator, verifier: pki.verifier, now: new Date() });
 
 describe('GET /trust-list', () => {
   it('is 503 while no valid trust list was ever produced, and health says down', async () => {
-    const res = await http().get('/trust-list').expect(503);
+    const res = await http().get('/trust-list').set('Origin', 'https://identra.awncorp.vn').expect(503);
 
     assert.equal(res.body.error, 'temporarily_unavailable');
+    // L3: the error of a public resource is readable from any origin too.
+    assert.equal(res.headers['access-control-allow-origin'], '*');
+    assert.equal(res.headers['access-control-allow-credentials'], undefined);
+    assert.equal(res.headers['access-control-expose-headers'], 'Date, Retry-After');
     assert.equal((await http().get('/v1/health')).body.services.trustList.status, 'down');
+  });
+
+  it('the server started anyway (M1): sessions answer 503 and health says verifier down', async () => {
+    const created = await createSession().expect(503);
+
+    assert.deepEqual([created.body.code, created.headers['retry-after']], ['UNAVAILABLE', '1']);
+    assert.equal((await http().get('/v1/health')).body.services.verifier.status, 'down');
+    // Everything else is up: sign-in does not depend on the trust list.
+    await http().post('/v1/auth/register/start').set('X-Forwarded-For', '198.51.100.7').send({ phone: '+84900000123', device: { deviceId: 'test-m1', platform: 'ios' } }).expect(201);
   });
 
   let firstToken = '';
@@ -135,5 +151,29 @@ describe('GET /trust-list', () => {
     }
 
     assert.equal((await http().get('/v1/health')).body.services.trustList.status, 'up');
+  });
+});
+
+describe('the hosted verifier follows the trust list (M1, L2)', () => {
+  it('is built as soon as a trust list lists it, without waiting for a retry period', async () => {
+    writeSource(sourceText);
+
+    const created = await createSession().expect(201);
+
+    assert.ok(created.body.id);
+    assert.equal(await verifierHealth(), 'up');
+  });
+
+  it('a newly signed list without it stops session creation and health at once; listed again, both recover', async () => {
+    const source = JSON.parse(sourceText);
+
+    writeSource(JSON.stringify({ ...source, verifiers: [] }));
+    // Health first: it reads the new token, so the verifier is rebuilt against it right away.
+    assert.equal(await verifierHealth(), 'down');
+    assert.equal((await createSession().expect(503)).body.code, 'UNAVAILABLE');
+
+    writeSource(sourceText);
+    await createSession().expect(201);
+    assert.equal(await verifierHealth(), 'up');
   });
 });

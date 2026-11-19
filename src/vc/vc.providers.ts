@@ -1,4 +1,4 @@
-import { readdirSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 
 import { Logger, Provider } from '@nestjs/common';
@@ -21,6 +21,8 @@ import {
   type StatusListService,
   type TrustListService
 } from '@identra/sdk-server';
+import { isDependencyDown } from '../common/http-errors';
+import { HOSTED_ISSUERS, HOSTED_VERIFIERS } from './hosted-issuers';
 import { createOwnFetch } from './own-fetch';
 import { createPrismaStatusListStorage } from './status-storage';
 
@@ -49,10 +51,55 @@ export interface Pki {
   hasher: typeof webCryptoHasher;
   random: typeof webCryptoRandom;
   clock: Clock;
+  /**
+   * Hosted organisations that cannot sign for one of their purposes (key or certificate missing
+   * or invalid), with the failed purposes. Empty in production, which refuses to start instead;
+   * elsewhere these organisations' routes answer 503 and health says `down`.
+   */
+  unavailable: ReadonlyMap<string, string>;
 }
 
 const logger = new Logger('Pki');
-const PURPOSE_FILES = { vc: ['vc', 'vc-product'], status: ['status'], request: ['request'] } as const;
+
+type Purpose = 'vc' | 'status' | 'request';
+
+/**
+ * What every hosted organisation must be able to sign with: issuers `vc` (an OpenID4VCI issuer
+ * from `vc.*`, a product issuer from `vc-product.*`) and `status`, verifiers `request`.
+ */
+const REQUIRED: ReadonlyArray<{ org: string; purposes: Purpose[]; vcFile?: 'vc' | 'vc-product' }> = [
+  ...HOSTED_ISSUERS.map((i) => ({ org: i.name, purposes: ['vc', 'status'] as Purpose[], vcFile: i.kind === 'openid4vci' ? ('vc' as const) : ('vc-product' as const) })),
+  ...HOSTED_VERIFIERS.map((v) => ({ org: v.name, purposes: ['request'] as Purpose[] }))
+];
+
+/**
+ * M3: loads every key of every hosted organisation (the key store validates each certificate
+ * chain for its profile and that the key matches it). Returns the organisations that cannot sign,
+ * each with the failed purposes and the SDK's reason (file names and codes, never key content).
+ */
+async function checkHostedOrganisations(dir: string, keyStore: IssuerKeyStore): Promise<Map<string, string>> {
+  const unavailable = new Map<string, string>();
+
+  for (const { org, purposes, vcFile } of REQUIRED) {
+    const failed: string[] = [];
+
+    for (const purpose of purposes) {
+      try {
+        if (purpose === 'vc' && vcFile && !existsSync(join(dir, 'orgs', org, `${vcFile}.key.pem`))) {
+          throw new Error(`a ${vcFile === 'vc' ? 'credential' : 'product'} issuer signs with orgs/${org}/${vcFile}.key.pem, which is missing`);
+        }
+
+        await keyStore.signer(org, purpose);
+      } catch (error) {
+        failed.push(`${purpose}: ${error instanceof Error ? error.message : 'unknown error'}`);
+      }
+    }
+
+    if (failed.length > 0) unavailable.set(org, failed.join('; '));
+  }
+
+  return unavailable;
+}
 
 /**
  * ADR-0015 §2, ADR-0016 §6: the Root and Issuing CA keys never live on the server. A `ca/`
@@ -73,51 +120,56 @@ export function refuseCaKeys(dir: string, depth = 0): void {
 }
 
 /**
- * Loads every key of the store (each organisation's keys found on disk and the trust-list
- * signer), so a missing, unreadable or invalid key stops the startup instead of the first
- * request. Messages name files and SDK error codes only, never key material.
+ * Loads the root, the trust-list signer and every key of every hosted organisation at startup.
+ * A missing or invalid key of a hosted organisation stops a production start (a server that
+ * cannot sign for an organisation it hosts must not pretend); elsewhere it is logged as an error
+ * and that organisation is `unavailable`. Messages name organisations, purposes, files and SDK
+ * error codes only, never key material.
  */
 async function loadPki(config: ConfigService, clock: Clock): Promise<Pki> {
   const dir = config.getOrThrow<string>('IDENTRA_KEYS_DIR');
   const baseUrl = config.getOrThrow<string>('IDENTRA_PUBLIC_BASE_URL');
+  const production = config.get<string>('NODE_ENV') === 'production';
+  let unavailable: Map<string, string>;
+  let keyStore: IssuerKeyStore;
+  let trustedRoots: Uint8Array[];
 
   try {
     refuseCaKeys(dir);
 
-    const keyStore = createFileKeyStore(dir);
-    const trustedRoots = keyStore.trustedRoots();
-    const organisations = readdirSync(join(dir, 'orgs'), { withFileTypes: true }).filter((e) => e.isDirectory());
+    keyStore = createFileKeyStore(dir);
+    trustedRoots = keyStore.trustedRoots();
 
     await keyStore.trustListSigner();
-
-    for (const org of organisations) {
-      const files = readdirSync(join(dir, 'orgs', org.name));
-
-      for (const [purpose, names] of Object.entries(PURPOSE_FILES)) {
-        if (names.some((name) => files.includes(`${name}.key.pem`))) {
-          await keyStore.signer(org.name, purpose as keyof typeof PURPOSE_FILES);
-        }
-      }
-    }
-
-    logger.log(`Loaded the keys of ${organisations.length} organisations and the trust-list signer`);
-
-    return {
-      baseUrl,
-      issuerUri: (name) => `${baseUrl}/issuers/${name}`,
-      keyStore,
-      trustedRoots,
-      chainValidator: createCertificateChainValidator({ trustedRoots, verifier: webCryptoVerifier, hasher: webCryptoHasher }),
-      verifier: webCryptoVerifier,
-      hasher: webCryptoHasher,
-      random: webCryptoRandom,
-      clock
-    };
+    unavailable = await checkHostedOrganisations(dir, keyStore);
   } catch (error) {
     const reason = error instanceof Error ? error.message : 'unknown error';
 
     throw new Error(`Credential keys in IDENTRA_KEYS_DIR are not usable: ${reason}`);
   }
+
+  const problems = [...unavailable].map(([org, reason]) => `${org} (${reason})`);
+
+  if (problems.length > 0 && production) {
+    throw new Error(`Credential keys in IDENTRA_KEYS_DIR are not usable for hosted organisations: ${problems.join(', ')}`);
+  }
+
+  for (const problem of problems) logger.error(`Hosted organisation cannot sign, its routes answer 503: ${problem}`);
+
+  logger.log(`Loaded the keys of ${REQUIRED.length - unavailable.size} of ${REQUIRED.length} hosted organisations and the trust-list signer`);
+
+  return {
+    baseUrl,
+    issuerUri: (name) => `${baseUrl}/issuers/${name}`,
+    keyStore,
+    trustedRoots,
+    chainValidator: createCertificateChainValidator({ trustedRoots, verifier: webCryptoVerifier, hasher: webCryptoHasher }),
+    verifier: webCryptoVerifier,
+    hasher: webCryptoHasher,
+    random: webCryptoRandom,
+    clock,
+    unavailable
+  };
 }
 
 /** How long a reader of a status list may wait (signing can queue behind a writer's lock). */
@@ -153,22 +205,28 @@ function createStatusProblems(): StatusProblems {
   };
 }
 
-/** Thrown when a status list cannot be served within the bound and no earlier token is held. */
-export class StatusListBusyError extends Error {}
+/**
+ * Thrown when a status list cannot be served now (503): busy beyond the bound, or not signable
+ * (the organisation's status key is unusable, or signing failed), with no earlier token held.
+ */
+export class StatusListUnavailableError extends Error {}
 
 /**
  * token() re-signs after a change and records the iat on the list row, which waits while a
  * status change holds that row's lock. Readers (the public GET, the own verifier) therefore
  * wait at most STATUS_TOKEN_WAIT_MS and then get the last token this process served for the
  * list: valid, signed, merely without the change that is still being committed. The signing
- * goes on in the background and refreshes the held token.
+ * goes on in the background and refreshes the held token. When token() fails (Postgres down,
+ * a signing failure) the held token is served too; a signing failure is reported (health `down`).
  */
-function withBoundedTokens(service: StatusListService): StatusListService {
+function withBoundedTokens(service: StatusListService, pki: Pki, problems: StatusProblems): StatusListService {
   const held = new Map<string, string>();
 
   return {
     ...service,
     async token(issuer, n) {
+      if (pki.unavailable.has(issuer)) throw new StatusListUnavailableError('the organisation cannot sign status lists');
+
       const key = `${issuer}/${n}`;
       const fresh = service.token(issuer, n).then((token) => {
         if (token !== null) held.set(key, token);
@@ -179,11 +237,15 @@ function withBoundedTokens(service: StatusListService): StatusListService {
       const late = new Promise<'late'>((resolve) => {
         timer = setTimeout(() => resolve('late'), STATUS_TOKEN_WAIT_MS);
       });
+      let failure: unknown;
 
       try {
         const first = await Promise.race([fresh, late]);
 
         if (first !== 'late') return first;
+      } catch (error) {
+        failure = error;
+        if (!isDependencyDown(error)) problems.report(issuer, 'token_failed');
       } finally {
         clearTimeout(timer);
       }
@@ -192,9 +254,10 @@ function withBoundedTokens(service: StatusListService): StatusListService {
 
       const previous = held.get(key);
 
-      if (previous === undefined) throw new StatusListBusyError('status list is busy');
+      if (previous !== undefined) return previous;
+      if (failure !== undefined && isDependencyDown(failure)) throw failure;
 
-      return previous;
+      throw new StatusListUnavailableError('status list cannot be served now');
     }
   };
 }
@@ -219,7 +282,9 @@ export const vcProviders: Provider[] = [
           clock: pki.clock,
           // The held token is served meanwhile; the reason (never content) goes to the log and health.
           onError: (reason, issuer) => problems.report(issuer, reason)
-        })
+        }),
+        pki,
+        problems
       )
   },
   { provide: STATUS_PROBLEMS, useFactory: createStatusProblems },
@@ -230,6 +295,8 @@ export const vcProviders: Provider[] = [
       async check() {
         const nowS = pki.clock.now().getTime() / 1000;
 
+        // An issuer that cannot sign its lists, or a signing problem in the last hour.
+        if (HOSTED_ISSUERS.some((i) => pki.unavailable.has(i.name))) return 'down';
         if (problems.recent(pki.clock.now().getTime())) return 'down';
 
         const lists = await prisma.vcStatusList.findMany({ select: { issuerName: true, listNumber: true } });

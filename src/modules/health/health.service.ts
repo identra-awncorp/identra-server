@@ -7,8 +7,17 @@ import { TRUST_LIST_MONITOR, TrustListMonitor } from '../../vc/trust-list';
 import { STATUS_MONITOR, StatusMonitor } from '../../vc/vc.providers';
 import { VERIFIER_MONITOR, VerifierMonitor } from '../../vc/verifiers';
 
+/** Redis is `degraded` above this share of `maxmemory` (ADR-0016: 128 MB, `noeviction`). */
+export const REDIS_MEMORY_WARN_SHARE = 0.8;
+
+const field = (info: string, name: string) => Number(new RegExp(`^${name}:(\\d+)`, 'm').exec(info)?.[1] ?? NaN);
+
 @Injectable()
 export class HealthService {
+  /** How long a memory verdict is kept: INFO and a probe write at most this often. Tests set 0. */
+  static memoryProbeEveryMs = 10_000;
+  private memory?: { at: number; state: 'up' | 'degraded' };
+
   constructor(
     private readonly prisma: PrismaService,
     private readonly redis: RedisService,
@@ -60,6 +69,31 @@ export class HealthService {
     return { trustList: { status: t }, statusLists: { status: s }, verifier: { status: v } };
   }
 
+  /**
+   * `degraded` when used memory is above 80 % of maxmemory, or a write is refused (OOM under
+   * `noeviction`): reads and pings still work, so a ping alone would say `up` while every
+   * sign-in, offer and session fails. Cached for memoryProbeEveryMs.
+   */
+  private async checkRedisMemory(): Promise<'up' | 'degraded'> {
+    const now = Date.now();
+
+    if (this.memory && now - this.memory.at < HealthService.memoryProbeEveryMs) return this.memory.state;
+
+    const client = this.redis.getClient();
+    const info = await client.info('memory');
+    const used = field(info, 'used_memory');
+    const max = field(info, 'maxmemory');
+    const writable = await client.set('health:probe', '1', 'PX', 10_000).then(
+      () => true,
+      () => false
+    );
+    const state = !writable || (max > 0 && used > max * REDIS_MEMORY_WARN_SHARE) ? 'degraded' : 'up';
+
+    this.memory = { at: now, state };
+
+    return state;
+  }
+
   private async checkDatabase() {
     try {
       await this.prisma.$queryRaw`SELECT 1`;
@@ -75,7 +109,9 @@ export class HealthService {
     try {
       const response = await this.redis.ping();
 
-      return { status: response === 'PONG' ? ('up' as const) : ('degraded' as const) };
+      if (response !== 'PONG') return { status: 'degraded' as const };
+
+      return { status: await this.checkRedisMemory() };
     } catch {
       // Public endpoint: never echo driver errors (they name hosts and ports).
       return { status: 'down' as const };

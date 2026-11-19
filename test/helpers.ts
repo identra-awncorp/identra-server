@@ -40,9 +40,10 @@ export async function createTestApp(
   await app.init();
 
   if (!keepRateLimits) {
-    // Counters are shared through Redis; every test file starts with a clean budget.
+    // Counters and the live-state caps are shared through Redis; every test file starts with a
+    // clean budget (after the app's own startup, which ends the offers of a previous process).
     const redis = app.get(RedisService).getClient();
-    const keys = await redis.keys('throttle:*');
+    const keys = [...(await redis.keys('throttle:*')), ...(await redis.keys('state:live:*'))];
 
     if (keys.length > 0) {
       await redis.del(...keys);

@@ -40,7 +40,8 @@ FROM base AS build
 COPY identra-server/prisma ./prisma
 RUN npx prisma generate
 COPY identra-server/ .
-RUN npm run build
+# Source maps and the incremental-build cache are for developers, not for the image.
+RUN npm run build && find dist \( -name '*.js.map' -o -name '*.tsbuildinfo' \) -delete
 RUN npm prune --omit=dev
 
 FROM node:24-alpine AS prod

@@ -39,8 +39,16 @@ Sample organisations (all operated by Identra, certificates carry "DEMO"):
   `FORBIDDEN` (403), `NOT_FOUND` (404), `CONFLICT` (409), `VALIDATION_FAILED`
   (400, also for malformed JSON), `PAYLOAD_TOO_LARGE` (413), `RATE_LIMITED` (429, with a `Retry-After` header in seconds, exposed to
   browsers through `Access-Control-Expose-Headers`), `INTERNAL_ERROR` (500),
-  `UNAVAILABLE` (503). A missing, unknown or expired bearer token is always
+  `UNAVAILABLE` (503, with `Retry-After`). A missing, unknown or expired bearer token is always
   `401 SESSION_EXPIRED`; a valid one without the right to do this is `403 FORBIDDEN`.
+- When Postgres or Redis is unreachable, times out or (Redis) refuses writes because it is
+  full, a route that needs it answers at once (Redis commands give up after 1 s) with
+  `503 UNAVAILABLE` under `/v1`, `503 { "error": "temporarily_unavailable" }` on the protocol
+  routes, both with `Retry-After` (5 s for a store that is down); never `500`. What does not need the missing store
+  is still served (for example the trust list, and a status list from the token the server holds
+  when Postgres is down).
+- A path that exists with another method is `404` (`NOT_FOUND` under `/v1`, `not_found` on the
+  protocol routes), not `405`.
 - A `POST` that creates something answers `201`; a `POST` that changes state
   answers `200`.
 - Every response that carries an `expiresAt` also carries `serverTime` (both
@@ -52,8 +60,9 @@ Sample organisations (all operated by Identra, certificates carry "DEMO"):
   their specification (OAuth 2.0 `{ error, error_description }` for OpenID4VCI
   and OpenID4VP).
 - Public signed resources (trust list, status lists, product events, issuer
-  metadata) send `Access-Control-Allow-Origin: *` and
-  `Access-Control-Expose-Headers: Date`, and never use cookies.
+  metadata, JWKS, offers by reference) send `Access-Control-Allow-Origin: *` and
+  `Access-Control-Expose-Headers: Date, Retry-After` on every `GET` answer, errors (`400`,
+  `404`, `429`, `503`) included, and never use cookies.
 - Nothing logs claims, credentials, disclosures, KB-JWTs, PINs, pre-authorized
   codes or tokens. Logs carry identifiers, error codes and timings only.
 - Every identifier handed to a client is at least 128 bits from a CSPRNG.
@@ -70,12 +79,22 @@ Both are re-signed hourly and on every change. Cache lifetimes stay well below
 the `ttl` inside the tokens (3600 s and 900 s) so a revocation is never delayed
 by an intermediary longer than the token allows.
 
+A status list is signed at most once per second (its `iat` never repeats). Under rapid
+consecutive changes a public read may therefore return the token from just before the latest
+change for up to about a second, and while a change is being committed a read waits at most one
+second and then gets the last token served. The server's own verifier (section 6) and product
+store (section 7) always read the current state. A status list that cannot be signed at the
+moment (the issuer's key is unusable) and for which no earlier token is held is `503`.
+
 Changing a credential's status (issuer administrators only):
 
 `POST /v1/issuers/:name/credentials/:credentialId/status` with body
 `{ "status": "valid" | "revoked" | "suspended" }` → `200 { id, status, updatedAt }`.
 `revoked` is final: a later change is `409`. Authorisation: a portal session
 with the registrar role of that issuer (section 5) or the organisation API key.
+A change that could not be published (the issuer cannot sign its status lists) is
+refused with `503 UNAVAILABLE`, never accepted with `200`; so is a change that keeps
+waiting for another one on the same credential (`Retry-After: 1`).
 
 ## 4. Issuance: OpenID4VCI 1.0, pre-authorized code (unprefixed)
 
@@ -90,7 +109,7 @@ proof type `jwt` with ES256).
 | `GET /issuers/:name/jwks` | Keys that sign access tokens |
 | `GET /issuers/:name/offers/:offerId` | Credential Offer by reference; `404` once expired or used |
 | `POST /issuers/:name/token` | Pre-authorized code + `tx_code` → access token (300 s) |
-| `POST /issuers/:name/nonce` | `c_nonce` (300 s, single use) |
+| `POST /issuers/:name/nonce` | `c_nonce` (300 s, single use); `503 temporarily_unavailable` with `Retry-After` while too many are outstanding (section 8) |
 | `POST /issuers/:name/credential` | Proof of possession → `{ credentials: [{ credential }] }`, encrypted when the wallet asks |
 
 Rules:
@@ -99,6 +118,9 @@ Rules:
 - An offer lives 10 minutes. The pre-authorized code is single use. The
   `tx_code` is 6 digits; after 5 wrong attempts the offer is destroyed. Wrong
   code, wrong PIN, expired or reused → `400 { "error": "invalid_grant" }`.
+- `:name` is an OpenID4VCI issuer (`truong-mau`); every other name, the product
+  issuers included, is `404 not_found`. A hosted issuer that cannot sign at the
+  moment answers `503 temporarily_unavailable`.
 - One credential per access token. The proof JWT must be
   `typ: openid4vci-proof+jwt`, ES256, header `jwk`, `aud` = issuer identifier,
   `nonce` = an unused `c_nonce`. Its key becomes `cnf.jwk`.
@@ -116,7 +138,7 @@ data; nothing here is a real person.
 | Method and path | Auth | Response |
 |---|---|---|
 | `POST /v1/demo/school/login` `{ username, password }` | none, rate limited | `{ token, expiresAt, serverTime, role: "student" \| "registrar", profile }` |
-| `POST /v1/demo/school/offers` | student | `{ offerId, offerUri, txCode, expiresAt, serverTime }`; creating one cancels the student's previous pending offer |
+| `POST /v1/demo/school/offers` | student | `{ offerId, offerUri, txCode, expiresAt, serverTime }`; creating one cancels the student's previous pending offer; `503 UNAVAILABLE` with `Retry-After` while too many offers are open (section 8) |
 | `GET /v1/demo/school/offers/:offerId` | student (owner) | `{ status: "pending" \| "issued" \| "expired", serverTime }` |
 | `GET /v1/demo/school/credentials?limit&cursor` | student: own; registrar: all of the issuer | `{ items: [{ id, studentCode, studentName, issuedAt, status }], nextCursor }`, newest first, `limit` ≤ 100 |
 
@@ -125,7 +147,12 @@ is shown once in the response and stored only as a keyed hash.
 
 An offer's state stays readable for 30 minutes after it was created: `pending`
 until the wallet collects it or 10 minutes pass, then `issued` or `expired`;
-after 30 minutes the route answers `404`. A student may ask for a new offer at
+after 30 minutes the route answers `404`. An offer whose code was redeemed but
+whose credential was never collected reads `expired` once the access token
+(300 s) would have expired. A server restart ends every pending offer (the PIN
+key lives only in memory): the portal reads `expired` and the wallet is told the
+offer expired; the student asks for a new one. Every portal answer is
+`Cache-Control: no-store`. A student may ask for a new offer at
 any time, including when they already hold a diploma: each collected offer is a
 new credential with its own status entry (a lost phone is handled by issuing
 again and revoking the old one). In `GET /v1/demo/school/credentials`,
@@ -147,7 +174,7 @@ a client cannot ask for arbitrary claims.
 
 | Method and path | Auth | Purpose |
 |---|---|---|
-| `POST /v1/verification/sessions` `{ verifier, scenario }` | none, rate limited | `{ id, qr, expiresAt }` |
+| `POST /v1/verification/sessions` `{ verifier, scenario }` | none, rate limited (section 8) | `201 { id, qr, expiresAt, serverTime }`, `Cache-Control: no-store` (the `id` reads the result); `503 UNAVAILABLE` with `Retry-After` while the verifier is not in a valid trust list or too many sessions are open |
 | `GET /v1/verification/sessions/:id` | knowledge of `id` | Session state and result |
 | `GET /oid4vp/request/:requestId` | none | `200 application/oauth-authz-req+jwt` (signed Request Object with `x5c`) |
 | `POST /oid4vp/response/:requestId` | none | `direct_post.jwt` body `response=<JWE>` → `200 {}` |
@@ -186,7 +213,12 @@ a client cannot ask for arbitrary claims.
 - A session that nobody answered turns `expired` after 5 minutes and stays
   readable as `expired`; every session is deleted 30 minutes after it was
   created or verified, after which the route answers `404` (clients treat that
-  as expired).
+  as expired). After the 5 minutes only a small record (about 250 bytes) of an
+  unanswered session is kept; the signed request object is gone.
+- The server starts without a valid trust list or with its verifier not listed;
+  session creation is `503` until a trust list verifies and lists the verifier
+  (checked again on every newly signed trust list, otherwise at most every 30 s),
+  and `/v1/health` reports `verifier: down` meanwhile. Open sessions stay readable.
 - The server verifies against its own status lists directly, so a revocation
   made through this server is seen by the very next verification here. A third
   party that fetches the status list over HTTP may see it up to 15 minutes later
@@ -197,7 +229,8 @@ a client cannot ask for arbitrary claims.
 | Method and path | Auth | Purpose |
 |---|---|---|
 | `GET /v1/products/:gtin/:serial/events` | none | `{ gtin, serial, serverTime, events: ["<compact>", …] }` in chain order; `404` for an unknown product |
-| `POST /v1/products/:gtin/:serial/events` `{ credential }` | organisation API key | Appends one signed event after verifying it and its position in the chain |
+| `POST /v1/products/:gtin/:serial/events` `{ credential }` | organisation API key | `201 { seq, id }`: appends one signed event after verifying it and its position in the chain |
+| `GET /v1/issuers/:name/credentials?gtin&serial&limit&cursor` | API key of `:name` (a product issuer) | `{ items: [{ id, gtin, serial, seq, congDoan, status, createdAt }], nextCursor }`, that organisation's events, newest first, `limit` ≤ 100 (default 50); `gtin` and `serial` filter |
 
 The server is a store, not an authority: the page that shows a product verifies
 every event in the browser with `@identra/sdk-core` and the pinned root
@@ -205,6 +238,15 @@ certificate. The `POST` verification only keeps garbage out of the store: the
 existing chain must verify completely and the new event must extend it by
 exactly the next stage. `serverTime` is a hint for pages to warn about a wrong
 device clock; no verification decision uses it.
+
+An event's `id` is what an organisation revokes or suspends it with:
+`POST /v1/issuers/:name/credentials/:id/status` (section 3) with its own API key; the
+listing finds the ids of earlier events. Refusals of a `POST` carry the SDK's code in
+`reason` and the failing position in `index`: `409 CONFLICT` with `CHAIN_BROKEN` when the
+event does not extend the product by its next stage (or another one was stored first),
+`400 VALIDATION_FAILED` with the verification code otherwise, with
+`STATUS_NOT_ALLOCATED` for a status entry this server did not allocate for that issuer,
+and `STATUS_ALREADY_USED` for one another event already uses.
 
 `:gtin` is 14 digits with a valid check digit; `:serial` is 1–20 characters of
 the GS1 AI (21) character set, percent-encoded in the path. The QR code printed
@@ -214,10 +256,29 @@ All issuers of this deployment are hosted by this server. When it verifies a
 presentation or a product event it reads status lists only from its own
 canonical origin, in-process; it never fetches a status list from another host.
 
-## 8. Rate limits
+## 8. Rate limits and capacity
 
-Per client IP (the address nginx passes on) and per route: login 10/min,
-session creation 30/min, token endpoint 20/min, other writes 60/min, reads
-300/min (polling a session once per second and an offer every two seconds stays
-well inside). The public signed resources of section 3 and the product events
-allow 1200/min: verifiers behind one address fetch them, and they are cacheable. Exceeding → `429 RATE_LIMITED` with `Retry-After`.
+Per client and per route. A client is the IP address nginx passes on; an IPv6 /64 counts as one
+client (GraphQL's cost limiter too). Login 10/min, session creation 30/min, token endpoint
+120/min (visitors of a venue share one NAT address; PIN guessing is bounded by the 5 attempts
+per offer, section 4), other writes 60/min, reads 300/min (polling a session once per second and
+an offer every two seconds stays well inside). The public signed resources of section 3 and the
+product events allow 1200/min: verifiers behind one address fetch them, and they are cacheable.
+Exceeding → `429 RATE_LIMITED` (`temporarily_unavailable` on protocol routes) with
+`Retry-After`, and the fixed message `Too many requests; try again later.`
+
+Anonymous protocol state lives in Redis (128 MB, `noeviction`: when full, writes fail). Its cost
+is bounded across all clients, whatever the number of addresses:
+
+| State | Bound | Redis bytes each (measured) | Worst case |
+|---|---|---|---|
+| Verification session, first 5 minutes (signed request object, session key, record) | `VERIFICATION_MAX_LIVE_SESSIONS` live, default 2000; creation `VERIFICATION_SESSIONS_PER_MINUTE` in total, default 300/min | ≈ 7.4 KB | 2000 × 7.4 KB ≈ 15 MB |
+| Session after 5 minutes (record, retrieved marker, result) until 30 minutes | creations in 30 minutes: ≤ 9000 at 300/min | ≈ 0.3–1.2 KB | 9000 × 1.2 KB ≈ 11 MB |
+| `c_nonce` (5 minutes) | `ISSUANCE_MAX_LIVE_NONCES` live, default 2000 | ≈ 0.45 KB | ≈ 0.9 MB |
+| Offer, first 10 minutes (offer, code, status) | `ISSUANCE_MAX_LIVE_OFFERS` per issuer, default 500 (a cancelled offer keeps its place until its 10 minutes end) | ≈ 1.4 KB | ≈ 0.7 MB |
+| Offer status until 30 minutes | ≤ 3 × 500 offers | ≈ 0.4 KB | ≈ 0.6 MB |
+
+About 28 MB, under a quarter of `maxmemory`. Beyond a bound the route answers `503` with
+`Retry-After` (the seconds until the oldest live entry ends) and nothing is stored; sign-in,
+issuance and everything else keep their share of Redis. `/v1/health` reports `redis: degraded`
+above 80 % of `maxmemory` or when a write is refused (checked every 10 s).

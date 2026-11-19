@@ -2,6 +2,8 @@ import { isAbsolute, join } from 'node:path';
 
 import { z } from 'zod';
 
+import { HOSTED_ISSUERS } from '../vc/hosted-issuers';
+
 const booleanFromEnv = z.preprocess((value) => {
   if (typeof value === 'boolean') {
     return value;
@@ -96,6 +98,13 @@ const envSchema = z.object({
   // Comma list of `org:sha256hex`: the SHA-256 of each organisation's back-office API key.
   // Empty = no API-key access.
   IDENTRA_ORG_API_KEY_HASHES: z.string().default(''),
+  // Redis budget of the anonymous protocol state (docs/vc-api.md §8): live verification sessions
+  // (5 minutes each), session creations per minute across all clients, live c_nonces (5 minutes)
+  // and live offers per issuer (10 minutes).
+  VERIFICATION_MAX_LIVE_SESSIONS: z.coerce.number().int().positive().default(2000),
+  VERIFICATION_SESSIONS_PER_MINUTE: z.coerce.number().int().positive().default(300),
+  ISSUANCE_MAX_LIVE_NONCES: z.coerce.number().int().positive().default(2000),
+  ISSUANCE_MAX_LIVE_OFFERS: z.coerce.number().int().positive().default(500),
   OTP_TTL_SECONDS: z.coerce.number().int().positive().default(300),
   OTP_MAX_ATTEMPTS: z.coerce.number().int().positive().default(5),
   OTP_RESEND_COOLDOWN_SECONDS: z.coerce.number().int().positive().default(60),
@@ -164,6 +173,16 @@ export function validateEnv(config: Record<string, unknown>): Env {
 
     return { org: org!, hash: hash! };
   });
+
+  // A hash listed twice would make one key act for two organisations; an unknown name is a typo
+  // that silently locks an organisation out. Neither message echoes an entry.
+  if (new Set(apiKeyHashes.map((k) => k.hash)).size !== apiKeyHashes.length) {
+    throw new Error('Invalid environment variables: IDENTRA_ORG_API_KEY_HASHES lists the same key hash twice');
+  }
+
+  if (apiKeyHashes.some((k) => !HOSTED_ISSUERS.some((issuer) => issuer.name === k.org))) {
+    throw new Error('Invalid environment variables: IDENTRA_ORG_API_KEY_HASHES names an organisation that is not a hosted issuer');
+  }
 
   const resolved: Env = {
     ...env,

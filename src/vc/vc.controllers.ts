@@ -29,7 +29,7 @@ import { RateLimit, RateLimitFailClosed } from '../common/rate-limit';
 import { PortalSessions, readBearer } from '../demo-portal/portal-sessions';
 import type { StatusListService, TrustListService } from '@identra/sdk-server';
 import { VcCredentialsService } from './vc-credentials.service';
-import { STATUS_LIST_SERVICE, StatusListBusyError, TRUST_LIST_SERVICE } from './vc.providers';
+import { STATUS_LIST_SERVICE, StatusListUnavailableError, TRUST_LIST_SERVICE } from './vc.providers';
 
 const ISSUER_NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 const LIST_NUMBER = /^[1-9][0-9]{0,8}$/;
@@ -78,10 +78,10 @@ export class StatusListController {
     try {
       token = ISSUER_NAME.test(name) && LIST_NUMBER.test(n) ? await this.statusLists.token(name, Number(n)) : null;
     } catch (error) {
-      if (!(error instanceof StatusListBusyError)) throw error;
+      if (!(error instanceof StatusListUnavailableError)) throw error;
 
       res.setHeader('Retry-After', '1');
-      throw new ServiceUnavailableException('The status list is being updated.');
+      throw new ServiceUnavailableException('The status list cannot be served at the moment.');
     }
 
     if (token === null) throw new NotFoundException('No such status list.');

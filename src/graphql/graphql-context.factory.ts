@@ -1,4 +1,5 @@
 import { HttpException, Injectable } from '@nestjs/common';
+import { normalizeIp } from '@nestjs/throttler';
 import { GraphQLError } from 'graphql';
 
 import { AuthService } from '../modules/auth/auth.service';
@@ -33,7 +34,8 @@ export class GraphqlContextFactory {
       scopes: new Set(),
       ip,
       highAssurance: false,
-      rateLimitKey: `ip:${ip}`
+      // One budget per IPv4 address or IPv6 /64, as the REST limiter (docs/vc-api.md §8).
+      rateLimitKey: `ip:${normalizeIp(ip)}`
     };
 
     if (!authorization) {

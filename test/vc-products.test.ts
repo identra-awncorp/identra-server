@@ -66,6 +66,7 @@ const post = (serial: string, credential: string, org?: string, ip = `198.51.100
     headers: { 'content-type': 'application/json', 'x-forwarded-for': ip, ...(org ? { authorization: `Bearer ${KEYS[org]}` } : {}) },
     body: JSON.stringify({ credential })
   });
+const prisma = () => app.get(PrismaService);
 const codeAt = (checks: Array<{ id: string; code: string | null }>, id: string) => checks.find((c) => c.id === id)?.code;
 
 /** The next event of `serial`, signed in-process by the stage's organisation (or `override`). */
@@ -203,7 +204,8 @@ describe('POST /v1/products/:gtin/:serial/events', () => {
 
     // Right key, right stage.
     const ok = await post(serial, first, 'nha-san-xuat');
-    assert.deepEqual([ok.status, await ok.json()], [201, { seq: 0 }]);
+    const stored0 = (await prisma().productEvent.findFirstOrThrow({ where: { gtin: GTIN, serial, seq: 0 } })).id;
+    assert.deepEqual([ok.status, await ok.json()], [201, { seq: 0, id: stored0 }]);
 
     // The same stage again (a second san_xuat event).
     [code, body] = await status(await post(serial, await nextEvent(serial, []), 'nha-san-xuat'));
@@ -235,7 +237,9 @@ describe('POST /v1/products/:gtin/:serial/events', () => {
     assert.deepEqual([code, body.code, body.reason], [400, 'VALIDATION_FAILED', 'NOT_YET_VALID'], 'future');
 
     const done = await post(serial, genuine, 'phan-phoi');
-    assert.deepEqual([done.status, await done.json()], [201, { seq: 2 }]);
+    const doneBody = await done.json();
+    assert.deepEqual([done.status, Object.keys(doneBody), doneBody.seq], [201, ['seq', 'id'], 2]);
+    assert.match(doneBody.id, /^[A-Za-z0-9_-]{22}$/);
     assert.equal((await load(serial)).result?.state, 'verified');
   });
 
@@ -299,5 +303,115 @@ describe('revocation and tampering are visible on the very next load', () => {
     assert.equal(events[1]!.ok, false);
     assert.ok(['SIGNATURE_INVALID', 'MALFORMED'].includes(events[1]!.checks.find((c) => !c.ok)!.code!));
     assert.equal(codeAt(events[2]!.checks, 'product_chain'), 'CHAIN_BROKEN');
+  });
+});
+
+describe('review 3: ids, listing, refusals and public error headers', () => {
+  const asOrg = (org: string, path: string, init: RequestInit = {}) =>
+    fetch(`${LOCAL}${path}`, { ...init, headers: { 'content-type': 'application/json', authorization: `Bearer ${KEYS[org]}`, ...init.headers } });
+
+  it('an organisation finds its own event ids and revokes one (M2)', async () => {
+    const serial = await fullProduct();
+    const list = async (org: string, query: string) => asOrg(org, `/v1/issuers/${org}/credentials?${query}`);
+
+    const mine = await list('kiem-dinh', `gtin=${GTIN}&serial=${serial}`);
+    const body = await mine.json();
+    const row = await prisma().productEvent.findFirstOrThrow({ where: { gtin: GTIN, serial, seq: 1 } });
+
+    assert.equal(mine.status, 200);
+    assert.deepEqual(body, {
+      items: [{ id: row.id, gtin: GTIN, serial, seq: 1, congDoan: 'kiem_dinh', status: 'valid', createdAt: row.createdAt.toISOString() }],
+      nextCursor: null
+    });
+
+    // Paginated, newest first, only that organisation's events.
+    const first = await (await list('nha-san-xuat', 'limit=1')).json();
+    const second = await (await list('nha-san-xuat', `limit=1&cursor=${first.nextCursor}`)).json();
+    assert.equal(first.items.length, 1);
+    assert.notEqual(second.items[0].id, first.items[0].id);
+    assert.ok([...first.items, ...second.items].every((i: { congDoan: string }) => i.congDoan === 'san_xuat'));
+
+    const revoked = await asOrg('kiem-dinh', `/v1/issuers/kiem-dinh/credentials/${body.items[0].id}/status`, { method: 'POST', body: JSON.stringify({ status: 'revoked' }) });
+    assert.equal(revoked.status, 200);
+    assert.equal((await (await list('kiem-dinh', `gtin=${GTIN}&serial=${serial}`)).json()).items[0].status, 'revoked');
+
+    // Another organisation's key, a non-product issuer, no key, a bad filter.
+    assert.equal((await asOrg('phan-phoi', '/v1/issuers/kiem-dinh/credentials')).status, 403);
+    assert.equal((await asOrg('truong-mau', '/v1/issuers/truong-mau/credentials')).status, 403);
+    assert.equal((await asOrg('kiem-dinh', '/v1/issuers/truong-mau/credentials')).status, 404);
+    assert.equal((await fetch(`${LOCAL}/v1/issuers/kiem-dinh/credentials`)).status, 401);
+    assert.equal((await list('kiem-dinh', 'gtin=123')).status, 400);
+  });
+
+  it("one product organisation's key cannot change another's event, even by its id (issuerName filter)", async () => {
+    const serial = await fullProduct();
+    const kdEvent = await prisma().productEvent.findFirstOrThrow({ where: { gtin: GTIN, serial, seq: 1 } });
+    const res = await asOrg('nha-san-xuat', `/v1/issuers/nha-san-xuat/credentials/${kdEvent.id}/status`, { method: 'POST', body: JSON.stringify({ status: 'revoked' }) });
+
+    assert.deepEqual([res.status, (await res.json()).code], [404, 'NOT_FOUND']);
+    assert.equal((await prisma().productEvent.findUniqueOrThrow({ where: { id: kdEvent.id } })).status, 'valid');
+  });
+
+  it('an event whose status entry this server did not allocate: 400 STATUS_NOT_ALLOCATED; one already used: 400 STATUS_ALREADY_USED (L4)', async () => {
+    const sign = async (serial: string, status: { uri: string; idx: number }) =>
+      issueProductEvent({
+        signer: await pki.keyStore.signer('nha-san-xuat', 'vc'),
+        hasher: pki.hasher,
+        random: pki.random,
+        clock: pki.clock,
+        iss: pki.issuerUri('nha-san-xuat'),
+        status,
+        claims: { ma_san_pham: formatProductCode(GTIN, serial), cong_doan: 'san_xuat', thoi_diem: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z'), dia_diem: 'x', mo_ta: 'x' }
+      });
+    const allocated = await statusLists.allocate('nha-san-xuat');
+    const reserved = new Set((await prisma().vcStatusIndex.findMany({ where: { issuerName: 'nha-san-xuat', listNumber: allocated.n } })).map((r) => r.idx));
+    const free = [...Array(1000).keys()].find((idx) => !reserved.has(idx))!;
+
+    const serialA = `SN-A-${randomBytes(4).toString('hex')}`;
+    let res = await post(serialA, await sign(serialA, { uri: allocated.uri, idx: free }), 'nha-san-xuat');
+    assert.deepEqual([res.status, (await res.json()).reason], [400, 'STATUS_NOT_ALLOCATED']);
+
+    res = await post(serialA, await sign(serialA, { uri: allocated.uri, idx: allocated.idx }), 'nha-san-xuat');
+    assert.equal(res.status, 201);
+
+    const serialB = `SN-B-${randomBytes(4).toString('hex')}`;
+    res = await post(serialB, await sign(serialB, { uri: allocated.uri, idx: allocated.idx }), 'nha-san-xuat');
+    const refused = await res.json();
+    assert.deepEqual([res.status, refused.code, refused.reason, refused.index], [400, 'VALIDATION_FAILED', 'STATUS_ALREADY_USED', 0]);
+  });
+
+  it('the provisioning command refuses to run without DEMO_PRODUCT_PROVISION=yes and stores nothing', async () => {
+    const before = await prisma().productEvent.count();
+    const { DEMO_PRODUCT_PROVISION: _unset, ...env } = process.env;
+
+    assert.throws(
+      () => execFileSync(process.execPath, [join(__dirname, '../src/scripts/demo-provision-product.js')], { env: { ...env, IDENTRA_KEYS_DIR: keysDir, DEMO_PRODUCT_SERIAL: 'SN-GATE-1' }, stdio: 'pipe' }),
+      (e: { status?: number; stderr?: Buffer }) => e.status === 1 && /refuses to run: set DEMO_PRODUCT_PROVISION=yes/.test(String(e.stderr))
+    );
+    assert.equal(await prisma().productEvent.count(), before);
+  });
+
+  it('errors of the public GETs are readable from any origin; 429 is the envelope with a fixed message (L3)', async () => {
+    const site = { origin: 'https://identra.awncorp.vn' };
+    const expectPublic = (r: Response, what: string) => {
+      assert.equal(r.headers.get('access-control-allow-origin'), '*', what);
+      assert.equal(r.headers.get('access-control-expose-headers'), 'Date, Retry-After', what);
+      assert.equal(r.headers.get('access-control-allow-credentials'), null, what);
+    };
+
+    expectPublic(await fetch(eventsUrl('SN-KHONG-CO-2'), { headers: site }), 'product 404');
+    expectPublic(await fetch(`${LOCAL}/v1/products/09520123456789/SN-1/events`, { headers: site }), 'product 400');
+    expectPublic(await fetch(`${LOCAL}/issuers/nha-san-xuat/status/999`, { headers: site }), 'status list 404');
+
+    const ip = '203.0.113.171';
+    let last: Response | undefined;
+    for (let i = 0; i < 1201; i += 1) last = await fetch(eventsUrl('SN-2026-000001'), { headers: { ...site, 'x-forwarded-for': ip } });
+    expectPublic(last!, 'product 429');
+    assert.deepEqual([last!.status, await last!.json()], [429, { statusCode: 429, code: 'RATE_LIMITED', message: 'Too many requests; try again later.' }]);
+    assert.ok(Number(last!.headers.get('retry-after')) > 0);
+
+    for (let i = 0; i < 1201; i += 1) last = await fetch(`${LOCAL}/issuers/nha-san-xuat/status/1`, { headers: { ...site, 'x-forwarded-for': ip } });
+    expectPublic(last!, 'status list 429');
+    assert.equal(last!.status, 429);
   });
 });

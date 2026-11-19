@@ -1,13 +1,20 @@
-import { Body, Controller, Get, Header, HttpCode, Inject, Logger, Param, Post, Req, Res, UseFilters } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Inject, Logger, Param, Post, Req, Res, UseFilters } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { ApiTags } from '@nestjs/swagger';
 import { IsString, Matches } from 'class-validator';
+import { SESSION_SECONDS } from '@identra/sdk-server';
+import type { Clock } from '@identra/sdk-core';
 
 import { apiError, oauthError, ProtocolErrorFilter, unavailable, V1ErrorFilter } from '../common/http-errors';
-import { RateLimit, RateLimitFailClosed } from '../common/rate-limit';
+import { createLiveCap, LiveCap } from '../common/live-cap';
+import { GlobalRateLimit, RateLimit, RateLimitFailClosed } from '../common/rate-limit';
+import { RedisService } from '../infrastructure/redis/redis.service';
 import { RawRequest, RawResponse, sdkRequest, send } from './issuer.controllers';
-import { VERIFIER_MONITOR, VerifierMonitor, VERIFIERS, VerifierRegistry } from './verifiers';
+import { HOSTED_VERIFIERS } from './hosted-issuers';
+import { HostedVerifiers, VERIFIER_CLOCK, VERIFIERS } from './verifiers';
 
 const NAME = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+const HOSTED_NAMES = new Set(HOSTED_VERIFIERS.map((v) => v.name));
 const logger = new Logger('Verification');
 
 class CreateSessionDto {
@@ -20,32 +27,63 @@ class CreateSessionDto {
   scenario: string;
 }
 
-/** Verification sessions for the website (docs/vc-api.md §6). */
+/**
+ * Verification sessions for the website (docs/vc-api.md §6). Anonymous, so their Redis cost is
+ * bounded three ways (§8): per client, per minute across all clients, and by a global cap on live
+ * sessions (VERIFICATION_MAX_LIVE_SESSIONS, each holding its ~6 KB request object for 5 minutes).
+ * Responses are `Cache-Control: no-store` (configureApp): the id reads the result.
+ */
 @ApiTags('verification')
 @Controller('verification/sessions')
 @UseFilters(V1ErrorFilter)
 // Sessions live in Redis: without it there is nothing to create or read (503).
 @RateLimitFailClosed()
 export class VerificationSessionsController {
+  private readonly live: LiveCap;
+
   constructor(
-    @Inject(VERIFIERS) private readonly verifiers: VerifierRegistry,
-    @Inject(VERIFIER_MONITOR) private readonly monitor: VerifierMonitor
-  ) {}
+    @Inject(VERIFIERS) private readonly verifiers: HostedVerifiers,
+    @Inject(VERIFIER_CLOCK) clock: Clock,
+    config: ConfigService,
+    redis: RedisService
+  ) {
+    this.live = createLiveCap(redis.getClient(), 'vp-sessions', {
+      max: config.getOrThrow<number>('VERIFICATION_MAX_LIVE_SESSIONS'),
+      lifetimeSeconds: SESSION_SECONDS,
+      clock
+    });
+  }
 
   @Post()
   @HttpCode(201)
   @RateLimit('sessionCreation')
+  @GlobalRateLimit()
   async create(@Body() body: CreateSessionDto) {
-    const verifier = this.verifiers.get(body.verifier);
-    const created = verifier ? await verifier.createSession({ scenario: body.scenario }) : null;
+    if (!HOSTED_NAMES.has(body.verifier)) throw apiError(404, 'NOT_FOUND', 'No such verifier or scenario.');
 
-    if (!created || (!created.ok && created.reason === 'unknown_scenario')) {
-      throw apiError(404, 'NOT_FOUND', 'No such verifier or scenario.');
+    const verifier = await this.verifiers.available(body.verifier);
+
+    if (!verifier) throw unavailable('This verifier cannot create sessions at the moment.');
+
+    const slot = await this.live.reserve();
+
+    if (!slot.ok) {
+      throw apiError(503, 'UNAVAILABLE', 'Too many verification sessions are open; try again shortly.', { retryAfter: slot.retryAfterSeconds });
     }
 
-    this.monitor.listing(body.verifier, created.ok);
+    const created = await verifier.createSession({ scenario: body.scenario }).catch(async (error: unknown) => {
+      await this.live.release(slot.member).catch(() => undefined);
+      throw error;
+    });
 
-    if (!created.ok) throw unavailable('This verifier is not in the trust list at the moment.');
+    if (!created.ok) {
+      await this.live.release(slot.member);
+
+      if (created.reason === 'unknown_scenario') throw apiError(404, 'NOT_FOUND', 'No such verifier or scenario.');
+
+      this.verifiers.notListed(body.verifier);
+      throw unavailable('This verifier is not in the trust list at the moment.');
+    }
 
     const { session } = created;
 
@@ -54,9 +92,8 @@ export class VerificationSessionsController {
   }
 
   @Get(':id')
-  @Header('Cache-Control', 'no-store')
   async get(@Param('id') id: string) {
-    for (const verifier of this.verifiers.values()) {
+    for (const verifier of this.verifiers.built()) {
       const session = await verifier.session(id);
 
       if (session) return session;
@@ -75,12 +112,12 @@ export class VerificationSessionsController {
 @Controller('oid4vp')
 @UseFilters(ProtocolErrorFilter)
 export class Oid4vpController {
-  constructor(@Inject(VERIFIERS) private readonly verifiers: VerifierRegistry) {}
+  constructor(@Inject(VERIFIERS) private readonly verifiers: HostedVerifiers) {}
 
   @Get('request/:requestId')
   async request(@Param('requestId') requestId: string, @Res() res: RawResponse) {
     // Each verifier answers null for request ids it does not hold.
-    for (const verifier of this.verifiers.values()) {
+    for (const verifier of this.verifiers.built()) {
       const answer = await verifier.requestObject(requestId);
 
       if (answer) return send(res, answer);
@@ -94,7 +131,7 @@ export class Oid4vpController {
   async response(@Param('requestId') requestId: string, @Req() req: RawRequest, @Res() res: RawResponse) {
     const request = sdkRequest(req);
 
-    for (const verifier of this.verifiers.values()) {
+    for (const verifier of this.verifiers.built()) {
       const handled = await verifier.handleResponse(requestId, request);
 
       if (!handled) continue;

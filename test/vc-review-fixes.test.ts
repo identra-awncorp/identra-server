@@ -124,6 +124,50 @@ describe('status changes: row and list never disagree (F2)', () => {
   });
 });
 
+describe('review 3: revoked is final on the row side; real lock contention is 503', () => {
+  it('a row that says revoked while the list says valid: 409, and neither side changes', async () => {
+    const { id } = await issue();
+
+    await prisma.vcIssuedCredential.update({ where: { id }, data: { status: 'revoked' } });
+    assert.deepEqual(await rowAndList(id), { row: VALUE.revoked, list: VALUE.valid });
+
+    for (const status of ['valid', 'suspended']) {
+      assert.equal((await change(id, status).expect(409)).body.code, 'CONFLICT');
+    }
+
+    assert.deepEqual(await rowAndList(id), { row: VALUE.revoked, list: VALUE.valid });
+  });
+
+  it('a row lock held by another connection: the change is retried, then 503 UNAVAILABLE with Retry-After, never 500', async () => {
+    const { id } = await issue();
+    let release!: () => void;
+    const released = new Promise<void>((resolve) => (release = resolve));
+    let holding!: () => void;
+    const held = new Promise<void>((resolve) => (holding = resolve));
+    // A second connection (an interactive transaction of its own) holds the credential row.
+    const holder = prisma.$transaction(
+      async (tx) => {
+        await tx.$queryRaw`SELECT 1 FROM "VcIssuedCredential" WHERE "id" = ${id} FOR UPDATE`;
+        holding();
+        await released;
+      },
+      { timeout: 20_000 }
+    );
+
+    await held;
+    const started = Date.now();
+    const res = await change(id, 'suspended');
+
+    release();
+    await holder;
+    assert.deepEqual([res.status, res.body.code, res.headers['retry-after']], [503, 'UNAVAILABLE', '1']);
+    // Three attempts, each bounded by the 2 s lock timeout.
+    assert.ok(Date.now() - started < 9000, `${Date.now() - started} ms`);
+    assert.deepEqual(await rowAndList(id), { row: VALUE.valid, list: VALUE.valid });
+    await change(id, 'suspended').expect(200);
+  });
+});
+
 describe('status changes under load (F6)', () => {
   it('60 concurrent changes on one list: only 200 or 503 with Retry-After, never 500', async () => {
     const ids = await Promise.all(Array.from({ length: 60 }, async () => (await issue()).id));

@@ -23,8 +23,12 @@ Layout of `identra-sdk/scripts/pki/README.md`: `root.cert.pem`, `orgs/<name>/<pu
 `trust-list.source.json`. Never the `ca/` directory: the Root and Issuing CA keys do not
 touch the VPS (ADR-0015 §2). The container runs as uid 1000, and the SDK refuses a key file
 that is not a regular file of mode 600, so: `sudo chown -R 1000:1000 /etc/identra/keys`,
-`chmod 600` every `*.key.pem`, `chmod 700` the directories. The server loads every key at
-startup and refuses to start, naming the file, when one is missing or does not validate.
+`chmod 600` every `*.key.pem`, `chmod 700` the directories. The server loads the key of every
+purpose of every hosted organisation at startup (`src/vc/hosted-issuers.ts`) and, in production,
+refuses to start when one is missing or does not validate, naming the organisation, the purpose
+and the file (never key content). Outside production it starts, logs the problem as an error and
+answers `503` on that organisation's routes; `/v1/health` then shows `statusLists: down` or
+`verifier: down`.
 
 Editing `trust-list.source.json` takes effect on the next request (re-read when its mtime
 changes). An invalid edit keeps the last good list in service, logs a warning, and
@@ -42,12 +46,13 @@ docker compose --env-file /etc/identra/server.env -f docker-compose.prod.yml \
 
 - Its `vc` key and certificate are `orgs/truong-mau/vc.{key,chain}.pem` in the key directory;
   the certificate's SAN must be `https://api-identra.awncorp.vn/issuers/truong-mau`. The
-  issuers are listed in `src/vc/issuers.ts` (a second one is one entry plus its keys).
+  issuers are listed in `src/vc/hosted-issuers.ts` (a second one is one entry plus its keys).
 - The access-token signing key, the request-encryption key and the HMAC key of the PIN hashes
   are generated in memory at every start and never stored. **A restart invalidates outstanding
-  access tokens (at most 5 minutes old), the encryption key a wallet read just before, and the
-  PINs of every pending offer** (offers live 10 minutes): a student in the middle of collecting a
-  diploma gets an error and asks the portal for a new offer. Offer state lives in Redis (readable
+  access tokens (at most 5 minutes old), the encryption key a wallet read just before, and ends
+  every pending offer** (offers live 10 minutes; their ids are kept in Redis for this): the
+  portal shows the offer as expired, the wallet says it expired, and the student asks for a new
+  one. Offer state lives in Redis (readable
   30 minutes) and keeps only a keyed hash of the PIN, so Redis alone never reveals a PIN.
 - `demo:provision` creates or updates only the four `DemoPortalAccount` rows (`sv001`–`sv003`,
   `phongdaotao`), whose profiles are the claims of the diplomas issued; it touches no other
@@ -80,10 +85,12 @@ docker compose ... run --rm -e DEMO_PRODUCT_PROVISION=yes -e DEMO_PRODUCT_SERIAL
 ### Verifier (OpenID4VP, `nha-tuyen-dung-mau`)
 
 - Its `request` key is `orgs/nha-tuyen-dung-mau/request.{key,chain}.pem`; the certificate's
-  fingerprint must be in the trust list with purpose `request`, or the server refuses to
-  start (`Verifier nha-tuyen-dung-mau cannot start: …`). If a later edit of the trust list
-  drops it, `/v1/health` shows `verifier: down` (re-checked hourly) and wallets warn that the
-  verifier is not trusted. Verifiers are listed in `src/vc/verifiers.ts`.
+  fingerprint must be in the trust list with purpose `request`. Without a valid trust list, or
+  while the list does not have it, the server still starts: session creation answers `503`,
+  `/v1/health` shows `verifier: down` and the log says `Verifier nha-tuyen-dung-mau cannot create
+  sessions: …`. It is checked again on every newly signed trust list (an edit takes effect on
+  the next request) and otherwise at most every 30 s. Verifiers are listed in
+  `src/vc/hosted-issuers.ts`.
 - Sessions and their results live only in Redis (5 minutes to answer, results 30 minutes).
   Nothing about a presentation is written to Postgres or to the log, which carries only the
   first 8 characters of the session id, the outcome and the failing check code.
@@ -143,5 +150,9 @@ Prisma refuses to continue until the failed migration is resolved.
 
 Redis runs with `--maxmemory 128mb --maxmemory-policy noeviction`: nothing is evicted
 silently. When full, writes fail; `/v1/auth/*` then answers 503 (rate limiting fails
-closed) and other REST routes run without rate limits. Check with
-`docker compose ... exec redis redis-cli info memory`.
+closed) and other REST routes run without rate limits; routes that must write answer 503.
+The anonymous protocol state (verification sessions, c_nonces, offers) is capped across all
+clients at about 28 MB in the worst case (docs/vc-api.md §8; `VERIFICATION_MAX_LIVE_SESSIONS`,
+`VERIFICATION_SESSIONS_PER_MINUTE`, `ISSUANCE_MAX_LIVE_NONCES`, `ISSUANCE_MAX_LIVE_OFFERS`).
+`/v1/health` reports `redis: degraded` (and `status: degraded`) above 80 % of `maxmemory` or
+when a write is refused. Check with `docker compose ... exec redis redis-cli info memory`.

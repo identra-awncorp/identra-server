@@ -8,7 +8,7 @@ import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { StatusRevokedError, type StatusListService } from '@identra/sdk-server';
 import { issuerKind } from './hosted-issuers';
 import { createPrismaStatusListStorage } from './status-storage';
-import { STATUS_LIST_SERVICE } from './vc.providers';
+import { PKI, Pki, STATUS_LIST_SERVICE } from './vc.providers';
 
 const STATUS_CHANGE_ATTEMPTS = 3;
 const LOCK_TIMEOUT_MS = 2000;
@@ -46,6 +46,7 @@ export class VcCredentialsService {
   constructor(
     private readonly prisma: PrismaService,
     @Inject(STATUS_LIST_SERVICE) private readonly statusLists: StatusListService,
+    @Inject(PKI) private readonly pki: Pki,
     @Optional() @Inject(STATUS_CHANGE_HOOKS) private readonly hooks?: StatusChangeHooks
   ) {}
 
@@ -115,6 +116,11 @@ export class VcCredentialsService {
    * either side. Lock or pool timeouts are retried briefly, then answered 503 (Retry-After: 1).
    */
   async changeStatus(issuerName: string, id: string, status: VcCredentialStatus) {
+    // M3: a change this server cannot publish (no usable status key) is refused, never a 200.
+    if (issuerKind(issuerName) !== null && !(await this.canSignStatus(issuerName))) {
+      throw unavailable('The status lists of this issuer cannot be signed at the moment.');
+    }
+
     for (let attempt = 1; ; attempt += 1) {
       try {
         return await this.changeStatusOnce(issuerName, id, status);
@@ -125,6 +131,15 @@ export class VcCredentialsService {
         await sleep(25 * attempt + Math.floor(Math.random() * 50));
       }
     }
+  }
+
+  private async canSignStatus(issuerName: string): Promise<boolean> {
+    if (this.pki.unavailable.has(issuerName)) return false;
+
+    return this.pki.keyStore.signer(issuerName, 'status').then(
+      () => true,
+      () => false
+    );
   }
 
   private async changeStatusOnce(issuerName: string, id: string, status: VcCredentialStatus) {

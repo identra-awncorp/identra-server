@@ -12,7 +12,7 @@ import { NestExpressApplication } from '@nestjs/platform-express';
 import { PrismaService } from '../src/infrastructure/prisma/prisma.service';
 import { RedisService } from '../src/infrastructure/redis/redis.service';
 import { ISSUER_CLOCK } from '../src/vc/vc.providers';
-import { adjustableClock, call, ISS, keysDir, LOCAL, login, newOffer, newWallet, offerState, PORT, wrongPin } from './e2e-world';
+import { adjustableClock, call, ISS, issueDiplomaTo, keysDir, LOCAL, login, newOffer, newWallet, offerState, PORT, wrongPin } from './e2e-world';
 import { createTestApp, TEST_PORTAL_PASSWORD } from './helpers';
 
 const issuerClock = adjustableClock();
@@ -191,7 +191,7 @@ describe('negative paths over real HTTP', () => {
     assert.deepEqual([again.status, (await again.json()).error], [401, 'invalid_token']);
   });
 
-  it('limits the token endpoint to 20 per minute per IP, in OAuth shape with Retry-After', async () => {
+  it('limits the token endpoint to 120 per minute per IP (N5), in OAuth shape with Retry-After and a fixed message', async () => {
     const ip = '203.0.113.150';
     const attempt = () =>
       fetch(`${LOCAL}/issuers/truong-mau/token`, {
@@ -200,11 +200,11 @@ describe('negative paths over real HTTP', () => {
         body: 'grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Apre-authorized_code&pre-authorized_code=x&tx_code=1'
       });
 
-    for (let i = 0; i < 20; i += 1) assert.equal((await attempt()).status, 400);
+    for (let i = 0; i < 120; i += 1) assert.equal((await attempt()).status, 400);
 
     const limited = await attempt();
     assert.equal(limited.status, 429);
-    assert.equal((await limited.json()).error, 'temporarily_unavailable');
+    assert.deepEqual(await limited.json(), { error: 'temporarily_unavailable', error_description: 'Too many requests; try again later.' });
     assert.ok(Number(limited.headers.get('retry-after')) > 0);
   });
 
@@ -216,6 +216,50 @@ describe('negative paths over real HTTP', () => {
     });
 
     assert.deepEqual(await res.json(), { error: 'invalid_request', error_description: 'a parameter is repeated' });
+  });
+
+  it('an offer redeemed but never collected reads expired once its access token would have expired (L5)', async (t) => {
+    t.after(() => issuerClock.reset());
+    const student = await login('sv002');
+    const offer = await newOffer(student);
+    const offerJson = await (await fetch(`${LOCAL}/issuers/truong-mau/offers/${offer.offerId}`)).json();
+    const code = offerJson.grants['urn:ietf:params:oauth:grant-type:pre-authorized_code']['pre-authorized_code'];
+    const redeemed = await fetch(`${LOCAL}/issuers/truong-mau/token`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded', 'x-forwarded-for': '203.0.113.152' },
+      body: new URLSearchParams({ grant_type: 'urn:ietf:params:oauth:grant-type:pre-authorized_code', 'pre-authorized_code': code, tx_code: offer.txCode }).toString()
+    });
+
+    evidence.pins.push(offer.txCode);
+    assert.equal(redeemed.status, 200);
+    // The wallet is between token and credential: still pending.
+    const polled = await offerState(student, offer.offerId);
+    assert.equal(polled.body.status, 'pending');
+    // L7: no portal answer is ever cached (they carry tokens, PINs and personal data), errors included.
+    assert.equal(polled.headers.get('cache-control'), 'no-store');
+    assert.equal((await call('POST', '/v1/demo/school/login', { body: { username: 'sv002', password: 'x' } })).headers.get('cache-control'), 'no-store');
+    issuerClock.advance(299);
+    assert.equal((await offerState(student, offer.offerId)).body.status, 'pending');
+    issuerClock.advance(2);
+    assert.equal((await offerState(student, offer.offerId)).body.status, 'expired');
+  });
+
+  it('product issuers have no OpenID4VCI endpoints: every route answers 404 in the OAuth shape (N3)', async () => {
+    for (const name of ['nha-san-xuat', 'kiem-dinh', 'phan-phoi']) {
+      for (const [method, path] of [
+        ['GET', `/.well-known/openid-credential-issuer/issuers/${name}`],
+        ['GET', `/.well-known/oauth-authorization-server/issuers/${name}`],
+        ['GET', `/issuers/${name}/jwks`],
+        ['GET', `/issuers/${name}/offers/${'A'.repeat(22)}`],
+        ['POST', `/issuers/${name}/token`],
+        ['POST', `/issuers/${name}/nonce`],
+        ['POST', `/issuers/${name}/credential`]
+      ] as const) {
+        const res = await fetch(`${LOCAL}${path}`, { method, headers: { 'x-forwarded-for': '203.0.113.153' } });
+
+        assert.deepEqual([res.status, (await res.json()).error], [404, 'not_found'], `${method} ${path}`);
+      }
+    }
   });
 
   it('answers unknown issuers with 404 in the OAuth shape', async () => {
@@ -267,5 +311,33 @@ describe('no personal data at rest', () => {
       `no-PII-at-rest: ${columns.length} text/json columns x ${needles.length} needles, hits only in DemoPortalAccount.profile; ` +
         `${keys.length} Redis keys, 0 hits`
     );
+  });
+});
+
+describe('a restart ends every pending offer (L1)', () => {
+  it('the portal reads expired and the wallet gets OFFER_EXPIRED instead of burning PIN attempts', async () => {
+    const student = await login('sv003');
+    const offer = await newOffer(student);
+    const early = newWallet();
+    const resolved = await early.wallet.offers.resolve(offer.offerUri);
+
+    evidence.pins.push(offer.txCode);
+    assert.ok(resolved.ok);
+    if (!resolved.ok) return;
+    assert.equal((await offerState(student, offer.offerId)).body.status, 'pending');
+
+    // The PIN key lived only in the old process.
+    await app.close();
+    app = await createTestApp({ IDENTRA_KEYS_DIR: keysDir }, { override: (builder) => builder.overrideProvider(ISSUER_CLOCK).useValue(issuerClock) });
+    await app.listen(PORT, '127.0.0.1');
+
+    assert.equal((await offerState(student, offer.offerId)).body.status, 'expired');
+    const accepted = await early.wallet.offers.accept(resolved.offer, { txCode: offer.txCode });
+    assert.equal(!accepted.ok && accepted.code, 'OFFER_EXPIRED');
+    const late = await newWallet().wallet.offers.resolve(offer.offerUri);
+    assert.equal(!late.ok && late.code, 'OFFER_EXPIRED');
+
+    // A new offer after the restart works as usual.
+    assert.ok(await issueDiplomaTo(newWallet().wallet, 'sv003'));
   });
 });

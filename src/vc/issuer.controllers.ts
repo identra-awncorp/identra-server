@@ -11,14 +11,17 @@ import {
   UseGuards
 } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
-import type { HttpRequest, HttpResponse as SdkResponse } from '@identra/sdk-server';
+import type { Clock } from '@identra/sdk-core';
+import { ACCESS_TOKEN_SECONDS, type HttpRequest, type HttpResponse as SdkResponse } from '@identra/sdk-server';
 
 import { allowAnyOrigin, apiError, HttpResponse, oauthError, ProtocolErrorFilter, V1ErrorFilter } from '../common/http-errors';
 import { RateLimit, RateLimitFailClosed } from '../common/rate-limit';
 import { createRedisStateStore, StateStore } from '../common/state-store';
 import { DemoPortalGuard, PortalSession, PortalSessionData } from '../demo-portal/portal-sessions';
 import { RedisService } from '../infrastructure/redis/redis.service';
-import { ISSUERS, IssuerRegistry } from './issuers';
+import { OPENID4VCI_ISSUERS } from './hosted-issuers';
+import { HostedIssuer, ISSUERS, IssuerRegistry } from './issuers';
+import { ISSUER_CLOCK } from './vc.providers';
 
 export interface RawRequest {
   headers: Record<string, string | string[] | undefined>;
@@ -61,7 +64,8 @@ export function send(res: RawResponse, r: SdkResponse, options: { public?: boole
 
 /**
  * OpenID4VCI 1.0 endpoints of docs/vc-api.md §4, unprefixed. Thin adapters: HTTP in, SDK call,
- * HTTP out. Anything thrown (a failing store or callback) becomes `500 { error: server_error }`.
+ * HTTP out. Postgres or Redis down becomes `503 temporarily_unavailable`; anything else thrown
+ * (a failing callback) becomes `500 { error: server_error }`.
  */
 @ApiTags('issuance')
 @Controller()
@@ -69,12 +73,19 @@ export function send(res: RawResponse, r: SdkResponse, options: { public?: boole
 export class IssuerProtocolController {
   constructor(@Inject(ISSUERS) private readonly issuers: IssuerRegistry) {}
 
-  private issuer(name: string) {
+  private hosted(name: string): HostedIssuer {
     const hosted = this.issuers.get(name);
 
-    if (!hosted) throw oauthError(404, 'not_found', 'unknown credential issuer');
+    if (hosted) return hosted;
+    // Hosted here but not able to sign at the moment (vc.providers.ts, issuers.ts).
+    if (OPENID4VCI_ISSUERS.some((i) => i.name === name)) throw oauthError(503, 'temporarily_unavailable', 'the credential issuer is unavailable');
 
-    return hosted.issuer;
+    // Unknown, and the product issuers: they have no OpenID4VCI endpoints.
+    throw oauthError(404, 'not_found', 'unknown credential issuer');
+  }
+
+  private issuer(name: string) {
+    return this.hosted(name).issuer;
   }
 
   @Get('.well-known/openid-credential-issuer/issuers/:name')
@@ -106,7 +117,16 @@ export class IssuerProtocolController {
   @Post('issuers/:name/nonce')
   @RateLimit('write')
   async nonce(@Param('name') name: string, @Res() res: RawResponse) {
-    send(res, await this.issuer(name).nonce());
+    const hosted = this.hosted(name);
+    // Anonymous state (a c_nonce for 5 minutes): a global cap bounds its Redis cost (§8).
+    const slot = await hosted.nonces.reserve();
+
+    if (!slot.ok) {
+      res.setHeader('Retry-After', String(slot.retryAfterSeconds));
+      throw oauthError(503, 'temporarily_unavailable', 'too many nonces are outstanding; try again shortly');
+    }
+
+    send(res, await hosted.issuer.nonce());
   }
 
   @Post('issuers/:name/credential')
@@ -134,6 +154,7 @@ export class PortalOffersController {
 
   constructor(
     @Inject(ISSUERS) private readonly issuers: IssuerRegistry,
+    @Inject(ISSUER_CLOCK) private readonly clock: Clock,
     redis: RedisService
   ) {
     this.portalState = createRedisStateStore(redis.getClient(), 'portal-offer');
@@ -153,9 +174,18 @@ export class PortalOffersController {
   async create(@PortalSession() session: PortalSessionData) {
     if (session.role !== 'student') throw apiError(403, 'FORBIDDEN', 'Only students can collect a diploma.');
 
-    const { issuer } = this.hosted(session);
+    const { issuer, offers } = this.hosted(session);
     // The PIN (txCode) exists only in this response: the SDK keeps a keyed hash of it.
     const offer = await issuer.createOffer({ subjectRef: session.username, configurationId: CONFIGURATION });
+    // Counted once created (its id is the member, ended at the next start, L1); over the cap it is
+    // ended at once, leaving only its small status record.
+    const slot = await offers.reserve(offer.offerId);
+
+    if (!slot.ok) {
+      await issuer.cancelOffer(offer.offerId);
+      throw apiError(503, 'UNAVAILABLE', 'Too many offers are open; try again shortly.', { retryAfter: slot.retryAfterSeconds });
+    }
+
     const previous = await this.portalState.swap(
       `current:${session.issuerName}:${session.username}`,
       offer.offerId,
@@ -170,11 +200,31 @@ export class PortalOffersController {
 
   @Get(':offerId')
   async status(@PortalSession() session: PortalSessionData, @Param('offerId') offerId: string) {
-    const state = await this.hosted(session).issuer.offerStatus(offerId);
+    const hosted = this.hosted(session);
+    const state = await hosted.issuer.offerStatus(offerId);
 
     // Unknown, too old, or someone else's: the same answer.
     if (!state || state.subjectRef !== session.username) throw apiError(404, 'NOT_FOUND', 'No such offer.');
 
-    return { status: state.status, serverTime: new Date().toISOString() };
+    return { status: state.status === 'pending' ? await this.pendingOrRedeemed(hosted, offerId) : state.status, serverTime: new Date().toISOString() };
+  }
+
+  /**
+   * L5: the SDK reads `pending` until the offer's 10 minutes pass, also after the token endpoint
+   * consumed the code (the offer record is gone: offer() answers 404) when the credential was then
+   * never issued. The first time the portal sees the code consumed is kept; once an access token
+   * from then would have expired (300 s) without an issuance, the offer reads `expired`.
+   */
+  private async pendingOrRedeemed(hosted: HostedIssuer, offerId: string): Promise<'pending' | 'expired'> {
+    if ((await hosted.issuer.offer(offerId)).status !== 404) return 'pending';
+
+    const key = `redeemed:${offerId}`;
+    const now = this.clock.now().getTime();
+    // Two polls racing here record nearly the same time; either is fine.
+    const seen = Number((await this.portalState.get(key)) ?? now);
+
+    if (seen === now) await this.portalState.put(key, String(now), PORTAL_OFFER_SECONDS);
+
+    return now - seen >= ACCESS_TOKEN_SECONDS * 1000 ? 'expired' : 'pending';
   }
 }

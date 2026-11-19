@@ -1,6 +1,7 @@
-import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger } from '@nestjs/common';
+import { ArgumentsHost, Catch, ExceptionFilter, HttpException, HttpStatus, Logger, ServiceUnavailableException } from '@nestjs/common';
 import { BaseExceptionFilter } from '@nestjs/core';
 import { ThrottlerException } from '@nestjs/throttler';
+import { Prisma } from '@prisma/client';
 
 // The parts of Express's response used here (the server has no @types/express).
 export interface HttpResponse {
@@ -50,6 +51,34 @@ function describe(exception: HttpException): { code?: string; message: string } 
   };
 }
 
+/** Seconds a client waits after a dependency (Postgres, Redis) was found down. */
+const DEPENDENCY_RETRY_AFTER = 5;
+const PRISMA_UNREACHABLE = ['P1001', 'P1002', 'P1008', 'P1017'];
+const REDIS_UNREACHABLE = /^(Command timed out|Connection is closed\.|Stream isn't writeable|OOM command not allowed)/;
+
+/**
+ * Postgres or Redis unreachable, timing out or (Redis) full: the request cannot be served now,
+ * which is a 503 with Retry-After, never a 500. ioredis: MaxRetriesPerRequestError, the command
+ * timeout, a closed connection, an OOM refusal under `noeviction`; Prisma: initialisation errors
+ * and P1001/P1002/P1008/P1017.
+ */
+export function isDependencyDown(error: unknown): boolean {
+  if (error instanceof Prisma.PrismaClientInitializationError) return true;
+  if (error instanceof Prisma.PrismaClientKnownRequestError) return PRISMA_UNREACHABLE.includes(error.code);
+  if (!(error instanceof Error)) return false;
+
+  return error.name === 'MaxRetriesPerRequestError' || REDIS_UNREACHABLE.test(error.message) || (error as { code?: unknown }).code === 'ECONNREFUSED';
+}
+
+function logDependencyDown(exception: unknown): void {
+  const name = exception instanceof Error ? exception.name : typeof exception;
+  const code = (exception as { code?: unknown })?.code;
+
+  logger.warn(`Dependency unavailable: ${name}${typeof code === 'string' ? ` (${code})` : ''}`);
+}
+
+const TOO_MANY_REQUESTS = 'Too many requests; try again later.';
+
 // Unknown errors are logged by type only: messages of driver errors can carry query values.
 function logUnexpected(exception: unknown): void {
   const name = exception instanceof Error ? exception.name : typeof exception;
@@ -59,6 +88,14 @@ function logUnexpected(exception: unknown): void {
 }
 
 function renderV1(exception: unknown, res: HttpResponse): void {
+  if (isDependencyDown(exception)) {
+    logDependencyDown(exception);
+    res.setHeader('Retry-After', String(DEPENDENCY_RETRY_AFTER));
+    res.status(503).json({ statusCode: 503, code: 'UNAVAILABLE', message: 'Service unavailable' });
+
+    return;
+  }
+
   if (!(exception instanceof HttpException)) {
     logUnexpected(exception);
     res.status(500).json({ statusCode: 500, code: 'INTERNAL_ERROR', message: 'Internal server error' });
@@ -84,7 +121,7 @@ function renderV1(exception: unknown, res: HttpResponse): void {
         : statusCode === 503
           ? 'UNAVAILABLE'
           : (code ?? V1_CODES[statusCode] ?? 'ERROR'),
-    message: statusCode >= 500 ? 'Service unavailable' : message,
+    message: statusCode >= 500 ? 'Service unavailable' : exception instanceof ThrottlerException ? TOO_MANY_REQUESTS : message,
     ...(typeof reason === 'string' ? { reason } : {}),
     ...(typeof index === 'number' || index === null ? { index } : {})
   });
@@ -116,6 +153,14 @@ export class ProtocolErrorFilter implements ExceptionFilter {
 }
 
 function renderProtocol(exception: unknown, res: HttpResponse): void {
+  if (isDependencyDown(exception)) {
+    logDependencyDown(exception);
+    res.setHeader('Retry-After', String(DEPENDENCY_RETRY_AFTER));
+    res.status(503).json({ error: 'temporarily_unavailable', error_description: 'Service unavailable' });
+
+    return;
+  }
+
   if (!(exception instanceof HttpException)) {
     logUnexpected(exception);
     res.status(500).json({ error: 'server_error' });
@@ -144,7 +189,7 @@ function renderProtocol(exception: unknown, res: HttpResponse): void {
 
   res.status(status >= 500 && status !== 503 ? 500 : status).json({
     error,
-    error_description: status >= 500 ? 'Server error' : describe(exception).message
+    error_description: status >= 500 ? 'Server error' : exception instanceof ThrottlerException ? TOO_MANY_REQUESTS : describe(exception).message
   });
 }
 
@@ -176,6 +221,13 @@ export class RoutedErrorFilter extends BaseExceptionFilter {
 
     if (shape === 'protocol') return renderProtocol(exception, http.getResponse<HttpResponse>());
     if (shape === 'v1') return renderV1(exception, http.getResponse<HttpResponse>());
+
+    if (isDependencyDown(exception)) {
+      logDependencyDown(exception);
+      http.getResponse<HttpResponse>().setHeader('Retry-After', String(DEPENDENCY_RETRY_AFTER));
+
+      return super.catch(new ServiceUnavailableException(), host);
+    }
 
     super.catch(exception, host);
   }

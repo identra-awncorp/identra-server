@@ -213,4 +213,30 @@ describe('credential feature configuration', () => {
       );
     }
   });
+
+  it('refuses a key hash listed twice and an organisation that is not hosted, without echoing them (N7)', () => {
+    const hash = 'c'.repeat(64);
+
+    for (const [bad, message] of [
+      [`truong-mau:${hash},kiem-dinh:${hash}`, /same key hash twice/],
+      [`truong-mau:${hash},truong-mau:${hash}`, /same key hash twice/],
+      [`truong-mua:${hash}`, /not a hosted issuer/],
+      [`nha-tuyen-dung-mau:${hash}`, /not a hosted issuer/]
+    ] as const) {
+      assert.throws(
+        () => validateEnv({ ...dev, IDENTRA_ORG_API_KEY_HASHES: bad }),
+        (error: Error) => message.test(error.message) && !error.message.includes(hash) && !error.message.includes('truong-mua'),
+        bad
+      );
+    }
+  });
+
+  it('defaults the protocol-state caps of docs/vc-api.md §8', () => {
+    const env = validateEnv({ ...dev });
+
+    assert.deepEqual(
+      [env.VERIFICATION_MAX_LIVE_SESSIONS, env.VERIFICATION_SESSIONS_PER_MINUTE, env.ISSUANCE_MAX_LIVE_NONCES, env.ISSUANCE_MAX_LIVE_OFFERS],
+      [2000, 300, 2000, 500]
+    );
+  });
 });

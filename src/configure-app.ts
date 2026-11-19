@@ -3,7 +3,7 @@ import { ConfigService } from '@nestjs/config';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 
-import { bodyParserErrorHandler, RoutedErrorFilter } from './common/http-errors';
+import { allowAnyOrigin, bodyParserErrorHandler, HttpResponse, RoutedErrorFilter } from './common/http-errors';
 import { parseCorsOrigins } from './config/cors';
 
 /**
@@ -30,11 +30,22 @@ export const UNPREFIXED_ROUTES = [
 const BODY_LIMIT = '64kb';
 
 /**
+ * GETs of the public resources (docs/vc-api.md §2): trust list, status lists, issuer metadata,
+ * JWKS, offers by reference and product events. Their errors too (400, 404, 429, 503) are
+ * readable from any origin, so they get the headers before any guard or controller runs.
+ */
+const PUBLIC_RESOURCE =
+  /^\/(trust-list|issuers\/[^/]+\/(status\/[^/]+|jwks|offers\/[^/]+)|\.well-known\/(openid-credential-issuer|oauth-authorization-server)\/issuers\/[^/]+|v1\/products\/[^/]+\/[^/]+\/events)$/;
+
+type Next = () => void;
+
+/**
  * Everything main.ts sets up on the app before listening. Tests call this too, so they run
  * against the same prefix, parsers, pipes and CORS as production.
  */
 export function configureApp(app: NestExpressApplication): void {
   const config = app.get(ConfigService);
+  const prefix = config.get<string>('API_PREFIX', 'v1');
 
   // Exactly one reverse proxy (nginx on localhost, ADR-0016) sits in front of the app, so
   // req.ip is the LAST X-Forwarded-For entry. nginx overwrites that header with the client
@@ -50,7 +61,7 @@ export function configureApp(app: NestExpressApplication): void {
   // Parser failures (malformed JSON, too large) in the shape of the route they were sent to.
   app.use(bodyParserErrorHandler);
 
-  app.setGlobalPrefix(config.get<string>('API_PREFIX', 'v1'), {
+  app.setGlobalPrefix(prefix, {
     exclude: UNPREFIXED_ROUTES
   });
   app.enableCors({
@@ -59,6 +70,20 @@ export function configureApp(app: NestExpressApplication): void {
     // Lets the website read how long to wait after a 429 (docs/vc-api.md §2).
     exposedHeaders: ['Retry-After']
   });
+  // After the CORS middleware, so this overrides what it set for the website's origin.
+  app.use((req: { method: string; path: string }, res: HttpResponse, next: Next) => {
+    if ((req.method === 'GET' || req.method === 'HEAD') && PUBLIC_RESOURCE.test(req.path)) allowAnyOrigin(res);
+    next();
+  });
+
+  // Portal answers carry bearer tokens and personal data; a session id is the capability to
+  // read a verification result: never stored by a browser or an intermediary (errors included).
+  for (const path of [`/${prefix}/demo/school`, `/${prefix}/verification/sessions`]) {
+    app.use(path, (_req: unknown, res: HttpResponse, next: Next) => {
+      res.setHeader('Cache-Control', 'no-store');
+      next();
+    });
+  }
 
   // Strict DTO validation for /v1. It only applies to parameters typed as a class: a protocol
   // controller that must accept extra fields types its body as a plain object

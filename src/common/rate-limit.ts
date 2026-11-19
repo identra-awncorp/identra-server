@@ -5,10 +5,12 @@ import {
   SetMetadata,
   ServiceUnavailableException
 } from '@nestjs/common';
-import { APP_GUARD } from '@nestjs/core';
+import { ConfigService } from '@nestjs/config';
+import { APP_GUARD, Reflector } from '@nestjs/core';
 import {
   Throttle,
   ThrottlerGuard,
+  ThrottlerLimitDetail,
   ThrottlerModule,
   ThrottlerStorage
 } from '@nestjs/throttler';
@@ -18,22 +20,33 @@ import { RedisService } from '../infrastructure/redis/redis.service';
 import { normalizePhone } from '../modules/auth/auth.utils';
 
 const MINUTE = 60_000;
+const reflector = new Reflector();
 
 /**
- * Per-client-IP limits per route (docs/vc-api.md §8). Every route already gets
- * `default` (300/min); declare a tighter one with `@RateLimit('login')` etc.
+ * Per-client limits per route (docs/vc-api.md §8). A client is an IPv4 address or an IPv6 /64
+ * (the throttler's own tracker, normalizeIp). Every route already gets `default` (300/min);
+ * declare a tighter one with `@RateLimit('login')` etc.
  */
 export const RATE_LIMITS = {
   default: { limit: 300, ttl: MINUTE },
   login: { limit: 10, ttl: MINUTE },
   sessionCreation: { limit: 30, ttl: MINUTE },
-  token: { limit: 20, ttl: MINUTE },
+  // A venue's visitors share one NAT address; PIN guessing is bounded per offer (5 attempts).
+  token: { limit: 120, ttl: MINUTE },
   write: { limit: 60, ttl: MINUTE },
   // Trust list and status lists: many verifiers can share one address, and they are cacheable.
   publicResource: { limit: 1200, ttl: MINUTE }
 } as const;
 
 export const RateLimit = (name: keyof typeof RATE_LIMITS) => Throttle({ default: RATE_LIMITS[name] });
+
+const GLOBAL_LIMIT = 'identra:global-rate-limit';
+
+/**
+ * One budget per route for ALL clients together, on top of the per-client one: rotating
+ * addresses does not buy more (VERIFICATION_SESSIONS_PER_MINUTE for session creation).
+ */
+export const GlobalRateLimit = () => SetMetadata(GLOBAL_LIMIT, true);
 
 const FAIL_CLOSED = 'identra:rate-limit-fail-closed';
 
@@ -96,6 +109,13 @@ class AppThrottlerGuard extends ThrottlerGuard {
     return context.getType() !== 'http';
   }
 
+  // Named throttlers would send `Retry-After-<name>`; clients read `Retry-After` (docs/vc-api.md §2).
+  protected async throwThrottlingException(context: ExecutionContext, detail: ThrottlerLimitDetail): Promise<void> {
+    context.switchToHttp().getResponse<{ setHeader(name: string, value: string): void }>().setHeader('Retry-After', String(detail.timeToBlockExpire));
+
+    return super.throwThrottlingException(context, detail);
+  }
+
   async canActivate(context: ExecutionContext): Promise<boolean> {
     try {
       return await super.canActivate(context);
@@ -135,8 +155,8 @@ function phoneOf(context: ExecutionContext): string | null {
 @Module({
   imports: [
     ThrottlerModule.forRootAsync({
-      inject: [RedisService],
-      useFactory: (redis: RedisService) => ({
+      inject: [RedisService, ConfigService],
+      useFactory: (redis: RedisService, config: ConfigService) => ({
         storage: new RedisThrottlerStorage(redis.getClient()),
         throttlers: [
           { name: 'default', ...RATE_LIMITS.default },
@@ -145,6 +165,16 @@ function phoneOf(context: ExecutionContext): string | null {
             ...RATE_LIMITS.login,
             skipIf: (context) => context.getType() !== 'http' || phoneOf(context) === null,
             getTracker: (_req, context) => `phone:${phoneOf(context)}`
+          },
+          {
+            name: 'global',
+            limit: config.getOrThrow<number>('VERIFICATION_SESSIONS_PER_MINUTE'),
+            ttl: MINUTE,
+            skipIf: (context) =>
+              context.getType() !== 'http' || !reflector.getAllAndOverride<boolean>(GLOBAL_LIMIT, [context.getHandler(), context.getClass()]),
+            getTracker: () => 'all-clients',
+            // The shared count is nobody's business.
+            setHeaders: false
           }
         ]
       })

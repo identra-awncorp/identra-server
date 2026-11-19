@@ -34,11 +34,11 @@ class CredentialsQueryDto {
   cursor?: string;
 }
 
-/** Opaque cursor: the (issuedAt, id) of the last item of the previous page. */
-const encodeCursor = (issuedAt: Date, id: string) =>
+/** Opaque cursor: the (time, id) of the last item of the previous page (also the product event listing). */
+export const encodeCursor = (issuedAt: Date, id: string) =>
   Buffer.from(JSON.stringify([issuedAt.toISOString(), id])).toString('base64url');
 
-function decodeCursor(cursor: string): { issuedAt: Date; id: string } {
+export function decodeCursor(cursor: string): { issuedAt: Date; id: string } {
   try {
     const [at, id] = JSON.parse(Buffer.from(cursor, 'base64url').toString('utf8')) as [unknown, unknown];
     const issuedAt = new Date(String(at));

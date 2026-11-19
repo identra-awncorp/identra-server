@@ -16,7 +16,11 @@ const logger = new Logger('Redis');
       useFactory: (config: ConfigService) =>
         new Redis(config.getOrThrow<string>('REDIS_URL'), {
           lazyConnect: true,
-          maxRetriesPerRequest: 3
+          // Fail fast while Redis is down or reconnecting: every command (queued ones included)
+          // gives up after 1 s, and a request answers 503 instead of hanging (docs/vc-api.md §2).
+          commandTimeout: 1000,
+          connectTimeout: 2000,
+          maxRetriesPerRequest: 1
         }).on('error', (error: Error) => logger.warn(`Redis unavailable: ${error.message}`))
     },
     RedisService

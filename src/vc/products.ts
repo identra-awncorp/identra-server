@@ -11,6 +11,7 @@ import {
   Injectable,
   Param,
   Post,
+  Query,
   Req,
   Res,
   UseFilters,
@@ -19,7 +20,8 @@ import {
 import { ConfigService } from '@nestjs/config';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Prisma } from '@prisma/client';
-import { IsString, MaxLength } from 'class-validator';
+import { Type } from 'class-transformer';
+import { IsInt, IsOptional, IsString, Matches, Max, MaxLength, Min } from 'class-validator';
 import {
   decodeCredentialUnverified,
   parseDigitalLinkPath,
@@ -30,7 +32,8 @@ import {
 import { checkProductEventForStorage } from '@identra/sdk-server';
 
 import { OrgApiKeyHash } from '../config/env.validation';
-import { allowAnyOrigin, apiError, HttpResponse, V1ErrorFilter } from '../common/http-errors';
+import { allowAnyOrigin, apiError, HttpResponse, unavailable, V1ErrorFilter } from '../common/http-errors';
+import { decodeCursor, encodeCursor } from '../demo-portal/demo-portal.controller';
 import { RateLimit, RateLimitFailClosed } from '../common/rate-limit';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { PRODUCT_ISSUERS } from './hosted-issuers';
@@ -133,9 +136,8 @@ export class ProductEventsService {
     }
 
     if (claimedIssuer === null) throw refusal(400, 'ISSUER_NOT_TRUSTED', existing.length, 'The event is not from a product issuer hosted here.');
-    if (input.actingOrg !== null && input.actingOrg !== claimedIssuer) {
-      throw apiError(403, 'FORBIDDEN', 'This API key belongs to another organisation than the event issuer.');
-    }
+    // M3: its status entry lives in a list this server could not publish.
+    if (this.pki.unavailable.has(claimedIssuer)) throw unavailable('The status lists of this issuer cannot be signed at the moment.');
 
     // Verified now: the claims below are authenticated.
     const payload = decodeCredentialUnverified(compact).payload as {
@@ -169,6 +171,11 @@ export class ProductEventsService {
       });
     } catch (error) {
       if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
+        // UNIQUE (issuerName, statusListNumber, statusIndex): the entry belongs to another event.
+        if (String(error.meta?.target).includes('statusIndex')) {
+          throw refusal(400, 'STATUS_ALREADY_USED', existing.length, 'The event status entry is already used by another event.');
+        }
+
         throw refusal(409, 'CHAIN_BROKEN', existing.length, 'Another event was stored for this stage first.');
       }
 
@@ -246,11 +253,73 @@ export class ProductEventsController {
   @UseGuards(ProductApiKeyGuard)
   async store(@Req() req: ProductRequest, @Body() body: StoreEventDto) {
     const { gtin, serial } = productOf(req);
-    const { seq } = await this.products.store({ gtin, serial, compact: body.credential, actingOrg: req.productOrg! });
 
-    return { seq };
+    // `id` is what POST /v1/issuers/:name/credentials/:id/status takes (M2).
+    return this.products.store({ gtin, serial, compact: body.credential, actingOrg: req.productOrg! });
+  }
+}
+
+class EventsQueryDto {
+  @IsOptional()
+  @Matches(/^[0-9]{14}$/)
+  gtin?: string;
+
+  @IsOptional()
+  @IsString()
+  @MaxLength(20)
+  serial?: string;
+
+  @IsOptional()
+  @Type(() => Number)
+  @IsInt()
+  @Min(1)
+  @Max(100)
+  limit = 50;
+
+  @IsOptional()
+  @IsString()
+  @Matches(/^[A-Za-z0-9_-]{1,200}$/)
+  cursor?: string;
+}
+
+/**
+ * GET /v1/issuers/:name/credentials (docs/vc-api.md §7): a product organisation's own events,
+ * newest first, so an operator can find the id to revoke. Its API key only.
+ */
+@ApiTags('products')
+@Controller('issuers')
+@UseFilters(V1ErrorFilter)
+export class ProductEventListController {
+  constructor(private readonly prisma: PrismaService) {}
+
+  @Get(':name/credentials')
+  @ApiBearerAuth()
+  @UseGuards(ProductApiKeyGuard)
+  async list(@Req() req: ProductRequest, @Param('name') name: string, @Query() query: EventsQueryDto) {
+    if (!PRODUCT_ISSUERS.includes(name)) throw apiError(404, 'NOT_FOUND', 'No such product issuer.');
+    if (req.productOrg !== name) throw apiError(403, 'FORBIDDEN', 'This API key belongs to another organisation.');
+
+    const after = query.cursor === undefined ? undefined : decodeCursor(query.cursor);
+    const page = await this.prisma.productEvent.findMany({
+      where: {
+        issuerName: name,
+        ...(query.gtin !== undefined ? { gtin: query.gtin } : {}),
+        ...(query.serial !== undefined ? { serial: query.serial } : {}),
+        ...(after ? { OR: [{ createdAt: { lt: after.issuedAt } }, { createdAt: after.issuedAt, id: { lt: after.id } }] } : {})
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: query.limit + 1,
+      select: { id: true, gtin: true, serial: true, seq: true, congDoan: true, status: true, createdAt: true }
+    });
+    const rows = page.slice(0, query.limit);
+    const last = rows[rows.length - 1];
+
+    return {
+      items: rows.map((row) => ({ ...row, createdAt: row.createdAt.toISOString() })),
+      nextCursor: page.length > query.limit && last ? encodeCursor(last.createdAt, last.id) : null
+    };
   }
 }
 
 export const productProviders = [ProductEventsService];
-export const productControllers = [ProductEventsController];
+export const productControllers = [ProductEventsController, ProductEventListController];
