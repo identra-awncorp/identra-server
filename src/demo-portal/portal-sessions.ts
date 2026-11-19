@@ -6,6 +6,7 @@ import * as argon2 from 'argon2';
 import Redis from 'ioredis';
 
 import { apiError, unavailable } from '../common/http-errors';
+import { clientOf, NETWORK_SHARES } from '../common/live-cap';
 import { createRedisStateStore, StateStore } from '../common/state-store';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { RedisService } from '../infrastructure/redis/redis.service';
@@ -35,13 +36,28 @@ export const sessionHashOf = (token: string) => createHash('sha256').update(`por
 export const MAX_CONCURRENT_HASHES = 2;
 
 /**
- * Wrong passwords for one registrar account (its name is public) within the window; beyond that the
- * account's sign-in answers 429 until the window ends, even with the right password, so guessing
- * gets no further. Students are never counted: their password is public, and a third party must
- * not be able to lock them out. A third party can delay the registrar's own sign-in this way.
+ * Wrong passwords for a registrar account (its name is public), counted per client (an IPv4
+ * address or IPv6 /56; its /48: NETWORK_SHARES ×) and, as a backstop, for the account from
+ * everywhere, each in a 15-minute window. A client over its count gets 429 for that account until
+ * its window ends, even with the right password, so guessing gets no further; it locks out only
+ * itself. The account-wide backstop (only reached by many addresses) refuses every client.
+ * Students are never counted: their password is public and nobody may lock them out.
  */
 export const REGISTRAR_FAILURES = 10;
+export const REGISTRAR_ACCOUNT_FAILURES = 500;
 export const REGISTRAR_WINDOW_SECONDS = 15 * 60;
+
+/** The failure counters a sign-in to `username` from `ip` is checked against, with their limits. */
+export function registrarCounters(username: string, ip: string | undefined): Array<[key: string, limit: number]> {
+  const base = `state:portal-registrar-failures:${username}`;
+  const client = clientOf(ip);
+
+  return [
+    [`${base}:client:${client.key}`, REGISTRAR_FAILURES],
+    ...(client.network ? [[`${base}:net:${client.network}`, REGISTRAR_FAILURES * NETWORK_SHARES] as [string, number]] : []),
+    [base, REGISTRAR_ACCOUNT_FAILURES]
+  ];
+}
 
 export function readBearer(header: string | string[] | undefined): string | null {
   const value = Array.isArray(header) ? header[0] : header;
@@ -71,17 +87,22 @@ export class PortalSessions implements OnModuleInit {
     this.dummyHash = await argon2.hash(randomBytes(16).toString('hex'), PORTAL_PASSWORD_HASH);
   }
 
-  async login(username: string, password: string) {
+  /** `ip`: req.ip, the address nginx passed on (counts a registrar's wrong passwords per client). */
+  async login(username: string, password: string, ip: string | undefined) {
     const account = await this.prisma.demoPortalAccount.findUnique({ where: { username } });
-    const failures = account?.role === 'registrar' ? `state:portal-registrar-failures:${account.username}` : null;
+    const counters = account?.role === 'registrar' ? registrarCounters(account.username, ip) : [];
 
-    if (failures) {
-      const [[, count], [, pttl]] = (await this.redis.multi().get(failures).pttl(failures).exec().catch(() => {
+    if (counters.length > 0) {
+      const read = counters.reduce((m, [key]) => m.get(key).pttl(key), this.redis.multi());
+      const replies = (await read.exec().catch(() => {
         throw unavailable();
-      })) as [[null, string | null], [null, number]];
+      })) as Array<[null, string | number | null]>;
+      const over = counters.findIndex(([, limit], i) => Number(replies[2 * i]![1]) >= limit);
 
-      if (Number(count) >= REGISTRAR_FAILURES) {
-        throw apiError(429, 'RATE_LIMITED', 'Too many failed sign-ins for this account; try again later.', { retryAfter: Math.max(1, Math.ceil(pttl / 1000)) });
+      if (over >= 0) {
+        const retryAfter = Math.max(1, Math.ceil(Number(replies[2 * over + 1]![1]) / 1000));
+
+        throw apiError(429, 'RATE_LIMITED', 'Too many failed sign-ins for this account; try again later.', { retryAfter });
       }
     }
 
@@ -95,7 +116,12 @@ export class PortalSessions implements OnModuleInit {
       .finally(() => (this.hashing -= 1));
 
     if (!account || !valid) {
-      if (failures) await this.redis.multi().incr(failures).expire(failures, REGISTRAR_WINDOW_SECONDS, 'NX').exec().catch(() => undefined);
+      if (counters.length > 0) {
+        await counters
+          .reduce((m, [key]) => m.incr(key).expire(key, REGISTRAR_WINDOW_SECONDS, 'NX'), this.redis.multi())
+          .exec()
+          .catch(() => undefined);
+      }
 
       throw apiError(401, 'INVALID_CREDENTIALS', 'Username or password is incorrect.');
     }

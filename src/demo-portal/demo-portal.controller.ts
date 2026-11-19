@@ -1,4 +1,4 @@
-import { Body, Controller, Get, HttpCode, Module, Post, Query, UseFilters, UseGuards } from '@nestjs/common';
+import { Body, Controller, Get, HttpCode, Module, Post, Query, Req, UseFilters, UseGuards } from '@nestjs/common';
 import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
 import { Prisma } from '@prisma/client';
 import { Type } from 'class-transformer';
@@ -66,8 +66,8 @@ export class DemoPortalController {
   @Post('login')
   @HttpCode(201)
   @RateLimit('login')
-  login(@Body() body: PortalLoginDto) {
-    return this.sessions.login(body.username, body.password);
+  login(@Body() body: PortalLoginDto, @Req() req: { ip?: string }) {
+    return this.sessions.login(body.username, body.password, req.ip);
   }
 
   /**

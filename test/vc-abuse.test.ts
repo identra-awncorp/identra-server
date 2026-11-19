@@ -247,3 +247,25 @@ describe('B-6: sign-in from many /64s of one /48', () => {
     assert.equal((await attempt('2001:db8:78::1', TEST_PORTAL_PASSWORD)).status, 201);
   });
 });
+
+describe('B-7: the /48 budget applies to routes that create state, not to reads', () => {
+  it('polling from many /64s of one /48 beyond the old /48 read budget is served; the token endpoint is still limited per /48', async () => {
+    const poll = (ip: string) => call('GET', '/v1/verification/sessions/AAAAAAAAAAAAAAAAAAAAAA', { ip }).then((r) => r.status);
+    // A carrier's /48 pool: every phone its own /64, each polling (the reads' /48 budget used to be 4 × 300/min).
+    const reads = tally(await pool(Array.from({ length: 4 * RATE_LIMITS.default.limit + 100 }, (_, i) => () => poll(`2001:db8:91:${i.toString(16)}::1`))));
+
+    assert.deepEqual(reads, { 404: 4 * RATE_LIMITS.default.limit + 100 });
+    // The per-client read limit still holds.
+    const one = tally(await pool(Array.from({ length: RATE_LIMITS.default.limit + 1 }, () => () => poll('2001:db8:91:ffff::1'))));
+
+    assert.deepEqual(one, { 404: RATE_LIMITS.default.limit, 429: 1 });
+
+    const budget = RATE_LIMITS.token.limit * NETWORK_SHARES;
+    const token = (ip: string) =>
+      fetch(`${LOCAL}/issuers/truong-mau/token`, { method: 'POST', headers: { 'x-forwarded-for': ip, 'content-type': 'application/x-www-form-urlencoded' }, body: 'grant_type=x' }).then(async (r) => (await r.text(), r.status));
+    const writes = tally(await pool(Array.from({ length: budget + 1 }, (_, i) => () => token(`2001:db8:92:${i.toString(16)}::1`))));
+
+    // Refused by the issuer (unsupported grant) up to the /48 budget, then by the /48 limiter.
+    assert.deepEqual(writes, { 400: budget, 429: 1 });
+  });
+});

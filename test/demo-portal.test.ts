@@ -9,7 +9,14 @@ import request from 'supertest';
 
 import { PrismaService } from '../src/infrastructure/prisma/prisma.service';
 import { RedisService } from '../src/infrastructure/redis/redis.service';
-import { MAX_CONCURRENT_HASHES, REGISTRAR_FAILURES, sessionHashOf } from '../src/demo-portal/portal-sessions';
+import { NETWORK_SHARES } from '../src/common/live-cap';
+import {
+  MAX_CONCURRENT_HASHES,
+  REGISTRAR_ACCOUNT_FAILURES,
+  REGISTRAR_FAILURES,
+  REGISTRAR_WINDOW_SECONDS,
+  sessionHashOf
+} from '../src/demo-portal/portal-sessions';
 import { createTestApp, portalLogin, randomIp, seedPortalAccounts, TEST_PORTAL_PASSWORD, TEST_REGISTRAR_PASSWORD } from './helpers';
 
 // Runs without keys: the portal itself needs none. Credential rows are inserted directly.
@@ -144,31 +151,64 @@ describe('POST /v1/demo/school/login', () => {
     await login('sv001', TEST_PORTAL_PASSWORD).expect(201);
   });
 
-  it(`locks the registrar account after ${REGISTRAR_FAILURES} wrong passwords from anywhere (429, also for the right one); a student account is never locked`, async (t) => {
-    const key = 'state:portal-registrar-failures:phongdaotao';
+  it(`counts the registrar's wrong passwords per client: an attacker locks out only itself; a backstop of ${REGISTRAR_ACCOUNT_FAILURES} for the account; students never`, async (t) => {
     const redis = app.get(RedisService).getClient();
+    const reset = async () => {
+      const keys = [...(await redis.keys('state:portal-registrar-failures:*')), ...(await redis.keys('throttle:*'))];
 
-    await redis.del(key); // the wrong passwords of the tests above
-    t.after(() => redis.del(key)); // the other tests sign in as the registrar
-    // Rotating addresses: the per-client limit never applies.
-    for (let i = 0; i < REGISTRAR_FAILURES; i += 1) await login('phongdaotao', `guess-${i}`, `192.0.2.${10 + i}`).expect(401);
+      if (keys.length > 0) await redis.del(...keys);
+    };
+    // The sign-in limit (10/min per client, 40 per /48) is not what is tested: cleared before a lock is checked.
+    const clearRateLimits = async () => {
+      const keys = await redis.keys('throttle:*');
 
+      if (keys.length > 0) await redis.del(...keys);
+    };
+    const isLock = (res: { body: { message: string }; headers: Record<string, string> }) =>
+      res.body.message.startsWith('Too many failed sign-ins') && Number(res.headers['retry-after']) > 14 * 60 && Number(res.headers['retry-after']) <= 15 * 60;
+
+    await reset(); // the wrong passwords of the tests above
+    t.after(reset); // the other tests sign in as the registrar
+
+    // One IPv4 attacker, within the normal sign-in limit: locked, also with the right password.
+    for (let i = 0; i < REGISTRAR_FAILURES; i += 1) await login('phongdaotao', `guess-${i}`, '192.0.2.10').expect(401);
+    await clearRateLimits();
     for (const password of ['guess-x', TEST_REGISTRAR_PASSWORD]) {
-      const locked = await login('phongdaotao', password, '192.0.2.99').expect(429);
+      const locked = await login('phongdaotao', password, '192.0.2.10').expect(429);
 
       assert.equal(locked.body.code, 'RATE_LIMITED');
-      // Until the window that began with the first wrong password ends.
-      assert.ok(Number(locked.headers['retry-after']) > 14 * 60 && Number(locked.headers['retry-after']) <= 15 * 60, locked.headers['retry-after']);
+      assert.ok(isLock(locked), `${locked.body.message} ${locked.headers['retry-after']}`);
     }
 
-    // The public student accounts: three times as many wrong passwords, then the right one works.
-    for (let i = 0; i < 3 * REGISTRAR_FAILURES; i += 1) await login('sv002', `guess-${i}`, `192.0.2.${100 + i}`).expect(401);
-    await login('sv002', TEST_PORTAL_PASSWORD, '192.0.2.200').expect(201);
+    // The registrar, from another address, signs in at once.
+    assert.equal((await login('phongdaotao', TEST_REGISTRAR_PASSWORD, '198.51.100.20').expect(201)).body.role, 'registrar');
+
+    // An IPv6 attacker spreading over the /56s of one /48: the /48 is locked as a whole (one try per /56).
+    for (let i = 0; i < REGISTRAR_FAILURES * NETWORK_SHARES; i += 1) {
+      await login('phongdaotao', `guess-${i}`, `2001:db8:9a:${(i << 8).toString(16)}::1`).expect(401);
+    }
+    await clearRateLimits();
+    assert.ok(isLock(await login('phongdaotao', TEST_REGISTRAR_PASSWORD, '2001:db8:9a:ff00::1').expect(429)));
+    await login('phongdaotao', TEST_REGISTRAR_PASSWORD, '2001:db8:9b::1').expect(201);
+
+    // The backstop: the account's count from everywhere (seeded one short; 500 sign-ins are slow).
+    await redis.set('state:portal-registrar-failures:phongdaotao', String(REGISTRAR_ACCOUNT_FAILURES - 1), 'EX', REGISTRAR_WINDOW_SECONDS);
+    await login('phongdaotao', 'guess-last', '198.51.100.21').expect(401);
+    assert.ok(isLock(await login('phongdaotao', TEST_REGISTRAR_PASSWORD, '198.51.100.22').expect(429)), 'every client is refused');
+
+    // The public student accounts: three times as many wrong passwords from one address, then the
+    // right one from that address works; nothing is counted for them.
+    for (let i = 0; i < 3 * REGISTRAR_FAILURES; i += 1) {
+      if (i % 10 === 0) await clearRateLimits();
+      await login('sv002', `guess-${i}`, '192.0.2.30').expect(401);
+    }
+    await clearRateLimits();
+    await login('sv002', TEST_PORTAL_PASSWORD, '192.0.2.30').expect(201);
     assert.deepEqual(await redis.keys('state:portal-registrar-failures:sv*'), []);
 
-    // Once the window ends the registrar signs in again.
-    await redis.del(key);
-    await login('phongdaotao', TEST_REGISTRAR_PASSWORD, '192.0.2.99').expect(201);
+    // Once its window ends the account signs in again.
+    await reset();
+    await login('phongdaotao', TEST_REGISTRAR_PASSWORD, '192.0.2.10').expect(201);
   });
 });
 

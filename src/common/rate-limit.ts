@@ -1,4 +1,5 @@
 import {
+  applyDecorators,
   ExecutionContext,
   Injectable,
   Module,
@@ -23,9 +24,10 @@ const MINUTE = 60_000;
 
 /**
  * Per-client limits per route (docs/vc-api.md §8). A client is an IPv4 address or an IPv6 /64
- * (the throttler's own tracker, normalizeIp); an IPv6 /48 (65,536 /64s) also has a budget of
- * NETWORK_SHARES clients on every route (throttler `network`). Every route already gets `default`
- * (300/min); declare a tighter one with `@RateLimit('login')` etc.
+ * (the throttler's own tracker, normalizeIp). Every route already gets `default` (300/min);
+ * declare a tighter one with `@RateLimit('login')` etc. The routes that create state or cost CPU
+ * (PER_NETWORK) also give an IPv6 /48 (65,536 /64s) a budget of NETWORK_SHARES clients
+ * (throttler `network`); reads are not limited per /48 (one mobile carrier's /48 pool polls).
  */
 export const RATE_LIMITS = {
   default: { limit: 300, ttl: MINUTE },
@@ -40,8 +42,20 @@ export const RATE_LIMITS = {
 
 const perNetwork = ({ limit, ttl }: { limit: number; ttl: number }) => ({ limit: limit * NETWORK_SHARES, ttl });
 
+const PER_NETWORK: ReadonlySet<keyof typeof RATE_LIMITS> = new Set(['login', 'sessionCreation', 'token', 'write']);
+const NETWORK_LIMITED = 'identra:rate-limit-network';
+
 export const RateLimit = (name: keyof typeof RATE_LIMITS) =>
-  Throttle({ default: RATE_LIMITS[name], network: perNetwork(RATE_LIMITS[name]) });
+  PER_NETWORK.has(name)
+    ? applyDecorators(Throttle({ default: RATE_LIMITS[name], network: perNetwork(RATE_LIMITS[name]) }), SetMetadata(NETWORK_LIMITED, true))
+    : Throttle({ default: RATE_LIMITS[name] });
+
+/** The /48 of an IPv6 client on a PER_NETWORK route; null (skip) for IPv4 and every other route. */
+function networkLimited(context: ExecutionContext): string | null {
+  if (context.getType() !== 'http' || !Reflect.getMetadata(NETWORK_LIMITED, context.getHandler())) return null;
+
+  return networkOf(context.switchToHttp().getRequest<{ ip?: string }>().ip);
+}
 
 const FAIL_CLOSED = 'identra:rate-limit-fail-closed';
 
@@ -155,13 +169,14 @@ function phoneOf(context: ExecutionContext): string | null {
         storage: new RedisThrottlerStorage(redis.getClient()),
         throttlers: [
           { name: 'default', ...RATE_LIMITS.default },
-          // The /48 of an IPv6 client (IPv4: skipped). No extra headers: Retry-After is set on refusal.
+          // The /48 of an IPv6 client on the routes of PER_NETWORK, whose limits it carries (the
+          // values here are never used). No extra headers: Retry-After is set on refusal.
           {
             name: 'network',
-            ...perNetwork(RATE_LIMITS.default),
+            ...perNetwork(RATE_LIMITS.write),
             setHeaders: false,
-            skipIf: (context) => context.getType() !== 'http' || networkOf(context.switchToHttp().getRequest<{ ip?: string }>().ip) === null,
-            getTracker: (req: { ip?: string }) => `net:${networkOf(req.ip)}`
+            skipIf: (context) => networkLimited(context) === null,
+            getTracker: (_req, context) => `net:${networkLimited(context)}`
           },
           {
             name: 'phone',

@@ -63,9 +63,15 @@ The school portal's sample accounts: Deploy, step 7.
   table and never prints a password. It needs two: `DEMO_PORTAL_PASSWORD` for the three students
   (public, printed on the portal's sign-in page) and `DEMO_PORTAL_REGISTRAR_PASSWORD` for the
   registrar (private, at least 20 characters, different: the registrar can suspend and revoke
-  every diploma, and its account name is public). Never publish the second one. After 10 wrong
-  passwords in 15 minutes the registrar's sign-in waits until those 15 minutes end (anyone can
-  cause that delay; the student accounts are never locked).
+  every diploma, and its account name is public). Never publish the second one. Wrong registrar
+  passwords are counted per client: 10 in 15 minutes from one address (40 from one IPv6 /48)
+  lock the registrar's sign-in from that address only, so the registrar signs in from another.
+  After 500 in 15 minutes from everywhere (a distributed attack) the registrar's sign-in is
+  refused for everyone until those 15 minutes end; meanwhile change statuses with the
+  organisation API key of `truong-mau` (`IDENTRA_ORG_API_KEY_HASHES`), typed so it stays out of
+  the shell history and the process list:
+  `read -rs KEY; printf 'Authorization: Bearer %s' "$KEY" | curl -H @- -H 'content-type: application/json' -d '{"status":"revoked"}' https://api-identra.awncorp.vn/v1/issuers/truong-mau/credentials/<id>/status; unset KEY`.
+  The student accounts are never locked.
 - Every visitor of a student account works in their own portal session: offers, the diplomas
   issued from them and their revocation belong to that session (docs/vc-api.md §5). Issued diplomas are recorded in `VcIssuedCredential`
   (status entry, cnf thumbprint, no claims); the credential itself is never stored.

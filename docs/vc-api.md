@@ -142,7 +142,7 @@ even of the same account, does not see, poll, cancel or revoke it (it gets `404`
 
 | Method and path | Auth | Body | Success | Errors |
 |---|---|---|---|---|
-| `POST /v1/demo/school/login` | none, rate limited | `{ username, password }` | `201 { token, expiresAt, serverTime, role: "student" \| "registrar", profile }` | `400 VALIDATION_FAILED`, `401 INVALID_CREDENTIALS`, `429 RATE_LIMITED` (also the registrar account after 10 wrong passwords in 15 minutes, section 8), `503 UNAVAILABLE` (also when the server is hashing too many passwords at once; retry after `Retry-After`) |
+| `POST /v1/demo/school/login` | none, rate limited | `{ username, password }` | `201 { token, expiresAt, serverTime, role: "student" \| "registrar", profile }` | `400 VALIDATION_FAILED`, `401 INVALID_CREDENTIALS`, `429 RATE_LIMITED` (also the registrar account from a client with 10 wrong passwords in 15 minutes, or from everyone after 500; section 8), `503 UNAVAILABLE` (also when the server is hashing too many passwords at once; retry after `Retry-After`) |
 | `POST /v1/demo/school/offers` | student | none | `201 { offerId, offerUri, txCode, expiresAt, serverTime }` | `403 FORBIDDEN` (registrar), `429 RATE_LIMITED` (this client already holds 5 live offers, or created 100 in the last 30 minutes; an IPv6 /48: 4 times that), `503 UNAVAILABLE` (all clients together hold the cap); both with `Retry-After` |
 | `GET /v1/demo/school/offers/:offerId` | student, the session that created it | none | `200 { status: "pending" \| "issued" \| "expired", serverTime }` | `404 NOT_FOUND` (unknown, older than 30 minutes, or another session's) |
 | `DELETE /v1/demo/school/offers/:offerId` | student, the session that created it | none | `200 { offerId, status: "expired" \| "issued", serverTime }`: a pending offer is cancelled (its code stops working, its place is freed); an issued one stays issued; repeating it is harmless | `404 NOT_FOUND` as above |
@@ -281,19 +281,28 @@ IPv6 /64 counts as one client (GraphQL's cost limiter too). Login 10/min, sessio
 bounded by the 5 attempts per offer, section 4), other writes 60/min, reads 300/min (polling a
 session once per second and an offer every two seconds stays well inside). The public signed
 resources of section 3 and the product events allow 1200/min: verifiers behind one address
-fetch them, and they are cacheable. An IPv6 **/48** (65,536 /64s, free from tunnel brokers) also
-has a budget of **4 clients** on every route: login 40/min, session creation 120/min, token
-480/min, other writes (offers, nonces, portal writes, wallet responses) 240/min, reads 1200/min,
-public resources 4800/min; IPv4 has no second level. Exceeding → `429 RATE_LIMITED`
+fetch them, and they are cacheable. On the routes that create state or cost CPU, an IPv6 **/48**
+(65,536 /64s, free from tunnel brokers) also has a budget of **4 clients**: sign-in (portal and
+app) 40/min, session creation 120/min, token 480/min, other writes (offers and their cancelling,
+nonces, credentials, portal writes, wallet responses, status changes, product events) 240/min.
+Reads (session and offer polling, listings, health) and the public resources have no /48 budget:
+the phones of one mobile carrier can share a /48 pool, and each polls on its own. IPv4 has no
+second level. Exceeding → `429 RATE_LIMITED`
 (`temporarily_unavailable` on protocol routes) with `Retry-After`, and the fixed message `Too many
 requests; try again later.` GraphQL over its cost budget answers HTTP `429` too
 (`extensions.code: RATE_LIMITED`, `Retry-After`). The portal hashes at most two passwords at once;
 a sign-in beyond that is `503 UNAVAILABLE` with `Retry-After: 1` (the per-client login limits
 apply before any hashing). The registrar account (its name is public) also counts its wrong
-passwords: after 10 within 15 minutes, from any address, its sign-in answers `429 RATE_LIMITED`
-with `Retry-After` until those 15 minutes end, even with the right password. Anyone can thus
-delay the registrar's sign-in (never anything else); the student accounts are never counted, so
-nobody can lock them.
+passwords **per client**, each count in a window of 15 minutes from its first wrong password:
+after 10 from one IPv4 address or IPv6 /56 (40 from one /48), sign-ins to the registrar from that
+client answer `429 RATE_LIMITED` with `Retry-After` until its window ends, even with the right
+password. An attacker so locks out only itself; the registrar signs in from any other address.
+As a backstop the account also counts wrong passwords from everywhere: after 500 within 15
+minutes (at least 50 attacking addresses or 13 /48s) every sign-in to the registrar is refused
+the same way until that window ends. The operator's fallback meanwhile is the issuer's
+organisation API key on the status route (`POST /v1/issuers/truong-mau/credentials/<id>/status`,
+section 3), which needs no portal sign-in. The student accounts are never counted, so nobody can
+lock them.
 
 Anonymous protocol state lives in Redis (128 MB, `noeviction`: when full, writes fail). Its
 cost is bounded by a **global cap** per kind (the memory bound, whatever the number of
@@ -333,7 +342,10 @@ shares above it takes, per kind: live verification sessions 200 IPv4 addresses o
 sessions of 30 minutes 120 IPv4 addresses or 30 /48s; nonces 100 addresses or 25 /48s; live
 offers 100 addresses or 25 /48s (each also needs a portal sign-in); offers of 30 minutes 100
 addresses or 25 /48s (or any mix: a /48 counts as four addresses). A tunnel broker hands out
-several /48s per free account, so 25 /48s are within one person's reach. The server cannot tell
+several /48s per free account, so 25 /48s are within one person's reach. The two password-hashing
+slots of the portal (about 50 ms each on the VPS) are kept busy, so that other sign-ins answer
+`503` and retry, by about 60 /48s at their 40 sign-ins per minute (measured by the reviewer), or
+240 IPv4 addresses at 10 per minute. The server cannot tell
 such clients from real ones; the remedy is a rate limit at the edge (deploy/README.md, "Edge
 rate limits": Cloudflare rules for `POST /issuers/*/nonce`, `POST /v1/verification/sessions`,
 `POST /v1/demo/school/login` and `POST /v1/demo/school/offers`).
