@@ -232,7 +232,7 @@ a client cannot ask for arbitrary claims.
 | `POST /v1/verification/sessions` `{ verifier, scenario }` | none, rate limited (section 8) | `201 { id, qr, expiresAt, serverTime }`, `Cache-Control: no-store` (the `id` reads the result); `400 VALIDATION_FAILED` for a malformed body, `404 NOT_FOUND` for an unknown verifier or scenario (neither uses any capacity); `429 RATE_LIMITED` with `Retry-After` while this client holds 10 open sessions or created 100 in the last 30 minutes (an IPv6 /48: 4 times that; a session's place is freed once it is final); `503 UNAVAILABLE` with `Retry-After` while the verifier is not in a valid trust list or all clients together hold the cap |
 | `GET /v1/verification/sessions/:id` | knowledge of `id` | Session state and result |
 | `GET /oid4vp/request/:requestId` | none | `200 application/oauth-authz-req+jwt` (signed Request Object with `x5c`) |
-| `POST /oid4vp/response/:requestId` | none | `direct_post.jwt` body `response=<JWE>` → `200 {}` |
+| `POST /oid4vp/response/:requestId` | none | `direct_post.jwt` body `response=<JWE>` → `200 {}`; a refused response `400 invalid_request`; refused only because the issuer's DID could not be resolved now `503 issuer_registry_unavailable` with `Retry-After` (below) |
 
 - `qr` = `openid4vp://?client_id=<client_id>&request_uri=<api>/oid4vp/request/<requestId>`.
   `id` and `requestId` are independent random values: the QR never reveals the
@@ -287,7 +287,15 @@ a client cannot ask for arbitrary claims.
   `kid` fails `did_resolution` with `DID_RESOLUTION_FAILED`. With it: a gateway that gives no
   usable answer (5xx, no answer, timeout, oversized) is `did_resolution` /
   `DID_RESOLUTION_UNAVAILABLE` ("not checked yet"): like every failure of that step the response
-  is refused and the session stays open, never verified; a trust registry that gives no answer
+  is refused and the session stays open, never verified, but it is answered `503` with
+  `Retry-After: 5` and `{ "error": "issuer_registry_unavailable", "error_description": "the
+  verifier could not reach its issuer registry; try again shortly" }` instead of `400`, so the
+  wallet can say "try again in a moment" and send the same request again (the SDK wallet:
+  `DID_RESOLUTION_UNAVAILABLE`). The answer says nothing about the credential or the holder. It
+  counts against the session's 10 refused responses like any other (the DID is the sender's
+  choice, so an exemption would allow unlimited responses during an outage); the 10th ends the
+  session `failed` / `TOO_MANY_ATTEMPTS` with `400`. Other `503`s of this route (Redis or
+  Postgres down) stay `temporarily_unavailable`. A trust registry that gives no answer
   is `issuer_trust` / `TRUST_LIST_UNAVAILABLE`, and an issuer the registry does not recognise
   for the diploma (absent, `rejected`, other type) is `issuer_trust` / `ISSUER_NOT_TRUSTED`,
   both final `failed`. Recognition is never cached: a withdrawal counts at the next session.

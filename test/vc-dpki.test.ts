@@ -9,7 +9,7 @@ import { createPublicKey } from 'node:crypto';
 import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { after, before, describe, it } from 'node:test';
+import { after, before, describe, it, type TestContext } from 'node:test';
 
 import { base64UrlDecode, createCertNetDidResolver, createCertNetTrustRegistry, createMappedFetch, isCertNetDid, utf8Decode, VCT } from '@identra/sdk-core';
 import { ConfigService } from '@nestjs/config';
@@ -385,17 +385,60 @@ describe('the DID issuer truong-mau-certnet and the hosted verifier', () => {
     assert.deepEqual([header.kid, 'x5c' in header, payload.sub], [`${did()}#key-1`, false, `${ORIGIN}/issuers/${DID_ISSUER}/status/1`]);
   });
 
-  it('a gateway with no usable answer (503, connection dropped): refused at did_resolution, never accepted', async (t) => {
+  // One session across the next two tests: answered while the gateway is down, then once it is back.
+  let outage: { id: string; submit: () => ReturnType<Wallet['presentations']['submit']> };
+  // What the response endpoint answered, as seen on the wire.
+  const answers: { status: number; retryAfter: string | null; body: unknown }[] = [];
+  const recordAnswers = (t: TestContext) => {
+    const realFetch = globalThis.fetch;
+
+    t.mock.method(globalThis, 'fetch', async (url: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      const res = await realFetch(url, init);
+
+      if (String(url).includes('/oid4vp/response/')) answers.push({ status: res.status, retryAfter: res.headers.get('retry-after'), body: await res.clone().json() });
+
+      return res;
+    });
+  };
+
+  it('a gateway with no usable answer (503, connection dropped), DID not cached: 503 issuer_registry_unavailable, session open, never accepted; garbage stays 400', async (t) => {
     t.after(() => (stub.mode = 'ok'));
+    recordAnswers(t);
+
+    const created = await createSession();
+    const requestId = new URLSearchParams(created.body.qr.split('?')[1]).get('request_uri')!.split('/').pop()!;
+    const resolved = await holder.wallet.presentations.resolve(created.body.qr);
+    assert.ok(resolved.ok, JSON.stringify(resolved));
+    const submit = () => holder.wallet.presentations.submit(resolved.request, { credentialId, claimSetIndex: 1 });
+
+    outage = { id: created.body.id, submit };
 
     for (const mode of ['unavailable', 'reset'] as const) {
       stub.mode = mode;
-      const { body, submitted, line } = await present(holder.wallet, credentialId);
-
-      assert.equal(submitted.ok, false, mode);
-      assert.notEqual(body.status, 'verified', mode);
-      assert.equal(line?.endsWith('refused (DID_RESOLUTION_UNAVAILABLE)'), true, `${mode}: ${line}`);
+      assert.deepEqual(await submit(), { ok: false, code: 'DID_RESOLUTION_UNAVAILABLE' }, mode);
+      assert.deepEqual(answers.pop(), {
+        status: 503,
+        retryAfter: '5',
+        body: { error: 'issuer_registry_unavailable', error_description: 'the verifier could not reach its issuer registry; try again shortly' }
+      }, mode);
+      assert.equal((await session(created.body.id)).status, 'request_retrieved', mode);
     }
+
+    // Garbage for the same session is the plain 400, outage or not.
+    const garbage = await fetch(`${LOCAL}/oid4vp/response/${requestId}`, { method: 'POST', headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: 'response=garbage' });
+    assert.deepEqual([garbage.status, await garbage.json()], [400, { error: 'invalid_request', error_description: 'the response is not acceptable' }]);
+
+    const lines = logs.filter((l) => l.startsWith(`Presentation ${created.body.id.slice(0, 8)}:`)).map((l) => l.split(': ')[1]);
+    assert.deepEqual(lines, ['refused (DID_RESOLUTION_UNAVAILABLE)', 'refused (DID_RESOLUTION_UNAVAILABLE)', 'refused (MALFORMED)']);
+  });
+
+  it('the gateway answers again: the same request of the same session verifies', async (t) => {
+    recordAnswers(t);
+    assert.deepEqual(await outage.submit(), { ok: true });
+    assert.deepEqual(answers.pop(), { status: 200, retryAfter: null, body: {} });
+    const done = await session(outage.id);
+    assert.equal(done.status, 'verified', JSON.stringify(done));
+    assert.equal(done.result.issuerDid, did());
   });
 
   it('verified on the DID path: trustPath did, the issuer DID, no issuer name', async () => {
