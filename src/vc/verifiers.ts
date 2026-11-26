@@ -5,7 +5,7 @@ import { createPresentationVerifier, type PresentationVerifier, type TrustListSe
 import { createRedisStateStore } from '../common/state-store';
 import { RedisService } from '../infrastructure/redis/redis.service';
 import { HOSTED_VERIFIERS } from './hosted-issuers';
-import { PKI, Pki, STATUS_CHECKER, TRUST_LIST_SERVICE, TRUST_REGISTRY } from './vc.providers';
+import { DPKI, Dpki, PKI, Pki, STATUS_CHECKER, TRUST_LIST_SERVICE, TRUST_REGISTRY } from './vc.providers';
 import type { createSignedTrustListRegistry } from '@identra/sdk-core';
 
 type Registry = ReturnType<typeof createSignedTrustListRegistry>;
@@ -65,9 +65,13 @@ export function createHostedVerifiers(deps: {
   trustList: TrustListService;
   trustRegistry: Registry;
   statusChecker: StatusChecker;
+  /** With DPKI configured the verifiers also accept DID issuers' credentials (ADR-0020). */
+  dpki?: Dpki | null;
   redis: RedisService;
 }): HostedVerifiers {
-  const { pki, clock, trustList, trustRegistry, statusChecker } = deps;
+  const { pki, clock, trustList, trustRegistry, dpki } = deps;
+  const statusChecker = dpki?.statusChecker ?? deps.statusChecker;
+  const didPath = dpki ? { dpki: { resolver: dpki.resolver, trustRegistry: dpki.trustRegistry } } : {};
   const store = createRedisStateStore(deps.redis.getClient(), VERIFIER_STATE_NAMESPACE);
   const slots = new Map<string, Slot>(HOSTED_VERIFIERS.map((h) => [h.name, { verifier: null, listed: false, token: null, triedAt: -Infinity }]));
 
@@ -84,7 +88,15 @@ export function createHostedVerifiers(deps: {
       slot.verifier = await createPresentationVerifier({
         apiOrigin: pki.baseUrl,
         signer: await pki.keyStore.signer(name, 'request'),
-        verification: { verifier: pki.verifier, hasher: pki.hasher, chainValidator: pki.chainValidator, trustRegistry, statusChecker, supportedVcts: [VCT.diploma] },
+        verification: {
+          verifier: pki.verifier,
+          hasher: pki.hasher,
+          chainValidator: pki.chainValidator,
+          trustRegistry,
+          statusChecker,
+          supportedVcts: [VCT.diploma],
+          ...didPath
+        },
         random: pki.random,
         clock,
         store,
@@ -138,10 +150,18 @@ export function createHostedVerifiers(deps: {
 export const verifierProviders: Provider[] = [
   {
     provide: VERIFIERS,
-    inject: [PKI, VERIFIER_CLOCK, TRUST_LIST_SERVICE, TRUST_REGISTRY, STATUS_CHECKER, RedisService],
+    inject: [PKI, VERIFIER_CLOCK, TRUST_LIST_SERVICE, TRUST_REGISTRY, STATUS_CHECKER, DPKI, RedisService],
     // Tried once at startup; a verifier that cannot be built does not stop the server (M1).
-    useFactory: async (pki: Pki, clock: Clock, trustList: TrustListService, trustRegistry: Registry, statusChecker: StatusChecker, redis: RedisService) => {
-      const verifiers = createHostedVerifiers({ pki, clock, trustList, trustRegistry, statusChecker, redis });
+    useFactory: async (
+      pki: Pki,
+      clock: Clock,
+      trustList: TrustListService,
+      trustRegistry: Registry,
+      statusChecker: StatusChecker,
+      dpki: Dpki | null,
+      redis: RedisService
+    ) => {
+      const verifiers = createHostedVerifiers({ pki, clock, trustList, trustRegistry, statusChecker, dpki, redis });
 
       await verifiers.check();
 

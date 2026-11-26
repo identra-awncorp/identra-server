@@ -1,8 +1,9 @@
 import { isAbsolute, join } from 'node:path';
 
+import { createCertNetTrustRegistry, type CertNetNetwork } from '@identra/sdk-core';
 import { z } from 'zod';
 
-import { HOSTED_ISSUERS } from '../vc/hosted-issuers';
+import { hostedIssuers } from '../vc/hosted-issuers';
 
 const booleanFromEnv = z.preprocess((value) => {
   if (typeof value === 'boolean') {
@@ -98,6 +99,13 @@ const envSchema = z.object({
   // Comma list of `org:sha256hex`: the SHA-256 of each organisation's back-office API key.
   // Empty = no API-key access.
   IDENTRA_ORG_API_KEY_HASHES: z.string().default(''),
+  // The DID trust path (ADR-0020, docs/vc-api.md §4 and §6): the CertNet gateway (an https origin,
+  // optional path prefix) and its network, both or neither. Neither = DPKI off. See certnetConfig.
+  CERTNET_GATEWAY_URL: z.string().optional(),
+  CERTNET_NETWORK: z.string().optional(),
+  // Development and tests only: http://127.0.0.1:<port> or http://localhost:<port>, where requests
+  // for the gateway origin are sent instead (identifiers stay canonical).
+  CERTNET_GATEWAY_LOCAL_URL: z.string().optional(),
   // Redis budget of the anonymous protocol state (docs/vc-api.md §8), global caps: live
   // verification sessions (5 minutes each), live c_nonces (5 minutes) and live offers per issuer
   // (10 minutes). Each client has a fixed share inside each cap.
@@ -124,13 +132,66 @@ const envSchema = z.object({
 
 export type Env = Omit<
   z.infer<typeof envSchema>,
-  'CORS_ORIGINS' | 'OTP_DEMO_ENABLED' | 'OTP_DEMO_PHONE_ALLOWLIST' | 'IDENTRA_ORG_API_KEY_HASHES'
+  'CORS_ORIGINS' | 'OTP_DEMO_ENABLED' | 'OTP_DEMO_PHONE_ALLOWLIST' | 'IDENTRA_ORG_API_KEY_HASHES' | 'CERTNET_NETWORK'
 > & {
   CORS_ORIGINS: string;
   OTP_DEMO_ENABLED: boolean;
   OTP_DEMO_PHONE_ALLOWLIST: string[];
   IDENTRA_ORG_API_KEY_HASHES: OrgApiKeyHash[];
+  CERTNET_NETWORK?: CertNetNetwork;
 };
+
+/** The CertNet gateway of the DID trust path (ADR-0020); null when DPKI is off. */
+export interface CertNetConfig {
+  /** https origin with an optional path prefix, no trailing slash; the API is under `<gatewayUrl>/v1`. */
+  gatewayUrl: string;
+  network: CertNetNetwork;
+  /** Development and tests: where requests for the gateway origin go instead. */
+  localUrl?: string;
+}
+
+const CERTNET_NETWORKS: readonly string[] = ['local', 'testnet', 'mainnet'];
+const LOCAL_ORIGIN = /^http:\/\/(127\.0\.0\.1|localhost):([1-9][0-9]{0,4})$/;
+
+/**
+ * CERTNET_GATEWAY_URL and CERTNET_NETWORK, both or neither (neither: null, DPKI off), and
+ * CERTNET_GATEWAY_LOCAL_URL, refused in production and without the other two. The URL rule is the
+ * SDK's (createCertNetTrustRegistry) plus a parse; messages name the variable, never its value.
+ * Also used by the scripts (demo:provision, certnet:register), which run without validateEnv.
+ */
+export function certnetConfig(raw: Record<string, unknown>): CertNetConfig | null {
+  const value = (name: string) => (typeof raw[name] === 'string' && raw[name] !== '' ? (raw[name] as string) : undefined);
+  const gatewayUrl = value('CERTNET_GATEWAY_URL')?.replace(/\/$/, '');
+  const network = value('CERTNET_NETWORK');
+  const localUrl = value('CERTNET_GATEWAY_LOCAL_URL');
+  const invalid = (message: string) => new Error(`Invalid environment variables: ${message}`);
+
+  if (localUrl !== undefined && raw.NODE_ENV === 'production') throw invalid('CERTNET_GATEWAY_LOCAL_URL is for development and tests only');
+  if (gatewayUrl === undefined && network === undefined) {
+    if (localUrl !== undefined) throw invalid('CERTNET_GATEWAY_LOCAL_URL needs CERTNET_GATEWAY_URL and CERTNET_NETWORK');
+
+    return null;
+  }
+  if (gatewayUrl === undefined || network === undefined) throw invalid('CERTNET_GATEWAY_URL and CERTNET_NETWORK must be set together');
+  if (!CERTNET_NETWORKS.includes(network)) throw invalid('CERTNET_NETWORK must be local, testnet or mainnet');
+
+  try {
+    const url = new URL(gatewayUrl);
+
+    if (url.href.replace(/\/$/, '') !== gatewayUrl) throw new Error('not in canonical form');
+    createCertNetTrustRegistry({ gatewayUrl, network: network as CertNetNetwork, fetch: () => Promise.reject(new Error('unused')) });
+  } catch {
+    throw invalid('CERTNET_GATEWAY_URL must be an https origin with an optional path prefix (no query, fragment, credentials or dot segments)');
+  }
+
+  const local = localUrl === undefined ? null : LOCAL_ORIGIN.exec(localUrl);
+
+  if (localUrl !== undefined && (local === null || Number(local[2]) > 65535)) {
+    throw invalid('CERTNET_GATEWAY_LOCAL_URL must be http://127.0.0.1:<port> or http://localhost:<port>');
+  }
+
+  return { gatewayUrl, network: network as CertNetNetwork, ...(localUrl !== undefined ? { localUrl } : {}) };
+}
 
 export function validateEnv(config: Record<string, unknown>): Env {
   const parsed = envSchema.safeParse(config);
@@ -179,7 +240,9 @@ export function validateEnv(config: Record<string, unknown>): Env {
     throw new Error('Invalid environment variables: IDENTRA_ORG_API_KEY_HASHES lists the same key hash twice');
   }
 
-  if (apiKeyHashes.some((k) => !HOSTED_ISSUERS.some((issuer) => issuer.name === k.org))) {
+  const certnet = certnetConfig(config);
+
+  if (apiKeyHashes.some((k) => !hostedIssuers(certnet !== null).some((issuer) => issuer.name === k.org))) {
     throw new Error('Invalid environment variables: IDENTRA_ORG_API_KEY_HASHES names an organisation that is not a hosted issuer');
   }
 
@@ -191,7 +254,10 @@ export function validateEnv(config: Record<string, unknown>): Env {
     IDENTRA_TRUST_LIST_SOURCE:
       env.IDENTRA_TRUST_LIST_SOURCE ??
       (env.IDENTRA_KEYS_DIR === undefined ? undefined : join(env.IDENTRA_KEYS_DIR, 'trust-list.source.json')),
-    IDENTRA_ORG_API_KEY_HASHES: apiKeyHashes
+    IDENTRA_ORG_API_KEY_HASHES: apiKeyHashes,
+    CERTNET_GATEWAY_URL: certnet?.gatewayUrl,
+    CERTNET_NETWORK: certnet?.network,
+    CERTNET_GATEWAY_LOCAL_URL: certnet?.localUrl
   };
 
   if (isProduction) {

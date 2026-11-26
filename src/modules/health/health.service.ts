@@ -5,7 +5,7 @@ import { BUILD } from '../../build-info';
 import { PrismaService } from '../../infrastructure/prisma/prisma.service';
 import { RedisService } from '../../infrastructure/redis/redis.service';
 import { TRUST_LIST_MONITOR, TrustListMonitor } from '../../vc/trust-list';
-import { STATUS_MONITOR, StatusMonitor } from '../../vc/vc.providers';
+import { PKI, Pki, STATUS_MONITOR, StatusMonitor } from '../../vc/vc.providers';
 import { VERIFIER_MONITOR, VerifierMonitor } from '../../vc/verifiers';
 
 /** Redis is `degraded` above this share of `maxmemory` (ADR-0016: 128 MB, `noeviction`). */
@@ -58,8 +58,10 @@ export class HealthService {
     let trustList: TrustListMonitor;
     let verifiers: VerifierMonitor;
     let statusLists: StatusMonitor;
+    let pki: Pki;
 
     try {
+      pki = this.moduleRef.get<Pki>(PKI, { strict: false });
       trustList = this.moduleRef.get<TrustListMonitor>(TRUST_LIST_MONITOR, { strict: false });
       verifiers = this.moduleRef.get<VerifierMonitor>(VERIFIER_MONITOR, { strict: false });
       statusLists = this.moduleRef.get<StatusMonitor>(STATUS_MONITOR, { strict: false });
@@ -70,7 +72,19 @@ export class HealthService {
     const down = () => 'down' as const;
     const [t, s, v] = await Promise.all([trustList.check(), statusLists.check().catch(down), verifiers.check().catch(down)]);
 
-    return { trustList: { status: t }, statusLists: { status: s }, verifier: { status: v } };
+    return { trustList: { status: t }, statusLists: { status: s }, verifier: { status: v }, ...this.dpki(pki) };
+  }
+
+  /**
+   * Only when DPKI is configured (ADR-0020): its network, and `up` while every DID issuer can sign
+   * (its DID key loaded at start-up). The gateway is not asked: health never depends on CertNet.
+   */
+  private dpki(pki: Pki) {
+    if (!pki.dpki) return {};
+
+    const signing = pki.issuers.filter((i) => i.identification === 'did').every((i) => !pki.unavailable.has(i.name));
+
+    return { dpki: { status: signing ? ('up' as const) : ('down' as const), network: pki.dpki.network } };
   }
 
   /**

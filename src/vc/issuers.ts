@@ -20,7 +20,7 @@ import { createRedisStateStore, StateStore } from '../common/state-store';
 import { StudentProfile } from '../demo-portal/demo-accounts';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { RedisService } from '../infrastructure/redis/redis.service';
-import { OPENID4VCI_ISSUERS } from './hosted-issuers';
+import { isOpenId4Vci } from './hosted-issuers';
 import { VcCredentialsService } from './vc-credentials.service';
 import { ISSUER_CLOCK, PKI, Pki, STATUS_LIST_SERVICE, TRUST_REGISTRY } from './vc.providers';
 
@@ -195,12 +195,13 @@ export const issuerProviders: Provider[] = [
       const maxNonces = config.getOrThrow<number>('ISSUANCE_MAX_LIVE_NONCES');
       const registry = new Map<string, HostedIssuer>();
 
-      for (const hosted of OPENID4VCI_ISSUERS) {
+      for (const hosted of pki.issuers.filter(isOpenId4Vci)) {
         if (pki.unavailable.has(hosted.name)) continue;
 
-        const signer = await pki.keyStore.signer(hosted.name, 'vc');
         const vcts = hosted.credentials.map((id) => CREDENTIAL_CONFIGURATIONS[id]!.vct);
-        const refusal = await trustListRefusal(pki, trustRegistry, hosted.name, signer.x5c!, vcts);
+        // A DID issuer (ADR-0020) is not in the trust list; its DID key was checked at start-up.
+        const signer = hosted.identification === 'did' ? (await pki.keyStore.didSigner!(hosted.name))! : await pki.keyStore.signer(hosted.name, 'vc');
+        const refusal = hosted.identification === 'did' ? null : await trustListRefusal(pki, trustRegistry, hosted.name, signer.x5c!, vcts);
 
         if (refusal !== null) {
           if (config.get<string>('NODE_ENV') === 'production') throw new Error(`Issuer ${hosted.name} cannot start: ${refusal}`);

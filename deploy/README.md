@@ -105,6 +105,22 @@ The school portal's sample accounts: Deploy, step 7.
   Nothing about a presentation is written to Postgres or to the log, which carries only the
   first 8 characters of the session id, the outcome and the failing check code.
 
+### DID issuer (DPKI, `truong-mau-certnet`): not deployed
+
+**Production needs no change.** The DID trust path (ADR-0020) is off unless
+`CERTNET_GATEWAY_URL` and `CERTNET_NETWORK` are set, and they are not set on the VPS: the DID
+issuer `truong-mau-certnet` then does not exist (its routes are `404`, it is not in health, its
+keys are not looked for), and every other organisation behaves exactly as before. ADR-0020 §10
+keeps it off the VPS until CertNet has a testnet.
+
+For when it is enabled (README, "DID trust path"): its keys are
+`orgs/truong-mau-certnet/did.key.pem` (mode 600, like every key) and `did.json`, written by
+`npm run certnet:register` (once per environment, against the gateway of that environment;
+`-- did` and `-- recognise` run the issuer's and the accrediting body's step separately). Then
+production refuses to start without them, as for any hosted organisation, and
+`/v1/health` gains `dpki: { status, network }`. `CERTNET_GATEWAY_LOCAL_URL` is refused in
+production. The gateway URL is trusted configuration (its answers are unsigned).
+
 The key directory must not contain CA keys: the server refuses to start when it finds a `ca/`
 directory or a `ca.key.pem` anywhere under it (ADR-0015 §2, ADR-0016 §6).
 

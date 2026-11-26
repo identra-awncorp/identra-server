@@ -240,3 +240,80 @@ describe('credential feature configuration', () => {
     );
   });
 });
+
+describe('CertNet (DPKI) configuration, ADR-0020', () => {
+  const dev = { DATABASE_URL: 'postgresql://u:p@localhost:5432/identra', REDIS_URL: 'redis://localhost:6379' };
+  const on = { CERTNET_GATEWAY_URL: 'https://gateway.certnet.example', CERTNET_NETWORK: 'local' };
+
+  it('neither variable: DPKI off, nothing set', () => {
+    const env = validateEnv({ ...dev });
+
+    assert.deepEqual([env.CERTNET_GATEWAY_URL, env.CERTNET_NETWORK, env.CERTNET_GATEWAY_LOCAL_URL], [undefined, undefined, undefined]);
+  });
+
+  it('accepts an https origin with an optional path prefix (one trailing slash dropped) and each network', () => {
+    for (const network of ['local', 'testnet', 'mainnet']) assert.equal(validateEnv({ ...dev, ...on, CERTNET_NETWORK: network }).CERTNET_NETWORK, network);
+    assert.equal(validateEnv({ ...dev, ...on, CERTNET_GATEWAY_URL: 'https://gw.example:8443/certnet/' }).CERTNET_GATEWAY_URL, 'https://gw.example:8443/certnet');
+    assert.equal(validateEnv({ ...dev, ...on, CERTNET_GATEWAY_LOCAL_URL: 'http://localhost:47450' }).CERTNET_GATEWAY_LOCAL_URL, 'http://localhost:47450');
+    assert.equal(validateEnv({ ...dev, ...on, CERTNET_GATEWAY_LOCAL_URL: 'http://127.0.0.1:8000' }).CERTNET_GATEWAY_LOCAL_URL, 'http://127.0.0.1:8000');
+    assert.equal(validateEnv({ ...productionEnv, ...on }).CERTNET_NETWORK, 'local');
+  });
+
+  it('refuses one variable without the other', () => {
+    assert.throws(() => validateEnv({ ...dev, CERTNET_GATEWAY_URL: on.CERTNET_GATEWAY_URL }), /must be set together/);
+    assert.throws(() => validateEnv({ ...dev, CERTNET_NETWORK: 'local' }), /must be set together/);
+  });
+
+  it('refuses another network', () => {
+    for (const network of ['Local', 'devnet', 'local ', 'main']) {
+      assert.throws(() => validateEnv({ ...dev, ...on, CERTNET_NETWORK: network }), /CERTNET_NETWORK must be local, testnet or mainnet/, network);
+    }
+  });
+
+  it('refuses a gateway URL that is not an https origin with a plain path prefix, without echoing it', () => {
+    for (const bad of [
+      'http://gateway.certnet.example',
+      'gateway.certnet.example',
+      'https://user:pw@gateway.certnet.example',
+      'https://gateway.certnet.example/?x=1',
+      'https://gateway.certnet.example/#f',
+      'https://gateway.certnet.example/a/../b',
+      'https://gateway.certnet.example//v1',
+      'https://GATEWAY.certnet.example',
+      'https://gateway.certnet.example:443',
+      'https://gateway.certnet.example:99999',
+      'https://gateway.certnet.example/a b'
+    ]) {
+      assert.throws(
+        () => validateEnv({ ...dev, ...on, CERTNET_GATEWAY_URL: bad }),
+        (error: Error) => /CERTNET_GATEWAY_URL must be an https origin/.test(error.message) && !error.message.includes(bad),
+        bad
+      );
+    }
+  });
+
+  it('refuses CERTNET_GATEWAY_LOCAL_URL in production, without the gateway, and when it is not a loopback http origin', () => {
+    assert.throws(() => validateEnv({ ...productionEnv, ...on, CERTNET_GATEWAY_LOCAL_URL: 'http://127.0.0.1:47450' }), /for development and tests only/);
+    assert.throws(() => validateEnv({ ...dev, CERTNET_GATEWAY_LOCAL_URL: 'http://127.0.0.1:47450' }), /needs CERTNET_GATEWAY_URL and CERTNET_NETWORK/);
+
+    for (const bad of [
+      'http://127.0.0.1',
+      'https://127.0.0.1:47450',
+      'http://127.0.0.1:47450/',
+      'http://127.0.0.1:47450/v1',
+      'http://10.0.0.5:8000',
+      'http://localhost.evil.example:8000',
+      'http://127.0.0.1:0',
+      'http://127.0.0.1:65536'
+    ]) {
+      assert.throws(() => validateEnv({ ...dev, ...on, CERTNET_GATEWAY_LOCAL_URL: bad }), /must be http:\/\/127\.0\.0\.1:<port> or http:\/\/localhost:<port>/, bad);
+    }
+  });
+
+  it('an API key of the DID issuer only with DPKI configured', () => {
+    const keys = `truong-mau-certnet:${'d'.repeat(64)}`;
+
+    assert.throws(() => validateEnv({ ...dev, IDENTRA_ORG_API_KEY_HASHES: keys }), /not a hosted issuer/);
+    assert.deepEqual(validateEnv({ ...dev, ...on, IDENTRA_ORG_API_KEY_HASHES: keys }).IDENTRA_ORG_API_KEY_HASHES, [{ org: 'truong-mau-certnet', hash: 'd'.repeat(64) }]);
+  });
+});

@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { randomBytes, randomInt } from 'node:crypto';
-import { existsSync, mkdtempSync, rmSync, symlinkSync } from 'node:fs';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -91,6 +91,30 @@ export function testKeysDir(): string {
   keysView = view;
 
   return view;
+}
+
+/**
+ * A key directory at `dir` like testKeysDir(), but with the demo organisations COPIED (mode 600; the
+ * key store opens key files without following links), so files can be added to it. Never copies a
+ * DID issuer's directory a developer may have registered into the demo PKI (`truong-mau-certnet`).
+ * The caller removes it.
+ */
+export function copiedKeysDir(dir: string): string {
+  const pki = demoPkiDir();
+
+  mkdirSync(join(dir, 'orgs'), { recursive: true, mode: 0o700 });
+  for (const f of ['trust-list-signer', 'root.cert.pem', 'trust-list.source.json']) symlinkSync(join(pki, f), join(dir, f));
+
+  for (const org of readdirSync(join(pki, 'orgs')).filter((o) => o !== 'truong-mau-certnet')) {
+    mkdirSync(join(dir, 'orgs', org), { mode: 0o700 });
+
+    for (const file of readdirSync(join(pki, 'orgs', org)).filter((f) => f.endsWith('.pem'))) {
+      copyFileSync(join(pki, 'orgs', org, file), join(dir, 'orgs', org, file));
+      chmodSync(join(dir, 'orgs', org, file), 0o600);
+    }
+  }
+
+  return dir;
 }
 
 /** A production configuration that passes every startup check. */

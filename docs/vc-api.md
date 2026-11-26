@@ -14,6 +14,7 @@ Decisions behind this file: the ADRs 0007–0017 in the private parent repositor
 | Canonical API origin | `https://api-identra.awncorp.vn` (env `IDENTRA_PUBLIC_BASE_URL`) |
 | Website origin | `https://identra.awncorp.vn` |
 | Credential Issuer identifier, also `iss` of its credentials | `<api>/issuers/<name>` |
+| `iss` of a DID issuer's credentials (section 4, ADR-0020) | its DID `did:certnet:<network>:<id>`; header `kid` `<did>#key-1` |
 | Status list | `<api>/issuers/<name>/status/<n>` |
 | Trust list | `<api>/trust-list` |
 | Verifier `client_id` | `x509_hash:<base64url(SHA-256(leaf certificate DER))>` |
@@ -28,7 +29,9 @@ path accepts a non-canonical or non-HTTPS identifier.
 
 Sample organisations (all operated by Identra, certificates carry "DEMO"):
 `truong-mau` (issuer of diplomas), `nha-san-xuat`, `kiem-dinh`, `phan-phoi`
-(issuers of product events), `nha-tuyen-dung-mau` (verifier).
+(issuers of product events), `nha-tuyen-dung-mau` (verifier). With DPKI configured
+(section 4) also `truong-mau-certnet`, an issuer of diplomas identified by a DID instead of a
+certificate.
 
 ## 2. Conventions
 
@@ -118,9 +121,9 @@ Rules:
 - An offer lives 10 minutes. The pre-authorized code is single use. The
   `tx_code` is 6 digits; after 5 wrong attempts the offer is destroyed. Wrong
   code, wrong PIN, expired or reused → `400 { "error": "invalid_grant" }`.
-- `:name` is an OpenID4VCI issuer (`truong-mau`); every other name, the product
-  issuers included, is `404 not_found`. A hosted issuer that cannot sign at the
-  moment answers `503 temporarily_unavailable`.
+- `:name` is an OpenID4VCI issuer (`truong-mau`, and `truong-mau-certnet` with DPKI
+  configured); every other name, the product issuers included, is `404 not_found`. A hosted
+  issuer that cannot sign at the moment answers `503 temporarily_unavailable`.
 - One credential per access token. The proof JWT must be
   `typ: openid4vci-proof+jwt`, ES256, header `jwk`, `aud` = issuer identifier,
   `nonce` = an unused `c_nonce`. Its key becomes `cnf.jwk`.
@@ -129,6 +132,29 @@ Rules:
 - The server stores which student and which status-list entry a credential
   belongs to, and the thumbprint of its `cnf` key. It does not store the
   credential or its disclosures.
+
+### DID issuer `truong-mau-certnet` (DPKI, ADR-0020)
+
+A second sample school that issues the same credential (`bang-tot-nghiep-v1`) on the DID trust
+path: it is recognised through CertNet (its DID document and the CertNet trust registry), not
+through a certificate and the trust list. It exists only when DPKI is configured
+(`CERTNET_GATEWAY_URL` and `CERTNET_NETWORK`, README); without that configuration every route
+of it, its status lists included, is `404` and nothing else changes. DPKI is not part of the
+production deployment yet.
+
+- Same routes and rules as above with `:name` = `truong-mau-certnet`. Its OpenID4VCI identifier
+  (`credential_issuer`, endpoints, `aud`) stays `<api>/issuers/truong-mau-certnet`.
+- Its credentials have `iss` = its DID and the header `kid` = `<did>#key-1` (no `x5c`). The
+  Credential Issuer metadata has one more member, `identra_issuer_did: "<did>"`; a wallet takes
+  a credential of this issuer only when its `iss` is that DID. An X.509 issuer never sends it.
+- Its status lists are `<api>/issuers/truong-mau-certnet/status/<n>` (section 3), signed with
+  the same DID key (header `kid`, no `x5c`): CertNet holds one key per DID for now.
+- Its keys are `orgs/truong-mau-certnet/did.key.pem` and `did.json`, written by
+  `npm run certnet:register`, which also registers the DID and its recognition with the gateway
+  (README). It is not in the trust list. With DPKI configured but no usable DID key, production
+  refuses to start and elsewhere its routes answer `503` (as for every hosted organisation).
+- `/v1/health` has `services.dpki: { status, network }` only when DPKI is configured: `up`
+  while the DID issuer can sign, `down` otherwise. The gateway is never asked for it.
 
 ## 5. School portal demo (`/v1/demo/school`)
 
@@ -142,7 +168,7 @@ even of the same account, does not see, poll, cancel or revoke it (it gets `404`
 
 | Method and path | Auth | Body | Success | Errors |
 |---|---|---|---|---|
-| `POST /v1/demo/school/login` | none, rate limited | `{ username, password }` | `201 { token, expiresAt, serverTime, role: "student" \| "registrar", profile }` | `400 VALIDATION_FAILED`, `401 INVALID_CREDENTIALS`, `429 RATE_LIMITED` (also the registrar account from a client with 10 wrong passwords in 15 minutes, or from everyone after 500; section 8), `503 UNAVAILABLE` (also when the server is hashing too many passwords at once; retry after `Retry-After`) |
+| `POST /v1/demo/school/login` | none, rate limited | `{ username, password, issuer? }` | `201 { token, expiresAt, serverTime, role: "student" \| "registrar", profile }` | `400 VALIDATION_FAILED`, `401 INVALID_CREDENTIALS`, `429 RATE_LIMITED` (also the registrar account from a client with 10 wrong passwords in 15 minutes, or from everyone after 500; section 8), `503 UNAVAILABLE` (also when the server is hashing too many passwords at once; retry after `Retry-After`) |
 | `POST /v1/demo/school/offers` | student | none | `201 { offerId, offerUri, txCode, expiresAt, serverTime }` | `403 FORBIDDEN` (registrar), `429 RATE_LIMITED` (this client already holds 5 live offers, or created 100 in the last 30 minutes; an IPv6 /48: 4 times that), `503 UNAVAILABLE` (all clients together hold the cap); both with `Retry-After` |
 | `GET /v1/demo/school/offers/:offerId` | student, the session that created it | none | `200 { status: "pending" \| "issued" \| "expired", serverTime }` | `404 NOT_FOUND` (unknown, older than 30 minutes, or another session's) |
 | `DELETE /v1/demo/school/offers/:offerId` | student, the session that created it | none | `200 { offerId, status: "expired" \| "issued", serverTime }`: a pending offer is cancelled (its code stops working, its place is freed); an issued one stays issued; repeating it is harmless | `404 NOT_FOUND` as above |
@@ -153,7 +179,11 @@ Every route but `login` needs `Authorization: Bearer <token>`; a missing, unknow
 token is `401 SESSION_EXPIRED`. Writes are rate limited per client (section 8).
 
 - **Login.** The portal token is an opaque bearer token (Redis, 30 minutes; only a hash of it
-  is stored). The `txCode` of an offer is shown once in its creation response and stored only as
+  is stored). Each account belongs to one issuer and the session acts for that issuer only.
+  `issuer` (optional) names the school portal signed in to: an account of another issuer is then
+  `401 INVALID_CREDENTIALS`, like an unknown one. Without it the account's own issuer is used,
+  as before (`truong-mau` for `sv001`–`sv003` and `phongdaotao`). An account of
+  `truong-mau-certnet` cannot sign in while DPKI is off. The `txCode` of an offer is shown once in its creation response and stored only as
   a keyed hash.
 - **Offers.** A student session may hold several live offers at once: creating one never ends
   another. An offer's state stays readable for 30 minutes after it was created: `pending` until
@@ -172,8 +202,11 @@ token is `401 SESSION_EXPIRED`. Writes are rate limited per client (section 8).
   a credential issued in this session, final. Verifiers see it at once through this server and
   within the status list's `ttl` (15 minutes) elsewhere.
 - **Registrar.** The registrar changes any diploma's status (`valid`, `suspended`, `revoked`)
-  through `POST /v1/issuers/truong-mau/credentials/:credentialId/status` (section 3) with its
-  portal token. A student token there is `403 FORBIDDEN`.
+  through `POST /v1/issuers/<its issuer>/credentials/:credentialId/status` (section 3) with its
+  portal token. A student token there is `403 FORBIDDEN`, and so is another issuer's registrar.
+- **One portal per issuer.** Offers, listings and revocations of a session are those of its
+  account's issuer only: a session of `truong-mau` never lists, reads or revokes anything of
+  `truong-mau-certnet` and the reverse (`404`).
 - Every portal answer is `Cache-Control: no-store`.
 
 Seeded sample accounts (fictional people): students `sv001`, `sv002`, `sv003`, whose password
@@ -183,6 +216,11 @@ public student password does not open it). `profile` of a student:
 `{ hoTen, ngaySinh, maSinhVien, nganh, hangTotNghiep, namTotNghiep, soHieuBang }`
 (the university's own record, the source of the diploma's claims); of the
 registrar: `{ hoTen, donVi }`.
+
+With DPKI configured `demo:provision` also creates the same four accounts for
+`truong-mau-certnet` under `cn-` names: students `cn-sv001`, `cn-sv002`, `cn-sv003` (the public
+student password) and the registrar `cn-phongdaotao` (the private registrar password). Sign in
+with `{ "issuer": "truong-mau-certnet", "username": "cn-sv001", "password": "…" }`.
 
 ## 6. Presentation: OpenID4VP 1.0, cross-device
 
@@ -216,6 +254,7 @@ a client cannot ask for arbitrary claims.
     "ok": true,
     "checks": [{ "id": "structure", "ok": true, "code": null }],
     "claims": { "ho_ten": "…", "nganh": "…" },
+    "trustPath": "x509",
     "issuer": { "maToChuc": "…", "ten": "…" },
     "verifiedAt": "…"
   }
@@ -223,8 +262,11 @@ a client cannot ask for arbitrary claims.
 ```
 
   `result` is absent (not `null`) until the session is final. `verified` means
-  `result.ok` is `true`, `failed` means it is `false`; `claims` and `issuer`
-  exist only when `ok`. Every claim value is a string (`nam_tot_nghiep` is
+  `result.ok` is `true`, `failed` means it is `false`; `claims`, `trustPath` and the issuer
+  exist only when `ok`. `trustPath` says how the issuer was recognised: `x509` (a certificate
+  in the trust list) with `issuer: { maToChuc, ten }`, or `did` (CertNet, section 4) with
+  `issuerDid: "did:certnet:…"` and no `issuer`: the DID path has no display name, so a client
+  shows the (shortened) DID and never a name the credential claims for itself. Every claim value is a string (`nam_tot_nghiep` is
   `"2026"`, `ngay_sinh` is `YYYY-MM-DD`). `verifier.name` is the display name
   from the trust list, in Vietnamese.
 - A session that nobody answered turns `expired` after 5 minutes and stays
@@ -236,6 +278,21 @@ a client cannot ask for arbitrary claims.
   session creation is `503` until a trust list verifies and lists the verifier
   (checked again on every newly signed trust list, otherwise at most every 30 s),
   and `/v1/health` reports `verifier: down` meanwhile. Open sessions stay readable.
+- Checks, in order: `structure`, `algorithm`, `certificate_chain`, `signature`,
+  `validity_time`, `credential_type`, `issuer_trust`, `status`, `holder_binding`, `query`. On
+  the DID path `did_resolution` (the issuer's DID resolved through the CertNet gateway, its key
+  in `assertionMethod`) stands where `certificate_chain` is, and `issuer_trust` asks the CertNet
+  trust registry for the diploma `vct`.
+- The DID path is on only with DPKI configured (section 4). Without it, a credential with a DID
+  `kid` fails `did_resolution` with `DID_RESOLUTION_FAILED`. With it: a gateway that gives no
+  usable answer (5xx, no answer, timeout, oversized) is `did_resolution` /
+  `DID_RESOLUTION_UNAVAILABLE` ("not checked yet"): like every failure of that step the response
+  is refused and the session stays open, never verified; a trust registry that gives no answer
+  is `issuer_trust` / `TRUST_LIST_UNAVAILABLE`, and an issuer the registry does not recognise
+  for the diploma (absent, `rejected`, other type) is `issuer_trust` / `ISSUER_NOT_TRUSTED`,
+  both final `failed`. Recognition is never cached: a withdrawal counts at the next session.
+  Status lists are still read only from this server. The product endpoints (section 7) stay on
+  the X.509 path.
 - The server verifies against its own status lists directly, so a revocation
   made through this server is seen by the very next verification here. A third
   party that fetches the status list over HTTP may see it up to 15 minutes later

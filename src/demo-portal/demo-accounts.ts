@@ -3,6 +3,13 @@ import * as argon2 from 'argon2';
 // The school portal's own records (docs/vc-api.md §5). Fictional people, public on purpose:
 // every value says or implies DEMO; none of this is a real person.
 export const DEMO_ISSUER = 'truong-mau';
+/**
+ * The sample school on the DID trust path (ADR-0020), provisioned only when DPKI is configured. Its
+ * accounts are DEMO_ACCOUNTS under `cn-` names (usernames are unique across issuers): cn-sv001,
+ * cn-sv002, cn-sv003 (students), cn-phongdaotao (registrar).
+ */
+export const DEMO_DID_ISSUER = 'truong-mau-certnet';
+export const DID_ACCOUNT_PREFIX = 'cn-';
 
 /** The university's record of a graduate: the source of the seven diploma claims. */
 export interface StudentProfile {

@@ -18,6 +18,13 @@ class PortalLoginDto {
   @IsString()
   @MaxLength(128)
   password: string;
+
+  /** The school portal signed in to (e.g. `truong-mau-certnet`); absent: the account's own issuer. */
+  @IsOptional()
+  @IsString()
+  @MaxLength(64)
+  @Matches(/^[a-z0-9]+(-[a-z0-9]+)*$/)
+  issuer?: string;
 }
 
 class CredentialsQueryDto {
@@ -67,7 +74,7 @@ export class DemoPortalController {
   @HttpCode(201)
   @RateLimit('login')
   login(@Body() body: PortalLoginDto, @Req() req: { ip?: string }) {
-    return this.sessions.login(body.username, body.password, req.ip);
+    return this.sessions.login(body.username, body.password, req.ip, body.issuer);
   }
 
   /**

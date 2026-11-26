@@ -7,11 +7,18 @@ import { ConfigService } from '@nestjs/config';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import {
   createCertificateChainValidator,
+  createCertNetDidResolver,
+  createCertNetTrustRegistry,
   createSignedTrustListRegistry,
   createStatusListChecker,
+  isCertNetDid,
+  splitDidUrl,
   type CertificateChainValidator,
   type Clock,
-  type HttpFetch
+  type DidResolver,
+  type DidTrustRegistry,
+  type HttpFetch,
+  type StatusChecker
 } from '@identra/sdk-core';
 import { webCryptoHasher, webCryptoRandom, webCryptoVerifier } from '@identra/sdk-core/webcrypto';
 import {
@@ -22,7 +29,9 @@ import {
   type TrustListService
 } from '@identra/sdk-server';
 import { isDependencyDown } from '../common/http-errors';
-import { HOSTED_ISSUERS, HOSTED_VERIFIERS } from './hosted-issuers';
+import { CertNetConfig } from '../config/env.validation';
+import { createGatewayFetch } from './gateway-fetch';
+import { HOSTED_VERIFIERS, hostedIssuers, HostedIssuerEntry } from './hosted-issuers';
 import { createOwnFetch } from './own-fetch';
 import { createPrismaStatusListStorage } from './status-storage';
 
@@ -39,6 +48,8 @@ export const STATUS_LIST_SERVICE = Symbol('STATUS_LIST_SERVICE');
 export const OWN_FETCH = Symbol('OWN_FETCH');
 export const TRUST_REGISTRY = Symbol('TRUST_REGISTRY');
 export const STATUS_CHECKER = Symbol('STATUS_CHECKER');
+/** The DID trust path of the hosted verifiers (Dpki), null when DPKI is off. */
+export const DPKI = Symbol('DPKI');
 
 /** Everything verification and signing need, built once at startup from IDENTRA_KEYS_DIR. */
 export interface Pki {
@@ -51,6 +62,10 @@ export interface Pki {
   hasher: typeof webCryptoHasher;
   random: typeof webCryptoRandom;
   clock: Clock;
+  /** The issuers hosted in this configuration (hostedIssuers): a DID issuer only with `dpki`. */
+  issuers: readonly HostedIssuerEntry[];
+  /** CERTNET_* (env.validation.ts certnetConfig); null: DPKI is off. */
+  dpki: CertNetConfig | null;
   /**
    * Hosted organisations that cannot sign for one of their purposes (key or certificate missing
    * or invalid), with the failed purposes. Empty in production, which refuses to start instead;
@@ -61,26 +76,42 @@ export interface Pki {
 
 const logger = new Logger('Pki');
 
-type Purpose = 'vc' | 'status' | 'request';
+type Purpose = 'vc' | 'status' | 'request' | 'did';
+type Required = { org: string; purposes: Purpose[]; vcFile?: 'vc' | 'vc-product' };
 
 /**
- * What every hosted organisation must be able to sign with: issuers `vc` (an OpenID4VCI issuer
- * from `vc.*`, a product issuer from `vc-product.*`) and `status`, verifiers `request`.
+ * What every hosted organisation must be able to sign with: X.509 issuers `vc` (an OpenID4VCI
+ * issuer from `vc.*`, a product issuer from `vc-product.*`) and `status`, a DID issuer its DID key
+ * (`did`, for credentials and lists), verifiers `request`.
  */
-const REQUIRED: ReadonlyArray<{ org: string; purposes: Purpose[]; vcFile?: 'vc' | 'vc-product' }> = [
-  ...HOSTED_ISSUERS.map((i) => ({ org: i.name, purposes: ['vc', 'status'] as Purpose[], vcFile: i.kind === 'openid4vci' ? ('vc' as const) : ('vc-product' as const) })),
-  ...HOSTED_VERIFIERS.map((v) => ({ org: v.name, purposes: ['request'] as Purpose[] }))
+const required = (issuers: readonly HostedIssuerEntry[]): Required[] => [
+  ...issuers.map((i): Required =>
+    i.identification === 'did'
+      ? { org: i.name, purposes: ['did'] }
+      : { org: i.name, purposes: ['vc', 'status'], vcFile: i.kind === 'openid4vci' ? 'vc' : 'vc-product' }
+  ),
+  ...HOSTED_VERIFIERS.map((v): Required => ({ org: v.name, purposes: ['request'] }))
 ];
+
+/** A DID issuer's signer: its files must exist and name a DID of the configured network. */
+async function checkDidSigner(keyStore: IssuerKeyStore, org: string, network: CertNetConfig['network'] | undefined): Promise<void> {
+  const signer = await keyStore.didSigner?.(org);
+
+  if (!signer) throw new Error(`a DID issuer signs with orgs/${org}/did.json and did.key.pem, which are missing (npm run certnet:register)`);
+  if (!isCertNetDid(splitDidUrl(signer.kid)?.did, network)) {
+    throw new Error(`orgs/${org}/did.json names a DID of another network than CERTNET_NETWORK`);
+  }
+}
 
 /**
  * M3: loads every key of every hosted organisation (the key store validates each certificate
  * chain for its profile and that the key matches it). Returns the organisations that cannot sign,
  * each with the failed purposes and the SDK's reason (file names and codes, never key content).
  */
-async function checkHostedOrganisations(dir: string, keyStore: IssuerKeyStore): Promise<Map<string, string>> {
+async function checkHostedOrganisations(dir: string, keyStore: IssuerKeyStore, list: Required[], dpki: CertNetConfig | null): Promise<Map<string, string>> {
   const unavailable = new Map<string, string>();
 
-  for (const { org, purposes, vcFile } of REQUIRED) {
+  for (const { org, purposes, vcFile } of list) {
     const failed: string[] = [];
 
     for (const purpose of purposes) {
@@ -89,7 +120,8 @@ async function checkHostedOrganisations(dir: string, keyStore: IssuerKeyStore): 
           throw new Error(`a ${vcFile === 'vc' ? 'credential' : 'product'} issuer signs with orgs/${org}/${vcFile}.key.pem, which is missing`);
         }
 
-        await keyStore.signer(org, purpose);
+        if (purpose === 'did') await checkDidSigner(keyStore, org, dpki?.network);
+        else await keyStore.signer(org, purpose);
       } catch (error) {
         failed.push(`${purpose}: ${error instanceof Error ? error.message : 'unknown error'}`);
       }
@@ -130,6 +162,13 @@ async function loadPki(config: ConfigService, clock: Clock): Promise<Pki> {
   const dir = config.getOrThrow<string>('IDENTRA_KEYS_DIR');
   const baseUrl = config.getOrThrow<string>('IDENTRA_PUBLIC_BASE_URL');
   const production = config.get<string>('NODE_ENV') === 'production';
+  const gatewayUrl = config.get<string>('CERTNET_GATEWAY_URL');
+  const network = config.get<CertNetConfig['network']>('CERTNET_NETWORK');
+  const localUrl = config.get<string>('CERTNET_GATEWAY_LOCAL_URL');
+  // Validated together by validateEnv (certnetConfig).
+  const dpki: CertNetConfig | null = gatewayUrl && network ? { gatewayUrl, network, ...(localUrl ? { localUrl } : {}) } : null;
+  const issuers = hostedIssuers(dpki !== null);
+  const list = required(issuers);
   let unavailable: Map<string, string>;
   let keyStore: IssuerKeyStore;
   let trustedRoots: Uint8Array[];
@@ -141,7 +180,7 @@ async function loadPki(config: ConfigService, clock: Clock): Promise<Pki> {
     trustedRoots = keyStore.trustedRoots();
 
     await keyStore.trustListSigner();
-    unavailable = await checkHostedOrganisations(dir, keyStore);
+    unavailable = await checkHostedOrganisations(dir, keyStore, list, dpki);
   } catch (error) {
     const reason = error instanceof Error ? error.message : 'unknown error';
 
@@ -156,7 +195,7 @@ async function loadPki(config: ConfigService, clock: Clock): Promise<Pki> {
 
   for (const problem of problems) logger.error(`Hosted organisation cannot sign, its routes answer 503: ${problem}`);
 
-  logger.log(`Loaded the keys of ${REQUIRED.length - unavailable.size} of ${REQUIRED.length} hosted organisations and the trust-list signer`);
+  logger.log(`Loaded the keys of ${list.length - unavailable.size} of ${list.length} hosted organisations and the trust-list signer`);
 
   return {
     baseUrl,
@@ -168,6 +207,8 @@ async function loadPki(config: ConfigService, clock: Clock): Promise<Pki> {
     hasher: webCryptoHasher,
     random: webCryptoRandom,
     clock,
+    issuers,
+    dpki,
     unavailable
   };
 }
@@ -225,6 +266,8 @@ function withBoundedTokens(service: StatusListService, pki: Pki, problems: Statu
   return {
     ...service,
     async token(issuer, n) {
+      // Not hosted in this configuration (a DID issuer with DPKI off): no such list.
+      if (!pki.issuers.some((i) => i.name === issuer)) return null;
       if (pki.unavailable.has(issuer)) throw new StatusListUnavailableError('the organisation cannot sign status lists');
 
       const key = `${issuer}/${n}`;
@@ -296,7 +339,7 @@ export const vcProviders: Provider[] = [
         const nowS = pki.clock.now().getTime() / 1000;
 
         // An issuer that cannot sign its lists, or a signing problem in the last hour.
-        if (HOSTED_ISSUERS.some((i) => pki.unavailable.has(i.name))) return 'down';
+        if (pki.issuers.some((i) => pki.unavailable.has(i.name))) return 'down';
         if (problems.recent(pki.clock.now().getTime())) return 'down';
 
         const lists = await prisma.vcStatusList.findMany({ select: { issuerName: true, listNumber: true } });
@@ -304,8 +347,9 @@ export const vcProviders: Provider[] = [
         for (const { issuerName, listNumber } of lists) {
           const held = statusLists.current(issuerName, listNumber);
 
-          // Not signed yet by this process is fine; a held token must live 2 h more by a valid signer.
-          if (held && (held.exp <= nowS + 2 * 3600 || held.signerNotAfter <= nowS)) return 'down';
+          // Not signed yet by this process is fine; a held token must live 2 h more by a valid signer
+          // (a DID issuer's key has no validity period: signerNotAfter null).
+          if (held && (held.exp <= nowS + 2 * 3600 || (held.signerNotAfter !== null && held.signerNotAfter <= nowS))) return 'down';
         }
 
         return 'up';
@@ -344,5 +388,40 @@ export const vcProviders: Provider[] = [
         clock: pki.clock,
         maxAgeSeconds: 0
       })
+  },
+  {
+    // The DID trust path of the hosted verifiers (ADR-0020). Only the resolver and the CertNet trust
+    // registry reach the gateway (createGatewayFetch); status lists are still read through the own
+    // fetch, never from another host. The product endpoints keep STATUS_CHECKER (X.509 only).
+    provide: DPKI,
+    inject: [PKI, OWN_FETCH, TRUST_REGISTRY],
+    useFactory: (pki: Pki, ownFetch: HttpFetch, trustRegistry: ReturnType<typeof createSignedTrustListRegistry>): Dpki | null => {
+      if (!pki.dpki) return null;
+
+      const { gatewayUrl, network, localUrl } = pki.dpki;
+      const fetch = createGatewayFetch({ gatewayUrl, ...(localUrl ? { localUrl } : {}) });
+      const resolver = createCertNetDidResolver({ gatewayUrl, network, fetch, clock: pki.clock });
+
+      return {
+        resolver,
+        trustRegistry: createCertNetTrustRegistry({ gatewayUrl, network, fetch }),
+        statusChecker: createStatusListChecker({
+          fetch: ownFetch,
+          verifier: pki.verifier,
+          chainValidator: pki.chainValidator,
+          trustRegistry,
+          clock: pki.clock,
+          maxAgeSeconds: 0,
+          didResolver: resolver
+        })
+      };
+    }
   }
 ];
+
+export interface Dpki {
+  resolver: DidResolver;
+  trustRegistry: DidTrustRegistry;
+  /** STATUS_CHECKER's twin that also checks DID issuers' lists. */
+  statusChecker: StatusChecker;
+}

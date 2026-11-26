@@ -6,7 +6,6 @@ import { Prisma, VcCredentialStatus } from '@prisma/client';
 import { apiError, unavailable } from '../common/http-errors';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { StatusRevokedError, type StatusListService } from '@identra/sdk-server';
-import { issuerKind } from './hosted-issuers';
 import { createPrismaStatusListStorage } from './status-storage';
 import { PKI, Pki, STATUS_LIST_SERVICE } from './vc.providers';
 
@@ -120,7 +119,7 @@ export class VcCredentialsService {
    */
   async changeStatus(issuerName: string, id: string, status: VcCredentialStatus) {
     // M3: a change this server cannot publish (no usable status key) is refused, never a 200.
-    if (issuerKind(issuerName) !== null && !(await this.canSignStatus(issuerName))) {
+    if (this.issuerKind(issuerName) !== null && !(await this.canSignStatus(issuerName))) {
       throw unavailable('The status lists of this issuer cannot be signed at the moment.');
     }
 
@@ -136,18 +135,27 @@ export class VcCredentialsService {
     }
   }
 
+  /** The kind of an issuer hosted in this configuration (a DID issuer only with DPKI), else null. */
+  private issuerKind(issuerName: string) {
+    return this.pki.issuers.find((issuer) => issuer.name === issuerName)?.kind ?? null;
+  }
+
   private async canSignStatus(issuerName: string): Promise<boolean> {
     if (this.pki.unavailable.has(issuerName)) return false;
 
-    return this.pki.keyStore.signer(issuerName, 'status').then(
-      () => true,
+    // A DID issuer signs its lists with its DID key (ADR-0020 §6).
+    const did = this.pki.issuers.some((issuer) => issuer.name === issuerName && issuer.identification === 'did');
+    const signer = did ? this.pki.keyStore.didSigner!(issuerName) : this.pki.keyStore.signer(issuerName, 'status');
+
+    return signer.then(
+      (s) => s !== null,
       () => false
     );
   }
 
   private async changeStatusOnce(issuerName: string, id: string, status: VcCredentialStatus) {
     // Diplomas are recorded in VcIssuedCredential, product events in ProductEvent: one code path.
-    const kind = issuerKind(issuerName);
+    const kind = this.issuerKind(issuerName);
 
     if (kind === null) throw apiError(404, 'NOT_FOUND', 'No such credential for this issuer.');
 

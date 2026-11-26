@@ -14,6 +14,8 @@ import {
   createWallet
 } from '@identra/sdk-app';
 
+type WalletDpki = NonNullable<Parameters<typeof createWallet>[0]['dpki']>;
+
 import { portalPasswordOf, randomIp, testKeysDir, uniqueIp } from './helpers';
 
 export const PORT = Number(process.env.IDENTRA_TEST_PORT ?? 47400);
@@ -52,8 +54,11 @@ export const mappedFetch = createMappedFetch(nodeFetch, { [ORIGIN]: LOCAL });
 export const derOf = (pemPath: string) =>
   base64Decode(/-----BEGIN CERTIFICATE-----([\s\S]+?)-----END/.exec(readFileSync(pemPath, 'utf8'))![1]!.replace(/\s+/g, ''));
 
-/** The SDK's own wallet, pinning the demo root (or `rootPemPath`), with an adjustable clock. */
-export function newWallet(rootPemPath = join(keysDir, 'root.cert.pem')) {
+/**
+ * The SDK's own wallet, pinning the demo root (or `rootPemPath`), with an adjustable clock; with
+ * `dpki` (its CertNet resolver and trust registry, given the clock) also on the DID trust path.
+ */
+export function newWallet(rootPemPath = join(keysDir, 'root.cert.pem'), dpki?: (clock: Clock) => WalletDpki) {
   const clock = adjustableClock();
   const rootDer = derOf(rootPemPath);
   const wallet = createWallet({
@@ -68,7 +73,8 @@ export function newWallet(rootPemPath = join(keysDir, 'root.cert.pem')) {
     random: webCryptoRandom,
     clock,
     trustedRoots: [rootDer],
-    trustListUrl: `${ORIGIN}/trust-list`
+    trustListUrl: `${ORIGIN}/trust-list`,
+    ...(dpki ? { dpki: dpki(clock) } : {})
   });
 
   return { wallet, clock };

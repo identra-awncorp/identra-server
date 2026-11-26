@@ -22,10 +22,10 @@ import { createRedisStateStore, StateStore } from '../common/state-store';
 import { DemoPortalGuard, PortalSession, PortalSessionData } from '../demo-portal/portal-sessions';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { RedisService } from '../infrastructure/redis/redis.service';
-import { OPENID4VCI_ISSUERS } from './hosted-issuers';
+import { isOpenId4Vci } from './hosted-issuers';
 import { HostedIssuer, ISSUERS, IssuerRegistry, offerOwnerKey, PORTAL_OFFER_NAMESPACE } from './issuers';
 import { VcCredentialsService } from './vc-credentials.service';
-import { ISSUER_CLOCK } from './vc.providers';
+import { ISSUER_CLOCK, PKI, Pki } from './vc.providers';
 
 export interface RawRequest {
   headers: Record<string, string | string[] | undefined>;
@@ -77,16 +77,19 @@ export function send(res: RawResponse, r: SdkResponse, options: { public?: boole
 @Controller()
 @UseFilters(ProtocolErrorFilter)
 export class IssuerProtocolController {
-  constructor(@Inject(ISSUERS) private readonly issuers: IssuerRegistry) {}
+  constructor(
+    @Inject(ISSUERS) private readonly issuers: IssuerRegistry,
+    @Inject(PKI) private readonly pki: Pki
+  ) {}
 
   private hosted(name: string): HostedIssuer {
     const hosted = this.issuers.get(name);
 
     if (hosted) return hosted;
     // Hosted here but not able to sign at the moment (vc.providers.ts, issuers.ts).
-    if (OPENID4VCI_ISSUERS.some((i) => i.name === name)) throw oauthError(503, 'temporarily_unavailable', 'the credential issuer is unavailable');
+    if (this.pki.issuers.some((i) => isOpenId4Vci(i) && i.name === name)) throw oauthError(503, 'temporarily_unavailable', 'the credential issuer is unavailable');
 
-    // Unknown, and the product issuers: they have no OpenID4VCI endpoints.
+    // Unknown, the product issuers (no OpenID4VCI endpoints), a DID issuer with DPKI off.
     throw oauthError(404, 'not_found', 'unknown credential issuer');
   }
 

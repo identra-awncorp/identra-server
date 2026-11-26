@@ -72,6 +72,46 @@ server runs without those routes. Sample data, after `npm run build`:
 `DEMO_PRODUCT_PROVISION=yes npm run demo:provision-product` (the sample product chain; add
 `DEMO_PRODUCT_SERIAL=SN-2026-000002 DEMO_PRODUCT_STAGES=2` for a product still in progress).
 
+### DID trust path (DPKI, optional; not in production)
+
+ADR-0020: beside the X.509 path, a sample issuer `truong-mau-certnet` identified by a
+`did:certnet` DID, recognised through the CertNet gateway (its DID documents and trust
+registry), and a hosted verifier that also accepts its credentials (`docs/vc-api.md` §4–§6).
+It is off unless both of these are set; with neither, the server behaves exactly as without
+this feature. **DPKI is not part of the production deployment yet: production needs no
+change** (ADR-0020 §10: not on the VPS until CertNet has a testnet).
+
+| Variable | Value |
+|---|---|
+| `CERTNET_GATEWAY_URL` | The gateway's https origin, optional path prefix (the API is under `<url>/v1`), e.g. `https://gateway.certnet.example`. Trusted configuration: its answers are unsigned. |
+| `CERTNET_NETWORK` | `local`, `testnet` or `mainnet`: only DIDs of this network are accepted. |
+| `CERTNET_GATEWAY_LOCAL_URL` | Development and tests only (refused in production): `http://127.0.0.1:<port>` or `http://localhost:<port>`, where requests for the gateway origin are sent (a localnet gateway on `:8000`, or the fake one). |
+
+Only the DID resolver and the trust-registry client reach the gateway, through a fetch limited to
+that origin (5 s, 64 KB, no redirects); status lists are still read only from this server.
+
+The issuer's key files are `orgs/truong-mau-certnet/did.key.pem` (PKCS#8 P-256, mode 600) and
+`did.json` (`{ "did", "kid" }`) in `IDENTRA_KEYS_DIR`, written once per environment by the
+registration script (after `npm run build`, with the variables above and `IDENTRA_KEYS_DIR`
+set; with the view above they land in `~/.identra/demo-pki/orgs/`, outside git):
+
+```bash
+npm run certnet:register                # both steps below, in order
+npm run certnet:register -- did         # the issuer: generate the key if missing (never replaced,
+                                        # never printed), POST /v1/dids, check the answer holds that
+                                        # key in assertionMethod, write did.json
+npm run certnet:register -- recognise   # the accrediting body: POST /v1/trust-registry/issuers
+                                        # (diploma vct, scope education); "already there" is fine
+```
+
+The two steps are separate roles in real life (an issuer registers its DID; an accrediting body
+records the recognition); the demo runs both. Running it again changes nothing.
+`CERTNET_WRITE_TOKEN`, when set, is sent as a bearer token (CertNet's write authentication is
+still to be defined). Exit codes: `0` done, `1` refused (configuration or local files), `2` the
+gateway did not answer or answered something else than success, `3` the returned DID document
+does not hold our key (nothing written). Then `npm run demo:provision` also creates the
+`cn-sv001`–`cn-sv003` and `cn-phongdaotao` accounts of that school, and the server starts with it.
+
 ## Environment
 
 Create a local environment file:
@@ -221,7 +261,9 @@ link its server part into a temporary directory without `ca/`): every `vc-*` fil
 production-mode files `demo-otp-production` and `dependencies-down` (production requires
 `IDENTRA_KEYS_DIR`). They fail with a message saying how to create it when it is missing. The
 other files (`access-control`, `app-setup`, `demo-otp-disabled`, `demo-portal`, `env-validation`,
-`rate-limit`) need no keys. Remove the containers and their volumes afterwards:
+`rate-limit`, `dpki-gateway-fetch`) need no keys. The DPKI files (`vc-dpki*`,
+`dpki-gateway-fetch`) run a small stub of the CertNet gateway in the test process on
+`127.0.0.1:47450` and `:47451`; no CertNet is needed. Remove the containers and their volumes afterwards:
 
 ```bash
 docker rm -f -v identra-s0-pg identra-s0-redis

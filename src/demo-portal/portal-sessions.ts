@@ -1,6 +1,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 
 import { CanActivate, ExecutionContext, Injectable, OnModuleInit, createParamDecorator } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { DemoPortalRole } from '@prisma/client';
 import * as argon2 from 'argon2';
 import Redis from 'ioredis';
@@ -10,6 +11,7 @@ import { clientOf, NETWORK_SHARES } from '../common/live-cap';
 import { createRedisStateStore, StateStore } from '../common/state-store';
 import { PrismaService } from '../infrastructure/prisma/prisma.service';
 import { RedisService } from '../infrastructure/redis/redis.service';
+import { isDidIssuer } from '../vc/hosted-issuers';
 import { PORTAL_PASSWORD_HASH } from './demo-accounts';
 
 export const PORTAL_SESSION_SECONDS = 30 * 60;
@@ -73,13 +75,16 @@ export class PortalSessions implements OnModuleInit {
   private readonly redis: Redis;
   private dummyHash = '';
   private hashing = 0;
+  private readonly dpki: boolean;
 
   constructor(
     private readonly prisma: PrismaService,
-    redis: RedisService
+    redis: RedisService,
+    config: ConfigService
   ) {
     this.store = createRedisStateStore(redis.getClient(), 'portal-session');
     this.redis = redis.getClient();
+    this.dpki = config.get<string>('CERTNET_NETWORK') !== undefined;
   }
 
   async onModuleInit() {
@@ -87,9 +92,15 @@ export class PortalSessions implements OnModuleInit {
     this.dummyHash = await argon2.hash(randomBytes(16).toString('hex'), PORTAL_PASSWORD_HASH);
   }
 
-  /** `ip`: req.ip, the address nginx passed on (counts a registrar's wrong passwords per client). */
-  async login(username: string, password: string, ip: string | undefined) {
-    const account = await this.prisma.demoPortalAccount.findUnique({ where: { username } });
+  /**
+   * `ip`: req.ip, the address nginx passed on (counts a registrar's wrong passwords per client).
+   * `issuer`: the portal signed in to; when given, an account of another issuer is unknown here.
+   * An account of a DID issuer is unknown while DPKI is off (that issuer is not hosted).
+   */
+  async login(username: string, password: string, ip: string | undefined, issuer?: string) {
+    const found = await this.prisma.demoPortalAccount.findUnique({ where: { username } });
+    const account =
+      found && (issuer === undefined || found.issuerName === issuer) && (this.dpki || !isDidIssuer(found.issuerName)) ? found : null;
     const counters = account?.role === 'registrar' ? registrarCounters(account.username, ip) : [];
 
     if (counters.length > 0) {
