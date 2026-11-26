@@ -11,7 +11,7 @@ import request from 'supertest';
 import * as argon2 from 'argon2';
 
 import { configureApp } from '../src/configure-app';
-import { DEMO_ACCOUNTS, DEMO_ISSUER, PORTAL_PASSWORD_HASH } from '../src/demo-portal/demo-accounts';
+import { DEMO_ACCOUNTS, DEMO_DID_ACCOUNTS, DEMO_ISSUER, DID_ACCOUNT_PREFIX, PORTAL_PASSWORD_HASH } from '../src/demo-portal/demo-accounts';
 import { PrismaService } from '../src/infrastructure/prisma/prisma.service';
 import { RedisService } from '../src/infrastructure/redis/redis.service';
 
@@ -196,12 +196,26 @@ export async function registerUser(app: NestExpressApplication): Promise<Registe
   };
 }
 
-/** The public student password, and the registrar's own (private) one: demo:provision needs both. */
+/**
+ * The public student password, and each registrar's own (private) one: demo:provision needs the
+ * first two, and the third with DPKI configured (the registrar of truong-mau-certnet).
+ */
 export const TEST_PORTAL_PASSWORD = 'Identra@2026';
 export const TEST_REGISTRAR_PASSWORD = 'Registrar-Only-Pass-2026';
-export const PROVISION_ENV = { DEMO_PORTAL_PASSWORD: TEST_PORTAL_PASSWORD, DEMO_PORTAL_REGISTRAR_PASSWORD: TEST_REGISTRAR_PASSWORD };
-export const portalPasswordOf = (username: string) =>
-  DEMO_ACCOUNTS.some((a) => a.username === username && a.role === 'student') ? TEST_PORTAL_PASSWORD : TEST_REGISTRAR_PASSWORD;
+export const TEST_REGISTRAR_PASSWORD_CERTNET = 'Registrar-CertNet-Pass-2026';
+export const PROVISION_ENV = {
+  DEMO_PORTAL_PASSWORD: TEST_PORTAL_PASSWORD,
+  DEMO_PORTAL_REGISTRAR_PASSWORD: TEST_REGISTRAR_PASSWORD,
+  DEMO_PORTAL_REGISTRAR_PASSWORD_CERTNET: TEST_REGISTRAR_PASSWORD_CERTNET
+};
+export const portalPasswordOf = (username: string) => {
+  const certnet = username.startsWith(DID_ACCOUNT_PREFIX);
+  const name = certnet ? username.slice(DID_ACCOUNT_PREFIX.length) : username;
+
+  if ((certnet ? DEMO_DID_ACCOUNTS : DEMO_ACCOUNTS).some((a) => a.username === name && a.role === 'student')) return TEST_PORTAL_PASSWORD;
+
+  return certnet ? TEST_REGISTRAR_PASSWORD_CERTNET : TEST_REGISTRAR_PASSWORD;
+};
 
 /** The sample portal accounts, plus a registrar of another issuer for authorisation tests. */
 export async function seedPortalAccounts(prisma: PrismaService): Promise<void> {

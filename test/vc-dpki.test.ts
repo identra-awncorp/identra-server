@@ -5,8 +5,8 @@
 // status list; portal sessions of the two schools never reach each other's credentials.
 import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
-import { createPublicKey } from 'node:crypto';
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createPublicKey, generateKeyPairSync } from 'node:crypto';
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { after, before, describe, it, type TestContext } from 'node:test';
@@ -16,10 +16,11 @@ import { ConfigService } from '@nestjs/config';
 import { NestExpressApplication } from '@nestjs/platform-express';
 import { Test } from '@nestjs/testing';
 
+import { ISSUERS, IssuerRegistry } from '../src/vc/issuers';
 import { CLOCK, PKI, Pki, vcProviders } from '../src/vc/vc.providers';
 import { call, LOCAL, login, newOffer, newWallet, nodeFetch, ORIGIN, PORT } from './e2e-world';
 import { GATEWAY, NETWORK, startStubGateway, StubGateway } from './certnet-stub';
-import { copiedKeysDir, createTestApp, PROVISION_ENV, randomIp, TEST_PORTAL_PASSWORD, TEST_REGISTRAR_PASSWORD, uniqueIp } from './helpers';
+import { copiedKeysDir, createTestApp, portalPasswordOf, PROVISION_ENV, randomIp, TEST_REGISTRAR_PASSWORD, TEST_REGISTRAR_PASSWORD_CERTNET, uniqueIp } from './helpers';
 
 const STUB_PORT = 47450;
 const DID_ISSUER = 'truong-mau-certnet';
@@ -207,6 +208,124 @@ describe('npm run certnet:register', () => {
   });
 });
 
+describe('npm run certnet:register: local checks and the answer, before and after anything is sent', () => {
+  let n = 0;
+  const fresh = () => {
+    const dir = keysCopy(`local-${n++}`);
+
+    mkdirSync(didFiles(dir), { mode: 0o700 });
+
+    return dir;
+  };
+  const pkcs8 = () => generateKeyPairSync('ec', { namedCurve: 'P-256' }).privateKey.export({ type: 'pkcs8', format: 'pem' });
+
+  it('every local precondition is checked before anything is sent (no orphan DID): exit 1, no request, no did.json', async () => {
+    const cases: Array<[string, (org: string, dir: string) => void, RegExp]> = [
+      ['organisation directory writable by group', (org) => chmodSync(org, 0o770), /writable by group or others/],
+      ['organisation directory writable by others', (org) => chmodSync(org, 0o703), /writable by group or others/],
+      ['organisation directory is a link', (org, dir) => {
+        rmSync(org, { recursive: true });
+        mkdirSync(join(dir, 'elsewhere'), { mode: 0o700 });
+        symlinkSync(join(dir, 'elsewhere'), org);
+      }, /is a symbolic link/],
+      ['did.json is a dangling link', (org) => symlinkSync(join(org, 'nowhere.json'), join(org, 'did.json')), /did\.json must be a regular file/],
+      ['did.json is a link to a file', (org, dir) => {
+        writeFileSync(join(dir, 'other.json'), JSON.stringify(readDid(keys)));
+        symlinkSync(join(dir, 'other.json'), join(org, 'did.json'));
+      }, /did\.json must be a regular file/],
+      ['an X.509 issuing key (a dangling link)', (org) => symlinkSync(join(org, 'nowhere.pem'), join(org, 'vc.key.pem')), /holds X\.509 issuing files/],
+      ['an X.509 issuing chain', (org) => writeFileSync(join(org, 'status.chain.pem'), 'x'), /holds X\.509 issuing files/],
+      ['an existing key that is not PKCS#8 (SEC1)', (org) => {
+        const sec1 = generateKeyPairSync('ec', { namedCurve: 'P-256' }).privateKey.export({ type: 'sec1', format: 'pem' });
+
+        writeFileSync(join(org, 'did.key.pem'), sec1, { mode: 0o600 });
+      }, /not a single PKCS#8 PEM private key/],
+      ['an existing key with mode 644 (did.json present)', (org) => {
+        writeFileSync(join(org, 'did.key.pem'), pkcs8(), { mode: 0o644 });
+        chmodSync(join(org, 'did.key.pem'), 0o644);
+        writeFileSync(join(org, 'did.json'), JSON.stringify(readDid(keys)));
+      }, /did\.key\.pem must be a regular file with mode 600/],
+      ['an existing key that is a link', (org, dir) => {
+        writeFileSync(join(dir, 'key.pem'), pkcs8(), { mode: 0o600 });
+        symlinkSync(join(dir, 'key.pem'), join(org, 'did.key.pem'));
+      }, /did\.key\.pem must be a regular file with mode 600/]
+    ];
+
+    for (const [name, prepare, message] of cases) {
+      const dir = fresh();
+      const org = didFiles(dir);
+
+      prepare(org, dir);
+      const hadJson = existsSync(join(org, 'did.json'));
+      const seen = stub.requests.length;
+      const r = await register({ IDENTRA_KEYS_DIR: dir }, 'did');
+
+      assert.equal(r.code, 1, `${name}: ${r.out}`);
+      assert.match(r.out, message, name);
+      assert.equal(stub.requests.length, seen, `${name}: nothing sent`);
+      if (!hadJson) assert.ok(!existsSync(join(org, 'did.json')), name);
+    }
+  });
+
+  it('an existing key is never replaced: the key placed before the first run is the one registered, and the file keeps mode 600', async () => {
+    const dir = fresh();
+    const keyPath = join(didFiles(dir), 'did.key.pem');
+    const key = pkcs8();
+
+    writeFileSync(keyPath, key, { mode: 0o600 });
+    const r = await register({ IDENTRA_KEYS_DIR: dir }, 'did');
+
+    assert.equal(r.code, 0, r.out);
+    assert.ok(!/generated/.test(r.out), r.out);
+    assert.equal(readFileSync(keyPath, 'utf8'), key);
+    assert.equal(statSync(keyPath).mode & 0o777, 0o600);
+    assert.equal(
+      (stub.dids.get(readDid(dir).did)!.verificationMethod as Array<{ publicKeyJwk: { x: string } }>)[0]!.publicKeyJwk.x,
+      createPublicKey(key).export({ format: 'jwk' }).x
+    );
+  });
+
+  it('refuses a returned key with private members, and a DID of another network even when the whole answer agrees with it (exit 3)', async (t) => {
+    t.after(() => (stub.tamper = undefined));
+    const tampers: Array<[string, (a: Record<string, unknown>) => Record<string, unknown>]> = [
+      ['the private member d', (a) => {
+        const out = structuredClone(a) as { document: { verificationMethod: Array<{ publicKeyJwk: Record<string, unknown> }> } };
+
+        out.document.verificationMethod[0]!.publicKeyJwk.d = 'jpsQnnGQmL-YBIffH1136cspYG6-0iY7X1fCE9-E9LI';
+
+        return out as unknown as Record<string, unknown>;
+      }],
+      ['another network throughout (did, document id, method, controller, assertionMethod)', (a) => JSON.parse(JSON.stringify(a).replaceAll(':local:', ':testnet:'))]
+    ];
+
+    for (const [name, tamper] of tampers) {
+      const dir = fresh();
+
+      stub.tamper = tamper;
+      const r = await register({ IDENTRA_KEYS_DIR: dir }, 'did');
+
+      assert.equal(r.code, 3, `${name}: ${r.out}`);
+      assert.ok(!existsSync(join(didFiles(dir), 'did.json')), name);
+    }
+  });
+
+  it('CERTNET_GATEWAY_LOCAL_URL is refused in production, also by IDENTRA_DEPLOYMENT alone, and so is the local network: nothing sent', async () => {
+    const seen = stub.requests.length;
+
+    for (const [env, message] of [
+      [{ IDENTRA_DEPLOYMENT: 'production' }, /CERTNET_GATEWAY_LOCAL_URL is for development and tests only/],
+      [{ NODE_ENV: 'production' }, /CERTNET_GATEWAY_LOCAL_URL is for development and tests only/],
+      [{ IDENTRA_DEPLOYMENT: 'production', CERTNET_GATEWAY_LOCAL_URL: '' }, /CERTNET_NETWORK=local is refused in production/]
+    ] as const) {
+      const r = await register({ IDENTRA_KEYS_DIR: fresh(), CERTNET_WRITE_TOKEN: WRITE_TOKEN, ...env });
+
+      assert.deepEqual([r.code, message.test(r.out)], [1, true], `${JSON.stringify(env)}: ${r.out}`);
+    }
+
+    assert.equal(stub.requests.length, seen);
+  });
+});
+
 describe('npm run certnet:register -- recognise: the record read back decides the exit code', () => {
   let n = 0;
   const dir = () => {
@@ -319,7 +438,7 @@ const didWallet = () => {
 
 const portalLogin = async (username: string, issuer?: string) =>
   call('POST', '/v1/demo/school/login', {
-    body: { ...(issuer ? { issuer } : {}), username, password: /phongdaotao$/.test(username) ? TEST_REGISTRAR_PASSWORD : TEST_PORTAL_PASSWORD },
+    body: { ...(issuer ? { issuer } : {}), username, password: portalPasswordOf(username) },
     ip: randomIp()
   });
 const didLogin = async (username: string) => {
@@ -374,7 +493,7 @@ describe('the DID issuer truong-mau-certnet and the hosted verifier', () => {
     const details = await holder.wallet.credentials.get(credentialId);
 
     assert.deepEqual([summary?.trustPath, summary?.issuerDid, summary?.issuerUri], ['did', did(), `${ORIGIN}/issuers/${DID_ISSUER}`]);
-    assert.equal(details.ok && details.credential.claims['ho_ten'], 'Nguyễn Thị Minh Anh');
+    assert.equal(details.ok && details.credential.claims['ho_ten'], 'Võ Ngọc Khánh Linh');
     assert.equal((await call('GET', `/v1/demo/school/offers/${issued.offerId}`, { token: student })).body.status, 'issued');
 
     // Its status list is served like every issuer's, signed by the DID key (no x5c).
@@ -448,7 +567,7 @@ describe('the DID issuer truong-mau-certnet and the hosted verifier', () => {
     assert.deepEqual(body.result.checks.map((c: { id: string }) => c.id), DID_CHECK_ORDER);
     assert.ok(body.result.checks.every((c: { ok: boolean; code: string | null }) => c.ok && c.code === null));
     assert.deepEqual([body.result.trustPath, body.result.issuerDid, 'issuer' in body.result], ['did', did(), false]);
-    assert.deepEqual(body.result.claims, { ho_ten: 'Nguyễn Thị Minh Anh', nganh: 'Công nghệ thông tin' });
+    assert.deepEqual(body.result.claims, { ho_ten: 'Võ Ngọc Khánh Linh', nganh: 'Công nghệ thông tin' });
   });
 
   it('the trust registry gives no answer: fails at issuer_trust with TRUST_LIST_UNAVAILABLE, never accepted', async (t) => {
@@ -566,6 +685,39 @@ describe('the DID issuer truong-mau-certnet and the hosted verifier', () => {
       assert.equal(res.status, 201);
       assert.equal(res.body.issuer, expected, username);
     }
+  });
+
+  it('each school\'s registrar has its own password: neither opens the other school', async () => {
+    const attempt = (username: string, password: string) => call('POST', '/v1/demo/school/login', { body: { username, password }, ip: randomIp() });
+
+    assert.deepEqual((await attempt('cn-phongdaotao', TEST_REGISTRAR_PASSWORD)).body.code, 'INVALID_CREDENTIALS');
+    assert.deepEqual((await attempt('phongdaotao', TEST_REGISTRAR_PASSWORD_CERTNET)).body.code, 'INVALID_CREDENTIALS');
+    assert.equal((await attempt('cn-phongdaotao', TEST_REGISTRAR_PASSWORD_CERTNET)).body.issuer, DID_ISSUER);
+  });
+
+  it('an offer of one school never yields a credential from an account of the other school (resolveClaims)', async () => {
+    const issuers = app.get<IssuerRegistry>(ISSUERS);
+    const accept = async (issuerName: string, subjectRef: string, wallet: Wallet) => {
+      const offer = await issuers.get(issuerName)!.issuer.createOffer({ subjectRef, configurationId: 'bang-tot-nghiep-v1' });
+      const resolved = await wallet.offers.resolve(offer.offerUri);
+
+      assert.ok(resolved.ok, JSON.stringify(resolved));
+
+      return wallet.offers.accept(resolved.offer, { txCode: offer.txCode });
+    };
+
+    for (const [issuerName, subjectRef, wallet] of [
+      ['truong-mau', 'cn-sv001', newWallet().wallet],
+      [DID_ISSUER, 'sv001', didWallet().wallet]
+    ] as const) {
+      const accepted = await accept(issuerName, subjectRef, wallet);
+
+      assert.equal(accepted.ok, false, `${issuerName} with ${subjectRef}: ${JSON.stringify(accepted)}`);
+      assert.deepEqual(await wallet.credentials.list(), []);
+    }
+
+    // The same call with the school's own account does issue (the refusal above is the issuer check).
+    assert.equal((await accept(DID_ISSUER, 'cn-sv002', didWallet().wallet)).ok, true);
   });
 
   it('health says DPKI is configured and the DID issuer can sign, without asking the gateway', async () => {

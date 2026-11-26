@@ -49,7 +49,10 @@ after(() => {
   server.close();
 });
 
-const gatewayFetch = createGatewayFetch({ gatewayUrl: GATEWAY, localUrl: LOCAL });
+// The transport tests below use the write-enabled instance (certnet:register's), which reaches any
+// path under the gateway; the server's own instance is read-only (last describe).
+const gatewayFetch = createGatewayFetch({ gatewayUrl: GATEWAY, localUrl: LOCAL, write: true });
+const readOnlyFetch = createGatewayFetch({ gatewayUrl: GATEWAY, localUrl: LOCAL });
 
 describe('the gateway fetch', () => {
   it('reaches the configured gateway (mapped to the local listener) and returns the answer', async () => {
@@ -101,5 +104,77 @@ describe('the gateway fetch', () => {
 
     assert.equal(res.status, 302);
     assert.deepEqual(seen.slice(count), ['/certnet/v1/redirect']);
+  });
+});
+
+describe('the gateway fetch: what reaches the gateway', () => {
+  const did = encodeURIComponent('did:certnet:local:abc123');
+
+  it('refuses dot segments and backslashes in any encoding, URLs not in canonical form and credentials, without opening a socket', async () => {
+    const before = connections;
+
+    for (const url of [
+      `${GATEWAY}/../admin`,
+      `${GATEWAY}/%2e%2e/admin`,
+      `${GATEWAY}/.%2E/admin`,
+      `${GATEWAY}/..\\admin`,
+      `${GATEWAY}/v1/./ok`,
+      `${GATEWAY}/v1/dids/x%2F..%2F..%2F..%2Fadmin`,
+      `${GATEWAY}/v1/dids/%252e%252e`,
+      `${GATEWAY}/v1/dids/%25252e%25252e`,
+      `${GATEWAY}/v1/dids/%2525252e`,
+      `${GATEWAY}/v1/dids/a%5Cb`,
+      `${GATEWAY}/v1/dids/a%255Cb`,
+      `${GATEWAY}/v1/dids/%E0%A4%A`,
+      `${GATEWAY}/v1/dids/${did}?q=a\\b`,
+      'https://GATEWAY.certnet.example/certnet/v1/ok',
+      'https://gateway.certnet.example:443/certnet/v1/ok',
+      'https://u:p@gateway.certnet.example/certnet/v1/ok',
+      'https://gateway.certnet.example/certnet/v1/ok#f'
+    ]) {
+      await assert.rejects(gatewayFetch(url, { timeoutMs: 500 }), /only the configured CertNet gateway/, url);
+      await assert.rejects(readOnlyFetch(url, { timeoutMs: 500 }), /only the configured CertNet gateway/, url);
+    }
+
+    assert.equal(connections, before);
+  });
+
+  it('the read-only instance (the server\'s) sends only GET of /v1/dids/<did> and /v1/trust-registry/issuers/<did>', async () => {
+    const before = connections;
+    const count = seen.length;
+
+    for (const [url, method] of [
+      [`${GATEWAY}/v1/dids`, 'POST'],
+      [`${GATEWAY}/v1/dids/${did}`, 'POST'],
+      [`${GATEWAY}/v1/dids/${did}/deactivate`, 'POST'],
+      [`${GATEWAY}/v1/dids/${did}/verification-methods`, 'POST'],
+      [`${GATEWAY}/v1/dids`, 'GET'],
+      [`${GATEWAY}/v1/dids/`, 'GET'],
+      [`${GATEWAY}/v1/trust-registry/issuers`, 'POST'],
+      [`${GATEWAY}/v1/trust-registry/issuers/${did}`, 'PUT'],
+      [`${GATEWAY}/v1/trust-registry/issuers/${did}`, 'DELETE'],
+      [`${GATEWAY}/v1/trust-registry/issuers/${did}/reject`, 'GET'],
+      [`${GATEWAY}/v1/trust-registry/pending-requests`, 'GET'],
+      [`${GATEWAY}/v1/credential-statuses/1`, 'GET'],
+      [`${GATEWAY}/v1/ok`, 'GET']
+    ] as const) {
+      await assert.rejects(readOnlyFetch(url, { method }), /only reads DIDs and trust records/, `${method} ${url}`);
+    }
+
+    assert.equal(connections, before);
+
+    await readOnlyFetch(`${GATEWAY}/v1/dids/${did}`);
+    await readOnlyFetch(`${GATEWAY}/v1/trust-registry/issuers/${did}?vcType=${encodeURIComponent('urn:eudi:diploma:1')}`, { method: 'GET' });
+    assert.deepEqual(seen.slice(count), [`/certnet/v1/dids/${did}`, `/certnet/v1/trust-registry/issuers/${did}?vcType=urn%3Aeudi%3Adiploma%3A1`]);
+  });
+
+  it('never sends an authorization header over plain http except to loopback', async () => {
+    const remote = createGatewayFetch({ gatewayUrl: GATEWAY, localUrl: 'http://192.0.2.1:9', write: true });
+
+    await assert.rejects(
+      remote(`${GATEWAY}/v1/dids`, { method: 'POST', headers: { authorization: 'Bearer t' }, body: '{}', timeoutMs: 500 }),
+      /never sent to the CertNet gateway over plain http/
+    );
+    assert.equal((await gatewayFetch(`${GATEWAY}/v1/ok`, { headers: { authorization: 'Bearer t' } })).status, 200);
   });
 });

@@ -107,11 +107,19 @@ The school portal's sample accounts: Deploy, step 7.
 
 ### DID issuer (DPKI, `truong-mau-certnet`): not deployed
 
-**Production needs no change.** The DID trust path (ADR-0020) is off unless
-`CERTNET_GATEWAY_URL` and `CERTNET_NETWORK` are set, and they are not set on the VPS: the DID
-issuer `truong-mau-certnet` then does not exist (its routes are `404`, it is not in health, its
-keys are not looked for), and every other organisation behaves exactly as before. ADR-0020 §10
-keeps it off the VPS until CertNet has a testnet.
+**Production needs no change, and DPKI is not part of the production deployment yet.** The DID
+trust path (ADR-0020) is off unless `CERTNET_GATEWAY_URL` and `CERTNET_NETWORK` are set, and they
+are not set on the VPS: the DID issuer `truong-mau-certnet` then does not exist (its routes are
+`404`, it is not in health, its keys are not looked for). ADR-0020 §10 keeps it off the VPS until
+CertNet has a testnet.
+
+With DPKI off, the differences from the release before it are exactly these: verification results
+carry `trustPath: "x509"`; `POST /v1/demo/school/login` accepts an optional `issuer` field (an
+unknown field used to be `400`) and its response has a new `issuer` field; a credential signed
+with a `did:` `kid` is still refused, with a different internal code in the log line; the image
+contains the registration script (`dist/src/scripts/certnet-register.js`, never run by the
+server). Unchanged: no new route is reachable, no outbound request is made, no database
+migration, no new dependency, `/v1/health` as before.
 
 For when it is enabled (README, "DID trust path"): its keys are
 `orgs/truong-mau-certnet/did.key.pem` (mode 600, like every key) and `did.json`, written by
@@ -119,7 +127,11 @@ For when it is enabled (README, "DID trust path"): its keys are
 `-- did` and `-- recognise` run the issuer's and the accrediting body's step separately). Then
 production refuses to start without them, as for any hosted organisation, and
 `/v1/health` gains `dpki: { status, network }`. `CERTNET_GATEWAY_LOCAL_URL` is refused in
-production. The gateway URL is trusted configuration (its answers are unsigned).
+production. The gateway URL is trusted configuration (its answers are unsigned). Production also
+refuses `CERTNET_NETWORK=local`: a local network's trust registry is unauthenticated, so anyone
+can record any DID as a recognised school there, and a verifier reading it would accept anyone's
+diplomas. `demo:provision` then also needs `DEMO_PORTAL_REGISTRAR_PASSWORD_CERTNET`, the second
+school's registrar password (private, at least 20 characters, different from the other two).
 
 The key directory must not contain CA keys: the server refuses to start when it finds a `ca/`
 directory or a `ca.key.pem` anywhere under it (ADR-0015 §2, ADR-0016 §6).

@@ -35,27 +35,84 @@ async function readCapped(res: Response, max: number): Promise<string> {
   return Buffer.concat(chunks).toString('utf8');
 }
 
+/** The only requests of the read-only fetch: GetDid and LookupIssuer (one path segment each, any query). */
+const READ_PATH = /^\/v1\/(dids|trust-registry\/issuers)\/[^/]+$/;
+const LOOPBACK = new Set(['127.0.0.1', 'localhost', '[::1]']);
+
+/**
+ * `url` when it reaches the gateway under its prefix, else null: it must already be in canonical
+ * form (so `..`, `%2e%2e` and `\` that the URL parser would resolve are refused, not resolved),
+ * have the gateway's origin and path prefix, and no dot segment or backslash in any encoding (a
+ * proxy or gateway that decodes `%2F..%2F` or `%252e` once more would reach another path).
+ */
+function gatewayPath(url: string, origin: string, prefix: string): { path: string; search: string } | null {
+  let parsed: URL;
+
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+
+  if (parsed.href !== url || parsed.origin !== origin || parsed.username !== '' || parsed.password !== '' || parsed.hash !== '' || url.includes('\\')) return null;
+  if (!parsed.pathname.startsWith(`${prefix}/`)) return null;
+
+  let decoded = parsed.pathname;
+
+  // Decoded until it no longer changes; encoded more than three times is refused (no gateway path is).
+  for (let round = 0; ; round += 1) {
+    let next: string;
+
+    try {
+      next = decodeURIComponent(decoded);
+    } catch {
+      return null;
+    }
+
+    if (next === decoded) break;
+    if (round === 3) return null;
+    decoded = next;
+  }
+
+  if (decoded.includes('\\') || decoded.split('/').some((segment) => segment === '.' || segment === '..')) return null;
+
+  return { path: parsed.pathname.slice(prefix.length), search: parsed.search };
+}
+
 /**
  * HttpFetch of the DID trust path (ADR-0020 §9), given ONLY to the CertNet DID resolver and trust
  * registry (and certnet:register). Reaches only URLs under `gatewayUrl` (anything else is refused
- * without opening a socket), enforces `timeoutMs` over the whole exchange and `maxBytes` while
- * reading, and never follows a redirect (a 3xx is returned as it is). `localUrl` (development and
- * tests): requests for the gateway origin go there instead; the URLs the SDK builds stay canonical.
+ * without opening a socket, see gatewayPath), enforces `timeoutMs` over the whole exchange and
+ * `maxBytes` while reading, and never follows a redirect (a 3xx is returned as it is). Read-only
+ * unless `write` (certnet:register only): then only `GET` of `/v1/dids/<did>` and
+ * `/v1/trust-registry/issuers/<did>`. An `authorization` header never goes over plain http except to
+ * loopback. `localUrl` (development and tests): requests for the gateway origin go there instead;
+ * the URLs the SDK builds stay canonical.
  */
-export function createGatewayFetch(options: { gatewayUrl: string; localUrl?: string }): HttpFetch {
-  const base = options.gatewayUrl.replace(/\/$/, '');
-  const origin = new URL(base).origin;
+export function createGatewayFetch(options: { gatewayUrl: string; localUrl?: string; write?: boolean }): HttpFetch {
+  const base = new URL(options.gatewayUrl.replace(/\/$/, ''));
+  const prefix = base.pathname.replace(/\/$/, '');
 
   return async (url, init = {}) => {
-    if (!url.startsWith(`${base}/`)) throw new Error('only the configured CertNet gateway is reached');
+    const target = gatewayPath(url, base.origin, prefix);
+    const method = init.method ?? 'GET';
 
-    const target = options.localUrl === undefined ? url : options.localUrl + url.slice(origin.length);
+    if (target === null) throw new Error('only the configured CertNet gateway is reached');
+    if (!options.write && (method !== 'GET' || !READ_PATH.test(target.path))) throw new Error('this CertNet gateway fetch only reads DIDs and trust records');
+
+    const sent = new URL(options.localUrl === undefined ? url : options.localUrl + prefix + target.path + target.search);
+    const headers = new Headers(init.headers);
+
+    if (headers.has('authorization') && sent.protocol !== 'https:' && !LOOPBACK.has(sent.hostname)) {
+      throw new Error('credentials are never sent to the CertNet gateway over plain http');
+    }
+
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), init.timeoutMs ?? DEFAULT_TIMEOUT_MS);
 
     try {
-      const res = await fetch(target, {
-        method: init.method ?? 'GET',
+      const res = await fetch(sent, {
+        method,
         redirect: 'manual',
         signal: controller.signal,
         ...(init.headers ? { headers: init.headers } : {}),

@@ -17,7 +17,8 @@ import {
   REGISTRAR_WINDOW_SECONDS,
   sessionHashOf
 } from '../src/demo-portal/portal-sessions';
-import { createTestApp, portalLogin, randomIp, seedPortalAccounts, TEST_PORTAL_PASSWORD, TEST_REGISTRAR_PASSWORD } from './helpers';
+import { DEMO_ACCOUNTS, DEMO_DID_ACCOUNTS, DEMO_DID_ISSUER, DID_ACCOUNT_PREFIX } from '../src/demo-portal/demo-accounts';
+import { createTestApp, portalLogin, PROVISION_ENV, randomIp, seedPortalAccounts, TEST_PORTAL_PASSWORD, TEST_REGISTRAR_PASSWORD } from './helpers';
 
 // Runs without keys: the portal itself needs none. Credential rows are inserted directly.
 let app: NestExpressApplication;
@@ -87,6 +88,57 @@ describe('npm run demo:provision', () => {
     const refused = await login('phongdaotao', 'Another-Pass-2026').expect(401);
     assert.equal(refused.body.code, 'INVALID_CREDENTIALS');
     assert.equal((await login('phongdaotao', 'Registrar-Pass-2026-Other').expect(201)).body.role, 'registrar');
+  });
+
+  it('with DPKI configured the second school\'s registrar needs its own password: 20+ characters, neither the public one nor the first registrar\'s', () => {
+    const dpki = { CERTNET_GATEWAY_URL: 'https://gateway.certnet.example', CERTNET_NETWORK: 'local' };
+    const refused: Array<[Record<string, string>, RegExp]> = [
+      [{}, /set DEMO_PORTAL_REGISTRAR_PASSWORD_CERTNET/],
+      [{ DEMO_PORTAL_REGISTRAR_PASSWORD_CERTNET: 'Registrar-Pass-2026' }, /DEMO_PORTAL_REGISTRAR_PASSWORD_CERTNET \(the private registrar password, at least 20/],
+      [{ DEMO_PORTAL_REGISTRAR_PASSWORD_CERTNET: TEST_REGISTRAR_PASSWORD }, /DEMO_PORTAL_REGISTRAR_PASSWORD_CERTNET must differ from DEMO_PORTAL_REGISTRAR_PASSWORD/],
+      [
+        { DEMO_PORTAL_PASSWORD: 'Same-Pass-2026-Same-1', DEMO_PORTAL_REGISTRAR_PASSWORD_CERTNET: 'Same-Pass-2026-Same-1' },
+        /DEMO_PORTAL_REGISTRAR_PASSWORD_CERTNET must differ from the public DEMO_PORTAL_PASSWORD/
+      ]
+    ];
+
+    for (const [extra, message] of refused) {
+      assert.throws(
+        () => execFileSync(process.execPath, [script], { env: { ...process.env, ...PROVISION_ENV, ...dpki, DEMO_PORTAL_REGISTRAR_PASSWORD_CERTNET: '', ...extra }, stdio: 'pipe' }),
+        (error: { stderr: Buffer }) => /refuses to run/.test(String(error.stderr)) && message.test(String(error.stderr)),
+        JSON.stringify(extra)
+      );
+    }
+  });
+
+  it('with DPKI off it creates no account of the DID issuer, and needs no third password', async (t) => {
+    t.after(() => seedPortalAccounts(prisma));
+    await prisma.demoPortalAccount.deleteMany({ where: { username: { startsWith: DID_ACCOUNT_PREFIX } } });
+    const { DEMO_PORTAL_REGISTRAR_PASSWORD_CERTNET: _c, ...env } = { ...process.env, ...PROVISION_ENV };
+    const output = execFileSync(process.execPath, [script], { env, stdio: 'pipe' }).toString();
+
+    assert.ok(!output.includes(DID_ACCOUNT_PREFIX), output);
+    assert.equal(await prisma.demoPortalAccount.count({ where: { OR: [{ username: { startsWith: DID_ACCOUNT_PREFIX } }, { issuerName: DEMO_DID_ISSUER }] } }), 0);
+  });
+});
+
+describe('the sample data of the two schools', () => {
+  it('the CertNet school\'s students are other people: own names, birth dates, student codes (DEMO) and diploma numbers', () => {
+    const students = (accounts: typeof DEMO_ACCOUNTS) => accounts.flatMap((a) => (a.role === 'student' ? [a.profile] : []));
+    const [tm, cn] = [students(DEMO_ACCOUNTS), students(DEMO_DID_ACCOUNTS)];
+
+    assert.deepEqual(DEMO_DID_ACCOUNTS.map((a) => [a.username, a.role]), DEMO_ACCOUNTS.map((a) => [a.username, a.role]));
+    assert.equal(cn.length, 3);
+
+    for (const field of ['hoTen', 'ngaySinh', 'maSinhVien', 'soHieuBang'] as const) {
+      assert.deepEqual(cn.filter((p) => tm.some((q) => q[field] === p[field])), [], field);
+    }
+
+    assert.ok(cn.every((p) => /^DEMO\d{2}[A-Z]+\d{4}$/.test(p.maSinhVien) && /^CNDEMO-\d{4}-\d{6}$/.test(p.soHieuBang) && /^\d{4}-\d{2}-\d{2}$/.test(p.ngaySinh)));
+
+    const registrar = (accounts: typeof DEMO_ACCOUNTS) => accounts.find((a) => a.role === 'registrar')!.profile.hoTen;
+
+    assert.notEqual(registrar(DEMO_DID_ACCOUNTS), registrar(DEMO_ACCOUNTS));
   });
 });
 

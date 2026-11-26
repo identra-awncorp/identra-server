@@ -222,11 +222,15 @@ accounts below, `"truong-mau-certnet"`; clients read it instead of guessing from
 
 With DPKI configured `demo:provision` also creates four accounts for
 `truong-mau-certnet` under `cn-` names: students `cn-sv001`, `cn-sv002`, `cn-sv003` (the public
-student password) and the registrar `cn-phongdaotao` (the private registrar password). Sign in
-with `{ "issuer": "truong-mau-certnet", "username": "cn-sv001", "password": "…" }`. They are the
-same fictional people, but the school has its own records: the registrar's `donVi` is `Phòng Đào
-tạo, Trường Mẫu CertNet (DEMO)` and the diploma numbers (`soHieuBang`) are `CNDEMO-2025-000317`,
-`CNDEMO-2024-001254`, `CNDEMO-2026-000029`, where the first school's are `TMDEMO-…`.
+student password) and the registrar `cn-phongdaotao` (its own private password,
+`DEMO_PORTAL_REGISTRAR_PASSWORD_CERTNET`, never the first registrar's: wrong passwords are counted
+per account, so one secret behind both would give twice the guesses and open both schools). Sign
+in with `{ "issuer": "truong-mau-certnet", "username": "cn-sv001", "password": "…" }`. The school
+has its own records of other fictional people: students Võ Ngọc Khánh Linh, Đặng Minh Khôi and
+Bùi Thanh Hà My (student codes `DEMO21CNTT0187`, `DEMO20DTVT0233`, `DEMO22QTKD0091`), the
+registrar Ngô Thị Thu Hằng of `Phòng Đào tạo, Trường Mẫu CertNet (DEMO)`, and diploma numbers
+(`soHieuBang`) `CNDEMO-2025-000317`, `CNDEMO-2024-001254`, `CNDEMO-2026-000029`, where the first
+school's are `TMDEMO-…`.
 
 ## 6. Presentation: OpenID4VP 1.0, cross-device
 
@@ -394,13 +398,21 @@ scenario, session) before it reserves anything; a refused one stores nothing.
 |---|---|---|---|---|---|---|
 | Verification session, until final or 5 minutes (signed request object, session key, record) | `VERIFICATION_MAX_LIVE_SESSIONS`, 2000 | 10 | 40 | when a wallet's response makes it final (verified, failed, or 10 refused responses: the result is stored and the request object deleted), or after 5 minutes | ≈ 7.4 KB (measured) | 2000 × 7.4 KB ≈ 15 MB |
 | Verification session created in the last 30 minutes (record, retrieved marker, result) | 6 × `VERIFICATION_MAX_LIVE_SESSIONS` = 12 000 | 100 | 400 | after 30 minutes (never earlier: freeing live places early cannot buy more) | ≈ 0.3–1.2 KB (measured) | 12 000 × 1.2 KB ≈ 14 MB |
-| `c_nonce` (5 minutes) | `ISSUANCE_MAX_LIVE_NONCES`, 2000 | 20 | 80 | when a proof uses it, or after 5 minutes | ≈ 0.45 KB (measured) | ≈ 0.9 MB |
+| `c_nonce` (5 minutes) | `ISSUANCE_MAX_LIVE_NONCES` per issuer, 2000 | 20 | 80 | when a proof uses it, or after 5 minutes | ≈ 0.45 KB (measured) | ≈ 0.9 MB |
 | Offer, first 10 minutes (offer, code) | `ISSUANCE_MAX_LIVE_OFFERS` per issuer, 500 | 5 | 20 | when redeemed (token endpoint), cancelled (`DELETE`, five wrong PINs, restart) or after 10 minutes | ≈ 1.4 KB (measured) | ≈ 0.7 MB |
 | Offer created in the last 30 minutes (status and portal records) | 20 × `ISSUANCE_MAX_LIVE_OFFERS` = 10 000 | 100 | 400 | after 30 minutes (its status stays readable that long, also once redeemed or cancelled) | ≈ 0.6 KB (status 0.4 + portal owner record 0.18, measured) | ≈ 6 MB |
 | Bookkeeping of the caps (sorted sets, owner hash; a session's place id) | one entry per place above, 26 500 | | | with its place | ≈ 0.38 KB per place for IPv4, 0.70 KB for IPv6 (both measured, every client distinct, each IPv6 client its own /48); 0.14 KB per open session | ≤ 26 500 × 0.70 KB + 0.3 MB ≈ 19 MB |
 | Portal session (30 minutes; only successful sign-ins) | none: bounded by the sign-in rate, at most two password hashes at once on the api's 0.75 CPU (≈ 30 ms each, measured) ≈ 25 sign-ins/s, so ≤ 45 000 in 30 minutes | (login limits above) | | after 30 minutes | ≈ 0.24 KB (measured) | ≈ 11 MB |
 
-About 67 MB, about half of `maxmemory` and below the 80 % health threshold. Portal sessions are
+About 67 MB, about half of `maxmemory` and below the 80 % health threshold, with one OpenID4VCI
+issuer (`truong-mau`, DPKI off). The three issuance kinds (`c_nonce`, live offers, offers of 30
+minutes) and their shares are **per hosted OpenID4VCI issuer**, on purpose: one school's traffic
+cannot use up the other's. With DPKI configured there are two (`truong-mau` and
+`truong-mau-certnet`), so those caps and a client's shares of them count twice: nonces 2 × 0.9 MB,
+live offers 2 × 0.7 MB, offers of 30 minutes 2 × 6 MB, and the bookkeeping 14 000 + 2 × 12 500 =
+39 000 places × 0.70 KB + 0.3 MB ≈ 28 MB. The worst case is then 15 + 14 + 1.8 + 1.4 + 12 + 28 + 11
+≈ **83 MB**, about 65 % of `maxmemory`, still below the 80 % health threshold (102 MB); the
+verification and portal-session kinds are shared by both schools and do not change. Portal sessions are
 not capped on purpose: their memory is already bounded by the CPU spent on hashing, and a cap
 would let a few hundred addresses (the student password is public) refuse every sign-in for 30
 minutes. The global per-minute budget of session creation (`VERIFICATION_SESSIONS_PER_MINUTE`)
@@ -412,6 +424,17 @@ minutes). Beyond a share (of the /56 or of the /48) the route answers `429` (`RA
 share or cap ends; for the 30-minute kinds up to 30 minutes); sign-in, issuance and everything
 else keep their share of Redis. `/v1/health` reports `redis: degraded` above 80 % of `maxmemory`
 or when a write is refused (checked every 10 s).
+
+On the DID path (DPKI configured) every `POST /oid4vp/response/:requestId` whose credential names
+a DID not in the verifier's resolver cache (60 s; a failure is never cached), an unknown DID
+included, costs one request to the CertNet gateway (the DID document,
+5 s, 64 KB) before the credential's signature is checked, and the trust-registry lookup one more
+once the signature holds: the DID is the sender's choice, so a client can make the server ask the
+gateway for DIDs that do not exist. This is a known property, bounded by the existing limits only:
+the response route's write limits (60/min per client, 240/min per /48), the 10 refused responses
+per session and the session caps above. There is no global cap on concurrent gateway requests; a
+gateway that is slow or down makes those responses `503 issuer_registry_unavailable` (section 6)
+and nothing else waits on it.
 
 What remains: an attacker with many addresses can still fill a global cap and keep that kind
 refused for everyone while the flood lasts (no data is lost, nothing else is affected). With the

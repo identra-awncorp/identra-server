@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
 import { parseCorsOrigins } from '../src/config/cors';
-import { validateEnv } from '../src/config/env.validation';
+import { certnetConfig, validateEnv } from '../src/config/env.validation';
 import { productionEnv as strongProductionEnv } from './helpers';
 
 const productionEnv = {
@@ -256,7 +256,16 @@ describe('CertNet (DPKI) configuration, ADR-0020', () => {
     assert.equal(validateEnv({ ...dev, ...on, CERTNET_GATEWAY_URL: 'https://gw.example:8443/certnet/' }).CERTNET_GATEWAY_URL, 'https://gw.example:8443/certnet');
     assert.equal(validateEnv({ ...dev, ...on, CERTNET_GATEWAY_LOCAL_URL: 'http://localhost:47450' }).CERTNET_GATEWAY_LOCAL_URL, 'http://localhost:47450');
     assert.equal(validateEnv({ ...dev, ...on, CERTNET_GATEWAY_LOCAL_URL: 'http://127.0.0.1:8000' }).CERTNET_GATEWAY_LOCAL_URL, 'http://127.0.0.1:8000');
-    assert.equal(validateEnv({ ...productionEnv, ...on }).CERTNET_NETWORK, 'local');
+    assert.equal(validateEnv({ ...productionEnv, ...on, CERTNET_NETWORK: 'testnet' }).CERTNET_NETWORK, 'testnet');
+  });
+
+  it('refuses the local network in production: anyone can write its trust registry', () => {
+    assert.throws(() => validateEnv({ ...productionEnv, ...on }), /CERTNET_NETWORK=local is refused in production/);
+    assert.throws(() => validateEnv({ ...productionEnv, ...on, IDENTRA_DEPLOYMENT: 'production' }), /CERTNET_NETWORK=local is refused in production/);
+    assert.equal(validateEnv({ ...productionEnv, ...on, CERTNET_NETWORK: 'mainnet' }).CERTNET_NETWORK, 'mainnet');
+    // The scripts read only certnetConfig: IDENTRA_DEPLOYMENT=production alone is production there.
+    assert.throws(() => certnetConfig({ ...on, IDENTRA_DEPLOYMENT: 'production' }), /CERTNET_NETWORK=local is refused in production/);
+    assert.throws(() => certnetConfig({ ...on, CERTNET_NETWORK: 'testnet', CERTNET_GATEWAY_LOCAL_URL: 'http://127.0.0.1:47450', IDENTRA_DEPLOYMENT: 'production' }), /for development and tests only/);
   });
 
   it('refuses one variable without the other', () => {

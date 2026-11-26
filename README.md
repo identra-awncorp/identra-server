@@ -77,18 +77,33 @@ server runs without those routes. Sample data, after `npm run build`:
 ADR-0020: beside the X.509 path, a sample issuer `truong-mau-certnet` identified by a
 `did:certnet` DID, recognised through the CertNet gateway (its DID documents and trust
 registry), and a hosted verifier that also accepts its credentials (`docs/vc-api.md` §4–§6).
-It is off unless both of these are set; with neither, the server behaves exactly as without
-this feature. **DPKI is not part of the production deployment yet: production needs no
-change** (ADR-0020 §10: not on the VPS until CertNet has a testnet).
+It is off unless both of these are set. **DPKI is not part of the production deployment yet:
+production needs no change** (ADR-0020 §10: not on the VPS until CertNet has a testnet).
+
+With neither set, the differences from the release before DPKI are exactly these:
+
+- Verification results (`GET /v1/verification/sessions/:id`, `result`) carry `trustPath: "x509"`.
+- `POST /v1/demo/school/login` accepts an optional `issuer` field (an unknown field used to be
+  `400 VALIDATION_FAILED`; only `truong-mau` signs in now), and its response has a new `issuer`
+  field (`"truong-mau"`).
+- A credential signed with a `did:` `kid` is still refused, with a different internal code in
+  the verifier's log line.
+- The image contains the registration script (`dist/src/scripts/certnet-register.js`); nothing runs it.
+
+Unchanged: no new route is reachable (every route of `truong-mau-certnet` is `404`), no outbound
+request is made (the gateway fetch is never built), no database migration, no new dependency,
+and `/v1/health` is as before (no `dpki` member).
 
 | Variable | Value |
 |---|---|
 | `CERTNET_GATEWAY_URL` | The gateway's https origin, optional path prefix (the API is under `<url>/v1`), e.g. `https://gateway.certnet.example`. Trusted configuration: its answers are unsigned. |
-| `CERTNET_NETWORK` | `local`, `testnet` or `mainnet`: only DIDs of this network are accepted. |
-| `CERTNET_GATEWAY_LOCAL_URL` | Development and tests only (refused in production): `http://127.0.0.1:<port>` or `http://localhost:<port>`, where requests for the gateway origin are sent (a localnet gateway on `:8000`, or the fake one). |
+| `CERTNET_NETWORK` | `local`, `testnet` or `mainnet`: only DIDs of this network are accepted. `local` is refused in production (`NODE_ENV` or `IDENTRA_DEPLOYMENT` = `production`): its trust registry is unauthenticated, anyone can write it, so a verifier pointed at one would accept anyone's diplomas. |
+| `CERTNET_GATEWAY_LOCAL_URL` | Development and tests only (refused in production, `NODE_ENV` or `IDENTRA_DEPLOYMENT` = `production`): `http://127.0.0.1:<port>` or `http://localhost:<port>`, where requests for the gateway origin are sent (a localnet gateway on `:8000`, or the fake one). |
 
 Only the DID resolver and the trust-registry client reach the gateway, through a fetch limited to
-that origin (5 s, 64 KB, no redirects); status lists are still read only from this server.
+that origin and path prefix (5 s, 64 KB, no redirects) and read-only: it sends only `GET
+<url>/v1/dids/<did>` and `GET <url>/v1/trust-registry/issuers/<did>`. Status lists are still read
+only from this server. Only the registration script builds a fetch that may write.
 
 The issuer's key files are `orgs/truong-mau-certnet/did.key.pem` (PKCS#8 P-256, mode 600) and
 `did.json` (`{ "did", "kid" }`) in `IDENTRA_KEYS_DIR`, written once per environment by the
@@ -108,13 +123,31 @@ npm run certnet:register -- recognise   # the accrediting body: POST /v1/trust-r
 The two steps are separate roles in real life (an issuer registers its DID; an accrediting body
 records the recognition); the demo runs both. Running it again changes nothing.
 `CERTNET_WRITE_TOKEN`, when set, is sent as a bearer token (CertNet's write authentication is
-still to be defined). Exit codes: `0` done, `1` refused (configuration or local files), `2` the
+still to be defined), over https or plain http to loopback only. Every local check runs before
+anything is sent: the organisation directory is no link and not writable by group or others, no
+X.509 issuing files (`vc`, `vc-product`, `status` keys or chains) sit beside the DID files, an
+existing `did.key.pem` is a regular PKCS#8 P-256 file with mode 600 (created with `wx`, so an
+existing key is never replaced), and `did.json` is a regular file. Exit codes: `0` done, `1` refused (configuration or local files), `2` the
 gateway did not answer or answered something else than success (also when the recognition
 cannot be read back), `3` the returned DID document does not hold our key (nothing written), `4`
 the trust registry's record does not recognise the issuer for diplomas (`rejected`, or `vcTypes`
 without the diploma type, or outside its dates: an earlier record behind "already there"; the
-accrediting body must correct it, the script never repairs it). Then `npm run demo:provision` also creates the
-`cn-sv001`–`cn-sv003` and `cn-phongdaotao` accounts of that school, and the server starts with it.
+accrediting body must correct it, the script never repairs it).
+
+Known limitation: if `POST /v1/dids` created the DID but its answer was lost or unusable
+(timeout, over 64 KB, not `201`, not JSON: exit `2`), `did.json` is not written, and the contract
+has no way to find a DID by its key, so a rerun creates a second DID for the same key. The first
+stays on CertNet, never in the trust registry, unused. Recovery: if the DID is known (the gateway's
+operator can find it by the request's time and the public key), write `did.json` by hand as
+`{"did": "<did>", "kid": "<did>#key-1"}` and run `-- did` (it sends nothing and checks the files
+as the server will); otherwise rerun, and ask the gateway's operator to deactivate the orphan
+(`POST /v1/dids/<did>/deactivate`).
+
+Then `npm run demo:provision`, with `DEMO_PORTAL_REGISTRAR_PASSWORD_CERTNET` set as well (the
+second school's registrar password: private, at least 20 characters, different from the public
+student password and from `DEMO_PORTAL_REGISTRAR_PASSWORD`; required only with DPKI configured),
+also creates the `cn-sv001`–`cn-sv003` and `cn-phongdaotao` accounts of that school (its own
+fictional people, `docs/vc-api.md` §5), and the server starts with it.
 
 ## Environment
 

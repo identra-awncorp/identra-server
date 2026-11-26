@@ -155,9 +155,12 @@ const LOCAL_ORIGIN = /^http:\/\/(127\.0\.0\.1|localhost):([1-9][0-9]{0,4})$/;
 
 /**
  * CERTNET_GATEWAY_URL and CERTNET_NETWORK, both or neither (neither: null, DPKI off), and
- * CERTNET_GATEWAY_LOCAL_URL, refused in production and without the other two. The URL rule is the
- * SDK's (createCertNetTrustRegistry) plus a parse; messages name the variable, never its value.
- * Also used by the scripts (demo:provision, certnet:register), which run without validateEnv.
+ * CERTNET_GATEWAY_LOCAL_URL, refused in production and without the other two. Production is
+ * NODE_ENV=production or IDENTRA_DEPLOYMENT=production (the scripts run without validateEnv, which
+ * ties the two together). Production also refuses the `local` network: anyone can write its trust
+ * registry, so a verifier pointed at one would accept anyone's diplomas. The URL rule is the SDK's
+ * (createCertNetTrustRegistry) plus a parse; messages name the variable, never its value. Also used
+ * by the scripts (demo:provision, certnet:register).
  */
 export function certnetConfig(raw: Record<string, unknown>): CertNetConfig | null {
   const value = (name: string) => (typeof raw[name] === 'string' && raw[name] !== '' ? (raw[name] as string) : undefined);
@@ -166,7 +169,9 @@ export function certnetConfig(raw: Record<string, unknown>): CertNetConfig | nul
   const localUrl = value('CERTNET_GATEWAY_LOCAL_URL');
   const invalid = (message: string) => new Error(`Invalid environment variables: ${message}`);
 
-  if (localUrl !== undefined && raw.NODE_ENV === 'production') throw invalid('CERTNET_GATEWAY_LOCAL_URL is for development and tests only');
+  const production = raw.NODE_ENV === 'production' || raw.IDENTRA_DEPLOYMENT === 'production';
+
+  if (localUrl !== undefined && production) throw invalid('CERTNET_GATEWAY_LOCAL_URL is for development and tests only');
   if (gatewayUrl === undefined && network === undefined) {
     if (localUrl !== undefined) throw invalid('CERTNET_GATEWAY_LOCAL_URL needs CERTNET_GATEWAY_URL and CERTNET_NETWORK');
 
@@ -174,6 +179,7 @@ export function certnetConfig(raw: Record<string, unknown>): CertNetConfig | nul
   }
   if (gatewayUrl === undefined || network === undefined) throw invalid('CERTNET_GATEWAY_URL and CERTNET_NETWORK must be set together');
   if (!CERTNET_NETWORKS.includes(network)) throw invalid('CERTNET_NETWORK must be local, testnet or mainnet');
+  if (network === 'local' && production) throw invalid('CERTNET_NETWORK=local is refused in production (anyone can write its trust registry)');
 
   try {
     const url = new URL(gatewayUrl);

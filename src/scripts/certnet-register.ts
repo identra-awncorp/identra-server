@@ -11,14 +11,28 @@
 //   (none)     both, in that order.
 //
 // Needs IDENTRA_KEYS_DIR, CERTNET_GATEWAY_URL and CERTNET_NETWORK (CERTNET_GATEWAY_LOCAL_URL outside
-// production). CERTNET_WRITE_TOKEN, when set, is sent as a bearer token (the contract's write
-// authentication is TBD). Exit codes: 0 done; 1 refused (configuration or local files); 2 the gateway
-// did not answer or answered something else than the contract's success (also when the recognition
-// cannot be read back); 3 the gateway's DID document does not hold our key; 4 the trust registry's
-// record does not recognise the issuer for diplomas (the accrediting body must correct it; nothing
-// is repaired here). Nothing is written by a step that does not succeed.
+// production; production, NODE_ENV or IDENTRA_DEPLOYMENT, refuses it and the `local` network).
+// CERTNET_WRITE_TOKEN, when set, is sent as a bearer token (the contract's write authentication is
+// TBD), over https, or plain http to loopback only (CERTNET_GATEWAY_LOCAL_URL). Every local check
+// (the organisation directory is no link and not writable by group or others, no X.509 issuing
+// files beside the DID files, an existing did.key.pem is a regular PKCS#8 P-256 file with mode 600,
+// did.json is a regular file) runs before anything is sent. Exit codes: 0 done; 1 refused
+// (configuration or local files); 2 the gateway did not answer or answered something else than the
+// contract's success (also when the recognition cannot be read back); 3 the gateway's DID document
+// does not hold our key; 4 the trust registry's record does not recognise the issuer for diplomas
+// (the accrediting body must correct it; nothing is repaired here). Nothing is written by a step
+// that does not succeed.
+//
+// Known limitation: when POST /v1/dids created the DID but its answer is lost or unusable (timeout,
+// over 64 KB, not 201, not JSON; exit 2), did.json is not written and the contract has no way to
+// find a DID by its key, so a rerun creates a second DID for the same key. The first one is never
+// in the trust registry and nothing here uses it. Recovery: if the DID is known (the gateway's
+// operator can find it by the time of the request and the public key), write did.json by hand as
+// {"did": "<did>", "kid": "<did>#key-1"} and run `-- did` (it then sends nothing and checks the
+// files as the server will); otherwise rerun, and ask the gateway's operator to deactivate the
+// orphan (POST /v1/dids/<did>/deactivate).
 import { createPrivateKey, createPublicKey, generateKeyPairSync } from 'node:crypto';
-import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 
 import { createCertNetTrustRegistry, isCertNetDid, splitDidUrl, VCT, type HttpFetch } from '@identra/sdk-core';
@@ -31,7 +45,8 @@ import { HOSTED_ISSUERS } from '../vc/hosted-issuers';
 const FRAGMENT = 'key-1';
 const WRITE_TIMEOUT_MS = 30_000;
 const MAX_BYTES = 65_536;
-const ISSUING_KEYS = ['vc', 'vc-product', 'status'].map((f) => `${f}.key.pem`);
+/** The X.509 issuing files: an organisation issues on one path only (ADR-0020 decision 1). */
+const ISSUING_FILES = ['vc', 'vc-product', 'status'].flatMap((f) => [`${f}.key.pem`, `${f}.chain.pem`]);
 
 class Stop extends Error {
   constructor(
@@ -51,7 +66,13 @@ interface Context {
 
 type PublicJwk = { kty: 'EC'; crv: 'P-256'; x: string; y: string };
 
-/** The public key of did.key.pem, which must be a regular file (not a link) readable by its owner only. */
+/** What the key store reads (sdk-server key-store.ts): a single PKCS#8 block. */
+const PKCS8_PEM = /^-----BEGIN PRIVATE KEY-----\r?\n([A-Za-z0-9+/=\r\n]+)-----END PRIVATE KEY-----\s*$/;
+
+/**
+ * The public key of did.key.pem, which must be a regular file (not a link) readable by its owner
+ * only, holding a PKCS#8 P-256 key: what the server's key store will accept.
+ */
 function publicJwkOf(path: string, label: string): PublicJwk {
   const st = lstatSync(path);
 
@@ -60,9 +81,12 @@ function publicJwkOf(path: string, label: string): PublicJwk {
   let jwk: { kty?: string; crv?: string; x?: string; y?: string };
 
   try {
-    jwk = createPublicKey(createPrivateKey(readFileSync(path))).export({ format: 'jwk' });
+    const pem = readFileSync(path, 'utf8');
+
+    if (!PKCS8_PEM.test(pem)) throw new Error('not PKCS#8');
+    jwk = createPublicKey(createPrivateKey(pem)).export({ format: 'jwk' });
   } catch {
-    throw new Stop(`${label} is not a PEM private key`, 1);
+    throw new Stop(`${label} is not a single PKCS#8 PEM private key`, 1);
   }
 
   if (jwk.kty !== 'EC' || jwk.crv !== 'P-256' || !jwk.x || !jwk.y) throw new Stop(`${label} is not an EC P-256 key`, 1);
@@ -122,31 +146,56 @@ const codeOf = (json: unknown) => {
   return typeof code === 'string' && /^[A-Z_]{1,40}$/.test(code) ? ` ${code}` : '';
 };
 
+const present = (path: string) => lstatSync(path, { throwIfNoEntry: false }) !== undefined;
+
+/**
+ * The local checks of an organisation directory, before anything is sent: no link and not writable
+ * by group or others, no X.509 issuing files (a link counts, even dangling), and did.json, if any
+ * entry of that name exists, a regular file. True when did.json exists.
+ */
+function checkOrgDir(dir: string, org: string): boolean {
+  const st = lstatSync(dir, { throwIfNoEntry: false });
+
+  if (st?.isSymbolicLink()) throw new Stop(`orgs/${org} is a symbolic link`, 1);
+  if (st === undefined || !st.isDirectory()) throw new Stop(`orgs/${org} is not a directory`, 1);
+  if ((st.mode & 0o022) !== 0) throw new Stop(`orgs/${org} is writable by group or others; run chmod 700 on it`, 1);
+  if (ISSUING_FILES.some((f) => present(join(dir, f)))) throw new Stop(`orgs/${org} holds X.509 issuing files; an organisation issues on one path only`, 1);
+
+  const json = lstatSync(join(dir, 'did.json'), { throwIfNoEntry: false });
+
+  if (json !== undefined && !json.isFile()) throw new Stop(`orgs/${org}/did.json must be a regular file (not a link)`, 1);
+
+  return json !== undefined;
+}
+
 /** Steps (a) and (b) for one organisation. */
 async function registerDid(ctx: Context, org: string): Promise<void> {
   const dir = join(ctx.keysDir, 'orgs', org);
   const keyPath = join(dir, 'did.key.pem');
   const jsonPath = join(dir, 'did.json');
+  const keyLabel = `orgs/${org}/did.key.pem`;
 
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  if (lstatSync(dir).isSymbolicLink()) throw new Stop(`orgs/${org} is a symbolic link`, 1);
-  if (ISSUING_KEYS.some((f) => existsSync(join(dir, f)))) throw new Stop(`orgs/${org} holds X.509 issuing keys; an organisation issues on one path only`, 1);
+  if (!present(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
 
-  if (lstatSync(keyPath, { throwIfNoEntry: false }) === undefined) {
-    // A new key would never match a DID that is already registered.
-    if (existsSync(jsonPath)) throw new Stop(`orgs/${org}/did.json exists without did.key.pem: restore the key, or remove did.json to register a new DID`, 1);
+  const registered = checkOrgDir(dir, org);
 
-    const { privateKey } = generateKeyPairSync('ec', { namedCurve: 'P-256' });
+  if (present(keyPath)) publicJwkOf(keyPath, keyLabel);
+  // A new key would never match a DID that is already registered.
+  else if (registered) throw new Stop(`orgs/${org}/did.json exists without did.key.pem: restore the key, or remove did.json to register a new DID`, 1);
 
-    // `wx`: fails rather than replace a key that appeared meanwhile.
-    writeFileSync(keyPath, privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600, flag: 'wx' });
-    console.log(`certnet:register: ${org}: generated orgs/${org}/did.key.pem (mode 600)`);
-  }
-
-  if (existsSync(jsonPath)) {
+  if (registered) {
     console.log(`certnet:register: ${org}: already registered (orgs/${org}/did.json), nothing sent`);
   } else {
-    const publicKeyJwk = publicJwkOf(keyPath, `orgs/${org}/did.key.pem`);
+    // `wx` is the key's only existence check that counts: an existing key (checked above, or one
+    // that appeared since) is never replaced. Created with mode 600, never printed.
+    try {
+      writeFileSync(keyPath, generateKeyPairSync('ec', { namedCurve: 'P-256' }).privateKey.export({ type: 'pkcs8', format: 'pem' }), { mode: 0o600, flag: 'wx' });
+      console.log(`certnet:register: ${org}: generated ${keyLabel} (mode 600)`);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+    }
+
+    const publicKeyJwk = publicJwkOf(keyPath, keyLabel);
     const { status, json } = await post(ctx, '/v1/dids', {
       network: ctx.certnet.network,
       verificationMethods: [{ idFragment: FRAGMENT, type: 'JsonWebKey2020', publicKeyJwk, purposes: ['assertionMethod'] }]
@@ -176,10 +225,13 @@ async function registerDid(ctx: Context, org: string): Promise<void> {
 /** Step (c) for one organisation. */
 async function recognise(ctx: Context, org: string): Promise<void> {
   const label = `orgs/${org}/did.json`;
+  const dir = join(ctx.keysDir, 'orgs', org);
   let did: unknown;
 
+  if (present(dir)) checkOrgDir(dir, org);
+
   try {
-    did = (JSON.parse(readFileSync(join(ctx.keysDir, 'orgs', org, 'did.json'), 'utf8')) as { did?: unknown }).did;
+    did = (JSON.parse(readFileSync(join(dir, 'did.json'), 'utf8')) as { did?: unknown }).did;
   } catch {
     throw new Stop(`${label} is missing or not JSON; run \`npm run certnet:register -- did\` first`, 1);
   }
@@ -231,7 +283,8 @@ async function main(): Promise<void> {
   const ctx: Context = {
     keysDir,
     certnet,
-    fetch: createGatewayFetch({ gatewayUrl: certnet.gatewayUrl, ...(certnet.localUrl ? { localUrl: certnet.localUrl } : {}) }),
+    // The only write-enabled gateway fetch: the server's own is read-only.
+    fetch: createGatewayFetch({ gatewayUrl: certnet.gatewayUrl, ...(certnet.localUrl ? { localUrl: certnet.localUrl } : {}), write: true }),
     token: process.env.CERTNET_WRITE_TOKEN || undefined
   };
 
