@@ -301,7 +301,8 @@ a client cannot ask for arbitrary claims.
   trust registry for the diploma `vct`.
 - The DID path is on only with DPKI configured (section 4). Without it, a credential with a DID
   `kid` fails `did_resolution` with `DID_RESOLUTION_FAILED`. With it: a gateway that gives no
-  usable answer (5xx, no answer, timeout, oversized) is `did_resolution` /
+  usable answer (no answer, timeout, oversized, a status other than 200, 404, 410 and 422, such as a
+  5xx or a redirect, a body that is not JSON) is `did_resolution` /
   `DID_RESOLUTION_UNAVAILABLE` ("not checked yet"): like every failure of that step the response
   is refused and the session stays open, never verified, but it is answered `503` with
   `Retry-After: 5` and `{ "error": "issuer_registry_unavailable", "error_description": "the
@@ -312,11 +313,23 @@ a client cannot ask for arbitrary claims.
   choice, so an exemption would allow unlimited responses during an outage); the 10th ends the
   session `failed` / `TOO_MANY_ATTEMPTS` with `400`. Other `503`s of this route (Redis or
   Postgres down) stay `temporarily_unavailable`. A trust registry that gives no answer
-  is `issuer_trust` / `TRUST_LIST_UNAVAILABLE`, and an issuer the registry does not recognise
-  for the diploma (absent, `rejected`, other type) is `issuer_trust` / `ISSUER_NOT_TRUSTED`,
-  both final `failed`. Recognition is never cached: a withdrawal counts at the next session.
-  Status lists are still read only from this server. The product endpoints (section 7) stay on
-  the X.509 path.
+  is `issuer_trust` / `TRUST_LIST_UNAVAILABLE`. "No usable answer" there is the same list (no
+  answer, timeout, oversized, a status other than 200 and 404, a body that is not JSON or not the
+  contract's answer). An issuer the registry does not recognise for the diploma is `issuer_trust` /
+  `ISSUER_NOT_TRUSTED`: absent (404), `rejected`, not listed for this `vct`, or now outside its
+  `validFrom` / `validUntil` (60 s of clock skew is tolerated). Both are final `failed`.
+  Recognition is never cached: a withdrawal counts at the next session.
+- The DID document is cached per DID for 60 s (only a successful resolution; a failure is never
+  cached). Two visible effects: a key change or a deactivation at the gateway can take up to 60 s
+  to show here; and during a CertNet outage a credential whose DID is cached passes
+  `did_resolution`, then ends as a final `failed` result at `issuer_trust` /
+  `TRUST_LIST_UNAVAILABLE` (recognition is not cached), while one whose DID is not cached gets the
+  retryable `503 issuer_registry_unavailable` above.
+- Status lists are still read only from this server. So this hosted verifier fails every DID
+  credential whose issuer is not hosted on this server, at `status` / `STATUS_UNAVAILABLE`, even
+  when CertNet's registry recognises that issuer (and after `issuer_trust` passed). Only
+  credentials of issuers hosted here (today `truong-mau-certnet`) can reach `verified` on the DID
+  path. The product endpoints (section 7) stay on the X.509 path.
 - The server verifies against its own status lists directly, so a revocation
   made through this server is seen by the very next verification here. A third
   party that fetches the status list over HTTP may see it up to 15 minutes later

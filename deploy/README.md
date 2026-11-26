@@ -113,7 +113,12 @@ are not set on the VPS: the DID issuer `truong-mau-certnet` then does not exist 
 `404`, it is not in health, its keys are not looked for). ADR-0020 §10 keeps it off the VPS until
 CertNet has a testnet.
 
-With DPKI off, the differences from the release before it are exactly these: verification results
+Whatever the CERTNET variables, startup now refuses an `IDENTRA_DEPLOYMENT` other than
+`production` or unset (e.g. `staging`), CertNet off included. `docker-compose.prod.yml` sets
+`production`, so the VPS is not affected; check any other deployment that sets it.
+
+With DPKI off, the differences from the release before it are exactly these: startup refuses an
+`IDENTRA_DEPLOYMENT` other than `production` or unset (above); verification results
 carry `trustPath: "x509"`; `POST /v1/demo/school/login` accepts an optional `issuer` field (an
 unknown field used to be `400`) and its response has a new `issuer` field; a credential signed
 with a `did:` `kid` is still refused, with a different internal code in the log line; the image

@@ -80,7 +80,12 @@ registry), and a hosted verifier that also accepts its credentials (`docs/vc-api
 It is off unless both of these are set. **DPKI is not part of the production deployment yet:
 production needs no change** (ADR-0020 §10: not on the VPS until CertNet has a testnet).
 
-With neither set, the differences from the release before DPKI are exactly these:
+**Whatever the CERTNET variables (CertNet off included), startup refuses an `IDENTRA_DEPLOYMENT`
+other than `production` or unset**, e.g. `staging`. Check this before upgrading a deployment that
+sets it to something else. (`IDENTRA_DEPLOYMENT=production` still needs `NODE_ENV=production`, and
+an unrecognised `NODE_ENV` was already refused: `Production` is not read as development.)
+
+With neither CERTNET variable set, the differences from the release before DPKI are exactly these:
 
 - Verification results (`GET /v1/verification/sessions/:id`, `result`) carry `trustPath: "x509"`.
 - `POST /v1/demo/school/login` accepts an optional `issuer` field (an unknown field used to be
@@ -88,6 +93,7 @@ With neither set, the differences from the release before DPKI are exactly these
   field (`"truong-mau"`).
 - A credential signed with a `did:` `kid` is still refused, with a different internal code in
   the verifier's log line.
+- Startup refuses any `IDENTRA_DEPLOYMENT` other than `production` or unset (it used to accept any value), even with CertNet off (above).
 - The image contains the registration script (`dist/src/scripts/certnet-register.js`); nothing runs it.
 
 Unchanged: no new route is reachable (every route of `truong-mau-certnet` is `404`), no outbound
@@ -97,7 +103,7 @@ and `/v1/health` is as before (no `dpki` member).
 | Variable | Value |
 |---|---|
 | `CERTNET_GATEWAY_URL` | The gateway's https origin, optional path prefix (the API is under `<url>/v1`), e.g. `https://gateway.certnet.example`. Trusted configuration: its answers are unsigned. |
-| `CERTNET_NETWORK` | `local`, `testnet` or `mainnet`: only DIDs of this network are accepted. `local` is refused in production (`NODE_ENV` or `IDENTRA_DEPLOYMENT` = `production`, exactly; any other `NODE_ENV` is refused, and `IDENTRA_DEPLOYMENT` must be `production` or unset): its trust registry is unauthenticated, anyone can write it, so a verifier pointed at one would accept anyone's diplomas. |
+| `CERTNET_NETWORK` | `local`, `testnet` or `mainnet`: only DIDs of this network are accepted. `local` is refused in production (`NODE_ENV` or `IDENTRA_DEPLOYMENT` = `production`, exactly; the `IDENTRA_DEPLOYMENT` rule above applies with or without CertNet): its trust registry is unauthenticated, anyone can write it, so a verifier pointed at one would accept anyone's diplomas. |
 | `CERTNET_GATEWAY_LOCAL_URL` | Development and tests only (refused in production, `NODE_ENV` or `IDENTRA_DEPLOYMENT` = `production`): `http://127.0.0.1:<port>` or `http://localhost:<port>`, where requests for the gateway origin are sent (a localnet gateway on `:8000`, or the fake one). |
 
 Only the DID resolver and the trust-registry client reach the gateway, through a fetch limited to

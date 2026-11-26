@@ -377,6 +377,24 @@ describe('npm run certnet:register: local checks and the answer, before and afte
     assert.equal(r.code, 0, r.out);
     assert.match(r.out, /already registered/);
   });
+
+  it('a directory that can be written but not searched is refused before any request: nothing sent, nothing created', { skip: process.getuid?.() === 0 && 'running as root: file modes do not restrict root, the check could not be exercised' }, async (t) => {
+    const dir = fresh();
+    const org = didFiles(dir);
+
+    chmodSync(org, 0o600); // read and write, no search (x): files in it cannot be created or looked up
+    t.after(() => chmodSync(org, 0o700));
+    const seen = stub.requests.length;
+    const r = await register({ IDENTRA_KEYS_DIR: dir }, 'did');
+
+    // Not the W_OK | X_OK check: checkOrgDir (lstat of the files inside) fails first with EACCES, exit 2.
+    // Either way the script must stop here, so the test only pins the outcome.
+    assert.notEqual(r.code, 0, r.out);
+    assert.match(r.out, /EACCES|is not writable/);
+    assert.equal(stub.requests.length, seen, 'nothing sent');
+    chmodSync(org, 0o700);
+    assert.deepEqual(readdirSync(org), [], 'no key, no did.json');
+  });
 });
 
 describe('npm run certnet:register -- recognise: the record read back decides the exit code', () => {
