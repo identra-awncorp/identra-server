@@ -131,7 +131,7 @@ production. The gateway URL is trusted configuration (its answers are unsigned).
 refuses `CERTNET_NETWORK=local`: a local network's trust registry is unauthenticated, so anyone
 can record any DID as a recognised school there, and a verifier reading it would accept anyone's
 diplomas. `demo:provision` then also needs `DEMO_PORTAL_REGISTRAR_PASSWORD_CERTNET`, the second
-school's registrar password (private, at least 20 characters, different from the other two).
+school's registrar password (private, at least 20 characters, different from the other two). A deployment that ran `demo:provision` with CertNet configured before this variable existed keeps the second school's registrar on the first school's password until `demo:provision` runs again.
 
 The key directory must not contain CA keys: the server refuses to start when it finds a `ca/`
 directory or a `ca.key.pem` anywhere under it (ADR-0015 §2, ADR-0016 §6).

@@ -285,16 +285,21 @@ describe('npm run certnet:register: local checks and the answer, before and afte
     );
   });
 
-  it('refuses a returned key with private members, and a DID of another network even when the whole answer agrees with it (exit 3)', async (t) => {
+  it('refuses a returned key with private members (d, p, k), a point off the curve, and a DID of another network even when the whole answer agrees with it (exit 3)', async (t) => {
     t.after(() => (stub.tamper = undefined));
+    const withKey = (a: Record<string, unknown>, change: (key: Record<string, unknown>) => Record<string, unknown>) => {
+      const out = structuredClone(a) as { document: { verificationMethod: Array<{ publicKeyJwk: Record<string, unknown> }> } };
+
+      out.document.verificationMethod[0]!.publicKeyJwk = change(out.document.verificationMethod[0]!.publicKeyJwk);
+
+      return out as unknown as Record<string, unknown>;
+    };
     const tampers: Array<[string, (a: Record<string, unknown>) => Record<string, unknown>]> = [
-      ['the private member d', (a) => {
-        const out = structuredClone(a) as { document: { verificationMethod: Array<{ publicKeyJwk: Record<string, unknown> }> } };
-
-        out.document.verificationMethod[0]!.publicKeyJwk.d = 'jpsQnnGQmL-YBIffH1136cspYG6-0iY7X1fCE9-E9LI';
-
-        return out as unknown as Record<string, unknown>;
-      }],
+      ...(['d', 'p', 'k'] as const).map((member): [string, (a: Record<string, unknown>) => Record<string, unknown>] => [
+        `the private member ${member}`,
+        (a) => withKey(a, (key) => ({ ...key, [member]: 'jpsQnnGQmL-YBIffH1136cspYG6-0iY7X1fCE9-E9LI' }))
+      ]),
+      ['a point off the curve', (a) => withKey(a, (key) => ({ ...key, y: 'AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA' }))],
       ['another network throughout (did, document id, method, controller, assertionMethod)', (a) => JSON.parse(JSON.stringify(a).replaceAll(':local:', ':testnet:'))]
     ];
 
@@ -323,6 +328,54 @@ describe('npm run certnet:register: local checks and the answer, before and afte
     }
 
     assert.equal(stub.requests.length, seen);
+  });
+
+  it('production is not matched exactly: an unrecognised NODE_ENV or IDENTRA_DEPLOYMENT is refused, never read as development (nothing sent)', async () => {
+    const seen = stub.requests.length;
+
+    for (const env of <Array<Record<string, string>>>[
+      { NODE_ENV: 'Production' }, { NODE_ENV: ' production ' }, { NODE_ENV: 'PRODUCTION' }, { NODE_ENV: '' },
+      { IDENTRA_DEPLOYMENT: 'Production' }, { IDENTRA_DEPLOYMENT: ' production ' }, { IDENTRA_DEPLOYMENT: 'PRODUCTION' }
+    ]) {
+      // The local network and the plain-http local URL, which only development may use.
+      const r = await register({ IDENTRA_KEYS_DIR: fresh(), CERTNET_WRITE_TOKEN: WRITE_TOKEN, ...env });
+
+      assert.deepEqual([r.code, /must be (development, test or production|production or unset)/.test(r.out)], [1, true], `${JSON.stringify(env)}: ${r.out}`);
+    }
+
+    assert.equal(stub.requests.length, seen);
+  });
+
+  it('a directory that cannot be written is refused before any request (no orphan DID): exit 1, nothing sent', { skip: process.getuid?.() === 0 && 'running as root: file modes do not restrict root, the check could not be exercised' }, async (t) => {
+    // The orphan case (key present, did.json still to write) and the first run (no key either).
+    for (const [name, withKey] of [['key present', true], ['no key', false]] as const) {
+      const dir = fresh();
+      const org = didFiles(dir);
+
+      if (withKey) writeFileSync(join(org, 'did.key.pem'), pkcs8(), { mode: 0o600 });
+      chmodSync(org, 0o500);
+      t.after(() => chmodSync(org, 0o700));
+      const seen = stub.requests.length;
+      const r = await register({ IDENTRA_KEYS_DIR: dir }, 'did');
+
+      assert.equal(r.code, 1, `${name}: ${r.out}`);
+      assert.match(r.out, /is not writable/, name);
+      assert.equal(stub.requests.length, seen, `${name}: nothing sent`);
+      assert.ok(!existsSync(join(org, 'did.json')), name);
+    }
+
+    // Both files present: nothing is written, so a read-only directory (the production mount) is fine.
+    const dir = fresh();
+    const org = didFiles(dir);
+
+    copyFileSync(join(didFiles(keys), 'did.key.pem'), join(org, 'did.key.pem'));
+    copyFileSync(join(didFiles(keys), 'did.json'), join(org, 'did.json'));
+    chmodSync(org, 0o500);
+    t.after(() => chmodSync(org, 0o700));
+    const r = await register({ IDENTRA_KEYS_DIR: dir }, 'did');
+
+    assert.equal(r.code, 0, r.out);
+    assert.match(r.out, /already registered/);
   });
 });
 
@@ -358,6 +411,32 @@ describe('npm run certnet:register -- recognise: the record read back decides th
       assert.equal(r.code, code, `${name}: ${r.out}`);
       assert.match(r.out, message, name);
       assert.deepEqual(stub.trust.get(did()), existing, `${name}: the record is never repaired`);
+    }
+  });
+
+  it('an organisation directory writable by group or others, or a symbolic link, is refused locally: exit 1, nothing sent', async () => {
+    const prepare: Array<[string, (d: string) => void, RegExp]> = [
+      ['writable by group', (d) => chmodSync(didFiles(d), 0o770), /writable by group or others/],
+      ['a link', (d) => {
+        const real = join(d, 'elsewhere');
+
+        mkdirSync(real, { mode: 0o700 });
+        copyFileSync(join(didFiles(d), 'did.json'), join(real, 'did.json'));
+        rmSync(didFiles(d), { recursive: true });
+        symlinkSync(real, didFiles(d));
+      }, /is a symbolic link/]
+    ];
+
+    for (const [name, change, message] of prepare) {
+      const d = dir();
+
+      change(d);
+      const seen = stub.requests.length;
+      const r = await register({ IDENTRA_KEYS_DIR: d }, 'recognise');
+
+      assert.equal(r.code, 1, `${name}: ${r.out}`);
+      assert.match(r.out, message, name);
+      assert.equal(stub.requests.length, seen, `${name}: nothing sent`);
     }
   });
 

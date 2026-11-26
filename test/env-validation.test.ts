@@ -259,6 +259,18 @@ describe('CertNet (DPKI) configuration, ADR-0020', () => {
     assert.equal(validateEnv({ ...productionEnv, ...on, CERTNET_NETWORK: 'testnet' }).CERTNET_NETWORK, 'testnet');
   });
 
+  it('production is matched as validateEnv matches it: an unrecognised NODE_ENV or IDENTRA_DEPLOYMENT is refused, in certnetConfig too', () => {
+    for (const NODE_ENV of ['Production', ' production ', 'PRODUCTION', '']) {
+      assert.throws(() => certnetConfig({ ...on, NODE_ENV }), /NODE_ENV must be development, test or production/, NODE_ENV);
+      assert.throws(() => validateEnv({ ...dev, ...on, NODE_ENV }), /NODE_ENV/, NODE_ENV);
+    }
+    for (const IDENTRA_DEPLOYMENT of ['Production', ' production ', 'PRODUCTION', 'staging']) {
+      assert.throws(() => certnetConfig({ ...on, IDENTRA_DEPLOYMENT }), /IDENTRA_DEPLOYMENT must be production or unset/, IDENTRA_DEPLOYMENT);
+      assert.throws(() => validateEnv({ ...dev, ...on, IDENTRA_DEPLOYMENT }), /IDENTRA_DEPLOYMENT must be production or unset/, IDENTRA_DEPLOYMENT);
+    }
+    for (const NODE_ENV of ['development', 'test']) assert.equal(certnetConfig({ ...on, NODE_ENV })?.network, 'local');
+  });
+
   it('refuses the local network in production: anyone can write its trust registry', () => {
     assert.throws(() => validateEnv({ ...productionEnv, ...on }), /CERTNET_NETWORK=local is refused in production/);
     assert.throws(() => validateEnv({ ...productionEnv, ...on, IDENTRA_DEPLOYMENT: 'production' }), /CERTNET_NETWORK=local is refused in production/);

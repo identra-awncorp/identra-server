@@ -97,7 +97,7 @@ and `/v1/health` is as before (no `dpki` member).
 | Variable | Value |
 |---|---|
 | `CERTNET_GATEWAY_URL` | The gateway's https origin, optional path prefix (the API is under `<url>/v1`), e.g. `https://gateway.certnet.example`. Trusted configuration: its answers are unsigned. |
-| `CERTNET_NETWORK` | `local`, `testnet` or `mainnet`: only DIDs of this network are accepted. `local` is refused in production (`NODE_ENV` or `IDENTRA_DEPLOYMENT` = `production`): its trust registry is unauthenticated, anyone can write it, so a verifier pointed at one would accept anyone's diplomas. |
+| `CERTNET_NETWORK` | `local`, `testnet` or `mainnet`: only DIDs of this network are accepted. `local` is refused in production (`NODE_ENV` or `IDENTRA_DEPLOYMENT` = `production`, exactly; any other `NODE_ENV` is refused, and `IDENTRA_DEPLOYMENT` must be `production` or unset): its trust registry is unauthenticated, anyone can write it, so a verifier pointed at one would accept anyone's diplomas. |
 | `CERTNET_GATEWAY_LOCAL_URL` | Development and tests only (refused in production, `NODE_ENV` or `IDENTRA_DEPLOYMENT` = `production`): `http://127.0.0.1:<port>` or `http://localhost:<port>`, where requests for the gateway origin are sent (a localnet gateway on `:8000`, or the fake one). |
 
 Only the DID resolver and the trust-registry client reach the gateway, through a fetch limited to
@@ -145,7 +145,9 @@ as the server will); otherwise rerun, and ask the gateway's operator to deactiva
 
 Then `npm run demo:provision`, with `DEMO_PORTAL_REGISTRAR_PASSWORD_CERTNET` set as well (the
 second school's registrar password: private, at least 20 characters, different from the public
-student password and from `DEMO_PORTAL_REGISTRAR_PASSWORD`; required only with DPKI configured),
+student password and from `DEMO_PORTAL_REGISTRAR_PASSWORD`; required only with DPKI configured;
+a deployment that ran `demo:provision` with CertNet configured before this variable existed keeps the
+second school's registrar on the first school's password until `demo:provision` runs again),
 also creates the `cn-sv001`–`cn-sv003` and `cn-phongdaotao` accounts of that school (its own
 fictional people, `docs/vc-api.md` §5), and the server starts with it.
 

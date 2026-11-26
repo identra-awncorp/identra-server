@@ -32,10 +32,10 @@
 // files as the server will); otherwise rerun, and ask the gateway's operator to deactivate the
 // orphan (POST /v1/dids/<did>/deactivate).
 import { createPrivateKey, createPublicKey, generateKeyPairSync } from 'node:crypto';
-import { lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { accessSync, constants, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 
-import { createCertNetTrustRegistry, isCertNetDid, splitDidUrl, VCT, type HttpFetch } from '@identra/sdk-core';
+import { createCertNetTrustRegistry, isCertNetDid, normalizeEcPublicJwk, splitDidUrl, VCT, type HttpFetch } from '@identra/sdk-core';
 import { createFileKeyStore } from '@identra/sdk-server';
 
 import { certnetConfig, CertNetConfig } from '../config/env.validation';
@@ -106,11 +106,11 @@ function registeredDid(body: unknown, network: CertNetConfig['network'], jwk: Pu
   const kid = `${did}#${FRAGMENT}`;
   const vms = doc.verificationMethod;
   const vm = (Array.isArray(vms) && vms.length === 1 ? vms[0] : null) as { id?: unknown; controller?: unknown; publicKeyJwk?: Record<string, unknown> } | null;
-  const key = vm?.publicKeyJwk;
+  // The SDK's own normaliser: refuses every private member and a point off the curve.
+  const key = normalizeEcPublicJwk(vm?.publicKeyJwk);
   const assertion = doc.assertionMethod;
 
-  if (vm?.id !== kid || vm.controller !== did || typeof key !== 'object' || key === null) return null;
-  if (key.kty !== 'EC' || key.crv !== 'P-256' || key.x !== jwk.x || key.y !== jwk.y || 'd' in key) return null;
+  if (vm?.id !== kid || vm.controller !== did || key === null || key.x !== jwk.x || key.y !== jwk.y) return null;
 
   return Array.isArray(assertion) && assertion.length > 0 && assertion.every((entry) => entry === kid) ? did : null;
 }
@@ -178,6 +178,17 @@ async function registerDid(ctx: Context, org: string): Promise<void> {
   if (!present(dir)) mkdirSync(dir, { recursive: true, mode: 0o700 });
 
   const registered = checkOrgDir(dir, org);
+
+  // Before any request: a DID created here whose did.json cannot be written would be an orphan, and
+  // every rerun would create another (production mounts the keys read-only). Both files present:
+  // nothing is written.
+  if (!registered) {
+    try {
+      accessSync(dir, constants.W_OK | constants.X_OK);
+    } catch {
+      throw new Stop(`orgs/${org} is not writable; did.key.pem and did.json must be written there`, 1);
+    }
+  }
 
   if (present(keyPath)) publicJwkOf(keyPath, keyLabel);
   // A new key would never match a DID that is already registered.

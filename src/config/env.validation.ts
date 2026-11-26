@@ -169,6 +169,13 @@ export function certnetConfig(raw: Record<string, unknown>): CertNetConfig | nul
   const localUrl = value('CERTNET_GATEWAY_LOCAL_URL');
   const invalid = (message: string) => new Error(`Invalid environment variables: ${message}`);
 
+  // As validateEnv reads them: NODE_ENV is one of the three or refused (never "Production" read as
+  // development); IDENTRA_DEPLOYMENT is `production` or unset.
+  if (raw.NODE_ENV !== undefined && !envSchema.shape.NODE_ENV.safeParse(raw.NODE_ENV).success) throw invalid('NODE_ENV must be development, test or production');
+  if (raw.IDENTRA_DEPLOYMENT !== undefined && raw.IDENTRA_DEPLOYMENT !== '' && raw.IDENTRA_DEPLOYMENT !== 'production') {
+    throw invalid('IDENTRA_DEPLOYMENT must be production or unset');
+  }
+
   const production = raw.NODE_ENV === 'production' || raw.IDENTRA_DEPLOYMENT === 'production';
 
   if (localUrl !== undefined && production) throw invalid('CERTNET_GATEWAY_LOCAL_URL is for development and tests only');
