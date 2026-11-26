@@ -150,6 +150,7 @@ export class PortalSessions implements OnModuleInit {
       expiresAt: new Date(now.getTime() + PORTAL_SESSION_SECONDS * 1000).toISOString(),
       serverTime: now.toISOString(),
       role: account.role,
+      issuer: account.issuerName,
       profile: account.profile
     };
   }

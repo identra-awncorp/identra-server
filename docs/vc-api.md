@@ -168,7 +168,7 @@ even of the same account, does not see, poll, cancel or revoke it (it gets `404`
 
 | Method and path | Auth | Body | Success | Errors |
 |---|---|---|---|---|
-| `POST /v1/demo/school/login` | none, rate limited | `{ username, password, issuer? }` | `201 { token, expiresAt, serverTime, role: "student" \| "registrar", profile }` | `400 VALIDATION_FAILED`, `401 INVALID_CREDENTIALS`, `429 RATE_LIMITED` (also the registrar account from a client with 10 wrong passwords in 15 minutes, or from everyone after 500; section 8), `503 UNAVAILABLE` (also when the server is hashing too many passwords at once; retry after `Retry-After`) |
+| `POST /v1/demo/school/login` | none, rate limited | `{ username, password, issuer? }` | `201 { token, expiresAt, serverTime, role: "student" \| "registrar", issuer, profile }` | `400 VALIDATION_FAILED`, `401 INVALID_CREDENTIALS`, `429 RATE_LIMITED` (also the registrar account from a client with 10 wrong passwords in 15 minutes, or from everyone after 500; section 8), `503 UNAVAILABLE` (also when the server is hashing too many passwords at once; retry after `Retry-After`) |
 | `POST /v1/demo/school/offers` | student | none | `201 { offerId, offerUri, txCode, expiresAt, serverTime }` | `403 FORBIDDEN` (registrar), `429 RATE_LIMITED` (this client already holds 5 live offers, or created 100 in the last 30 minutes; an IPv6 /48: 4 times that), `503 UNAVAILABLE` (all clients together hold the cap); both with `Retry-After` |
 | `GET /v1/demo/school/offers/:offerId` | student, the session that created it | none | `200 { status: "pending" \| "issued" \| "expired", serverTime }` | `404 NOT_FOUND` (unknown, older than 30 minutes, or another session's) |
 | `DELETE /v1/demo/school/offers/:offerId` | student, the session that created it | none | `200 { offerId, status: "expired" \| "issued", serverTime }`: a pending offer is cancelled (its code stops working, its place is freed); an issued one stays issued; repeating it is harmless | `404 NOT_FOUND` as above |
@@ -217,10 +217,16 @@ public student password does not open it). `profile` of a student:
 (the university's own record, the source of the diploma's claims); of the
 registrar: `{ hoTen, donVi }`.
 
-With DPKI configured `demo:provision` also creates the same four accounts for
+The login response's `issuer` is the school the session belongs to: `"truong-mau"` or, for the
+accounts below, `"truong-mau-certnet"`; clients read it instead of guessing from the username.
+
+With DPKI configured `demo:provision` also creates four accounts for
 `truong-mau-certnet` under `cn-` names: students `cn-sv001`, `cn-sv002`, `cn-sv003` (the public
 student password) and the registrar `cn-phongdaotao` (the private registrar password). Sign in
-with `{ "issuer": "truong-mau-certnet", "username": "cn-sv001", "password": "…" }`.
+with `{ "issuer": "truong-mau-certnet", "username": "cn-sv001", "password": "…" }`. They are the
+same fictional people, but the school has its own records: the registrar's `donVi` is `Phòng Đào
+tạo, Trường Mẫu CertNet (DEMO)` and the diploma numbers (`soHieuBang`) are `CNDEMO-2025-000317`,
+`CNDEMO-2024-001254`, `CNDEMO-2026-000029`, where the first school's are `TMDEMO-…`.
 
 ## 6. Presentation: OpenID4VP 1.0, cross-device
 
@@ -237,8 +243,14 @@ a client cannot ask for arbitrary claims.
 - `qr` = `openid4vp://?client_id=<client_id>&request_uri=<api>/oid4vp/request/<requestId>`.
   `id` and `requestId` are independent random values: the QR never reveals the
   value that reads the result.
-- A session lives 5 minutes. `nonce` and `state` are single use: the first
-  response for a request is processed, every later one is `400`.
+- A session lives 5 minutes. `nonce` and `state` are single use, but only a response
+  that passes the gate checks uses them up. A response refused at a gate check (`structure`,
+  `algorithm`, the issuer's certificate chain or, on the DID path, its DID resolution, the issuer
+  signature, or holder binding) gets `400 invalid_request` (or the `503` below), leaves the
+  session open and counts toward 10 refused responses per request; the 10th ends the session
+  `failed` / `TOO_MANY_ATTEMPTS`. The first response that passes them finalises the session, as
+  `verified` or `failed` (revoked, untrusted issuer, query not satisfied); every later response
+  for that request is `400`.
 - Scenario `ung-tuyen`: DCQL for one `dc+sd-jwt` credential of the diploma
   `vct`; `claim_sets` option 1 = `ho_ten`, `nganh`, `hang_tot_nghiep`,
   `nam_tot_nghiep`; option 2 = `ho_ten`, `nganh`.

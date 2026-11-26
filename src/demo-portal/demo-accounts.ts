@@ -5,8 +5,8 @@ import * as argon2 from 'argon2';
 export const DEMO_ISSUER = 'truong-mau';
 /**
  * The sample school on the DID trust path (ADR-0020), provisioned only when DPKI is configured. Its
- * accounts are DEMO_ACCOUNTS under `cn-` names (usernames are unique across issuers): cn-sv001,
- * cn-sv002, cn-sv003 (students), cn-phongdaotao (registrar).
+ * accounts are DEMO_DID_ACCOUNTS, the people of DEMO_ACCOUNTS under `cn-` names (usernames are
+ * unique across issuers): cn-sv001, cn-sv002, cn-sv003 (students), cn-phongdaotao (registrar).
  */
 export const DEMO_DID_ISSUER = 'truong-mau-certnet';
 export const DID_ACCOUNT_PREFIX = 'cn-';
@@ -76,6 +76,16 @@ export const DEMO_ACCOUNTS: Array<
     profile: { hoTen: 'Phạm Văn Đức', donVi: 'Phòng Đào tạo, Trường Mẫu (DEMO)' }
   }
 ];
+
+/**
+ * The second school's own records: the same fictional people, but its diplomas come from its own
+ * series (`CNDEMO-` where the first school's is `TMDEMO-`) and its registrar belongs to it.
+ */
+export const DEMO_DID_ACCOUNTS: typeof DEMO_ACCOUNTS = DEMO_ACCOUNTS.map((a) =>
+  a.role === 'student'
+    ? { ...a, profile: { ...a.profile, soHieuBang: a.profile.soHieuBang.replace(/^TMDEMO-/, 'CNDEMO-') } }
+    : { ...a, profile: { ...a.profile, donVi: 'Phòng Đào tạo, Trường Mẫu CertNet (DEMO)' } }
+);
 
 // Same parameters as user passwords (AuthService.hashPassword).
 export const PORTAL_PASSWORD_HASH = {

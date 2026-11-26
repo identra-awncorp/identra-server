@@ -533,6 +533,41 @@ describe('the DID issuer truong-mau-certnet and the hosted verifier', () => {
     assert.deepEqual([(await portalLogin('sv001', 'Truong-Mau')).status, (await portalLogin('sv001', 'Truong-Mau')).body.code], [400, 'VALIDATION_FAILED']);
   });
 
+  it('the second school has its own registrar unit and diploma series; the login says which school the session belongs to', async () => {
+    const profile = async (username: string, issuer?: string) => (await portalLogin(username, issuer)).body.profile as Record<string, string>;
+    // One at a time: the server hashes at most two passwords at once and answers 503 beyond that.
+    const numbers = async (names: string[]) => {
+      const out: string[] = [];
+
+      for (const n of names) out.push((await profile(n)).soHieuBang!);
+
+      return out;
+    };
+    const tm = await numbers(['sv001', 'sv002', 'sv003']);
+    const cn = await numbers(['cn-sv001', 'cn-sv002', 'cn-sv003']);
+
+    assert.ok(tm.every((n) => /^TMDEMO-\d{4}-\d{6}$/.test(n)) && cn.every((n) => /^CNDEMO-\d{4}-\d{6}$/.test(n)));
+    assert.deepEqual(cn.filter((n) => tm.includes(n)), []);
+    assert.equal((await profile('phongdaotao')).donVi, 'Phòng Đào tạo, Trường Mẫu (DEMO)');
+
+    const donVi = (await profile('cn-phongdaotao')).donVi;
+
+    assert.equal(donVi, 'Phòng Đào tạo, Trường Mẫu CertNet (DEMO)');
+    assert.ok(!donVi.includes('Trường Mẫu (DEMO)'));
+
+    for (const [username, issuer, expected] of [
+      ['cn-sv001', undefined, DID_ISSUER],
+      ['cn-phongdaotao', undefined, DID_ISSUER],
+      ['sv001', undefined, 'truong-mau'],
+      ['phongdaotao', 'truong-mau', 'truong-mau']
+    ] as const) {
+      const res = await portalLogin(username, issuer);
+
+      assert.equal(res.status, 201);
+      assert.equal(res.body.issuer, expected, username);
+    }
+  });
+
   it('health says DPKI is configured and the DID issuer can sign, without asking the gateway', async () => {
     const seen = stub.requests.length;
     const health = (await call('GET', '/v1/health')).body;
