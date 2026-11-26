@@ -534,7 +534,7 @@ describe('the DID issuer truong-mau-certnet and the hosted verifier', () => {
 
     for (const mode of ['unavailable', 'reset'] as const) {
       stub.mode = mode;
-      assert.deepEqual(await submit(), { ok: false, code: 'DID_RESOLUTION_UNAVAILABLE' }, mode);
+      assert.deepEqual(await submit(), { ok: false, code: 'DID_RESOLUTION_UNAVAILABLE', delivered: true }, mode);
       assert.deepEqual(answers.pop(), {
         status: 503,
         retryAfter: '5',
