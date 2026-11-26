@@ -102,14 +102,18 @@ npm run certnet:register -- did         # the issuer: generate the key if missin
                                         # key in assertionMethod, write did.json
 npm run certnet:register -- recognise   # the accrediting body: POST /v1/trust-registry/issuers
                                         # (diploma vct, scope education); "already there" is fine
+                                        # only if the record read back recognises the issuer for diplomas
 ```
 
 The two steps are separate roles in real life (an issuer registers its DID; an accrediting body
 records the recognition); the demo runs both. Running it again changes nothing.
 `CERTNET_WRITE_TOKEN`, when set, is sent as a bearer token (CertNet's write authentication is
 still to be defined). Exit codes: `0` done, `1` refused (configuration or local files), `2` the
-gateway did not answer or answered something else than success, `3` the returned DID document
-does not hold our key (nothing written). Then `npm run demo:provision` also creates the
+gateway did not answer or answered something else than success (also when the recognition
+cannot be read back), `3` the returned DID document does not hold our key (nothing written), `4`
+the trust registry's record does not recognise the issuer for diplomas (`rejected`, or `vcTypes`
+without the diploma type, or outside its dates: an earlier record behind "already there"; the
+accrediting body must correct it, the script never repairs it). Then `npm run demo:provision` also creates the
 `cn-sv001`–`cn-sv003` and `cn-phongdaotao` accounts of that school, and the server starts with it.
 
 ## Environment

@@ -13,8 +13,10 @@
 // Needs IDENTRA_KEYS_DIR, CERTNET_GATEWAY_URL and CERTNET_NETWORK (CERTNET_GATEWAY_LOCAL_URL outside
 // production). CERTNET_WRITE_TOKEN, when set, is sent as a bearer token (the contract's write
 // authentication is TBD). Exit codes: 0 done; 1 refused (configuration or local files); 2 the gateway
-// did not answer or answered something else than the contract's success; 3 the gateway's DID
-// document does not hold our key. Nothing is written by a step that does not succeed.
+// did not answer or answered something else than the contract's success (also when the recognition
+// cannot be read back); 3 the gateway's DID document does not hold our key; 4 the trust registry's
+// record does not recognise the issuer for diplomas (the accrediting body must correct it; nothing
+// is repaired here). Nothing is written by a step that does not succeed.
 import { createPrivateKey, createPublicKey, generateKeyPairSync } from 'node:crypto';
 import { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
@@ -34,7 +36,7 @@ const ISSUING_KEYS = ['vc', 'vc-product', 'status'].map((f) => `${f}.key.pem`);
 class Stop extends Error {
   constructor(
     message: string,
-    readonly exitCode: 1 | 2 | 3
+    readonly exitCode: 1 | 2 | 3 | 4
   ) {
     super(message);
   }
@@ -189,13 +191,24 @@ async function recognise(ctx: Context, org: string): Promise<void> {
 
   if (outcome === undefined) throw new Stop(`POST /v1/trust-registry/issuers answered HTTP ${status}${codeOf(json)}`, 2);
 
-  // Read back as a verifier does: a 409 may be an earlier, rejected record.
-  const trust = await createCertNetTrustRegistry({ gatewayUrl: ctx.certnet.gatewayUrl, network: ctx.certnet.network, fetch: ctx.fetch })
-    .lookupIssuer(did, VCT.diploma, new Date())
-    .then((r) => (r.trusted ? 'recognised for diplomas' : `NOT recognised for diplomas (${r.detail})`))
-    .catch(() => 'could not be read back');
+  // Read back as a verifier does (recognised, diploma type held, within its dates): a 409 may be an
+  // earlier record that rejects the issuer or lacks the type, and the operator must not think it ready.
+  let trust: Awaited<ReturnType<ReturnType<typeof createCertNetTrustRegistry>['lookupIssuer']>>;
 
-  console.log(`certnet:register: ${org}: ${did}: ${outcome}; the trust registry says: ${trust}`);
+  try {
+    trust = await createCertNetTrustRegistry({ gatewayUrl: ctx.certnet.gatewayUrl, network: ctx.certnet.network, fetch: ctx.fetch }).lookupIssuer(did, VCT.diploma, new Date());
+  } catch {
+    throw new Stop(`${did}: ${outcome}, but the trust registry could not be read back (gateway error)`, 2);
+  }
+
+  if (!trust.trusted) {
+    throw new Stop(
+      `${did}: ${outcome}, but the trust registry says: NOT recognised for diplomas (${trust.detail}); verifiers will refuse its documents. The accrediting body must correct the record (recognition "recognized", vcTypes holding ${VCT.diploma})`,
+      4
+    );
+  }
+
+  console.log(`certnet:register: ${org}: ${did}: ${outcome}; the trust registry says: recognised for diplomas`);
 }
 
 async function main(): Promise<void> {

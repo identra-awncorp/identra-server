@@ -207,6 +207,62 @@ describe('npm run certnet:register', () => {
   });
 });
 
+describe('npm run certnet:register -- recognise: the record read back decides the exit code', () => {
+  let n = 0;
+  const dir = () => {
+    const d = keysCopy(`recognise-readback-${n++}`);
+
+    mkdirSync(didFiles(d), { recursive: true, mode: 0o700 });
+    writeFileSync(join(didFiles(d), 'did.json'), JSON.stringify(readDid(keys)));
+
+    return d;
+  };
+  const record = (over: Record<string, unknown>) => ({ issuerDid: did(), recognition: 'recognized', scopes: ['education'], vcTypes: [VCT.diploma], accreditingBody: null, ...over });
+
+  it('an existing (409) record that is rejected, or lacks the diploma type, exits 4 and says what the registry says; recognised exits 0', async (t) => {
+    const original = stub.trust.get(did())!;
+
+    t.after(() => stub.trust.set(did(), original));
+
+    const cases: Array<[string, Record<string, unknown>, number, RegExp]> = [
+      ['rejected', record({ recognition: 'rejected' }), 4, /rejected in the CertNet trust registry.*accrediting body must correct the record/s],
+      ['no diploma type', record({ vcTypes: ['urn:other:type'] }), 4, /not recognised for this credential type.*accrediting body must correct the record/s],
+      ['no types at all', record({ vcTypes: [] }), 4, /not recognised for this credential type/],
+      ['a longer type name is not the diploma type', record({ vcTypes: [`${VCT.diploma}-x`] }), 4, /not recognised for this credential type/],
+      ['recognised with the type', record({}), 0, /already in the trust registry; the trust registry says: recognised for diplomas/]
+    ];
+
+    for (const [name, existing, code, message] of cases) {
+      stub.trust.set(did(), existing);
+      const r = await register({ IDENTRA_KEYS_DIR: dir() }, 'recognise');
+
+      assert.equal(r.code, code, `${name}: ${r.out}`);
+      assert.match(r.out, message, name);
+      assert.deepEqual(stub.trust.get(did()), existing, `${name}: the record is never repaired`);
+    }
+  });
+
+  it('a fresh registration (201) exits 0; a read-back that fails for a gateway reason exits 2', async (t) => {
+    const original = stub.trust.get(did())!;
+
+    t.after(() => {
+      stub.mode = 'ok';
+      stub.trust.set(did(), original);
+    });
+
+    stub.trust.delete(did());
+    const fresh = await register({ IDENTRA_KEYS_DIR: dir() }, 'recognise');
+
+    assert.equal(fresh.code, 0, fresh.out);
+    assert.match(fresh.out, /: recognised; the trust registry says: recognised for diplomas/);
+
+    stub.mode = 'trust-unavailable';
+    const down = await register({ IDENTRA_KEYS_DIR: dir() }, 'recognise');
+
+    assert.deepEqual([down.code, /could not be read back/.test(down.out)], [2, true], down.out);
+  });
+});
+
 describe('start-up check of the DID issuer', () => {
   it('a did.json naming a DID of another network than CERTNET_NETWORK makes the issuer unable to sign', async () => {
     const dir = keysCopy('other-network');
